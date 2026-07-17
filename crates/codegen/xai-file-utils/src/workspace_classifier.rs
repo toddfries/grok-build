@@ -118,7 +118,9 @@ fn is_platform_home_excluded(cwd: &Path, home: &Path) -> bool {
     false
 }
 
-#[cfg(target_os = "linux")]
+// Linux + BSD (and other non-macOS unix): treat XDG-style top-level home dirs
+// as non-project. macOS has its own Library rule above.
+#[cfg(all(unix, not(target_os = "macos")))]
 fn is_platform_home_excluded(cwd: &Path, home: &Path) -> bool {
     let Ok(relative) = cwd.strip_prefix(home) else {
         return false;
