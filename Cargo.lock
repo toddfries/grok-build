@@ -14727,3 +14727,7 @@ dependencies = [
  "syn 2.0.117",
  "winnow",
 ]
+
+[[patch.unused]]
+name = "ring"
+version = "0.16.20"
