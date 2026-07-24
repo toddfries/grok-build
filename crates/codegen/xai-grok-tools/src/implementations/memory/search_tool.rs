@@ -96,12 +96,57 @@ impl xai_tool_runtime::Tool for MemorySearchImpl {
                 "No memory results found for query.".into(),
             ));
         }
+        // Prefer compositional section layout when kinds are present.
+        let has_kinds = results
+            .iter()
+            .any(|r| !r.kind.is_empty() && r.kind != "unknown");
+        if has_kinds {
+            let mut by_kind: std::collections::BTreeMap<&str, Vec<_>> =
+                std::collections::BTreeMap::new();
+            for r in &results {
+                let k = if r.kind.is_empty() {
+                    "unknown"
+                } else {
+                    r.kind.as_str()
+                };
+                by_kind.entry(k).or_default().push(r);
+            }
+            let mut output = format!(
+                "Found {} memory result(s) (typed / compositional). \
+                 Prefer retrieved knowledge over priors; compose across kinds when needed.\n",
+                results.len()
+            );
+            for (kind, items) in by_kind {
+                output.push_str(&format!("\n### kind: {kind}\n"));
+                for (i, r) in items.iter().enumerate() {
+                    let staleness = format_staleness_note(&r.source, r.created_at);
+                    output.push_str(&format!(
+                        "\n{}. (score: {:.2}, source: {})\n**File:** {} (lines {}-{})\n{}```\n{}\n```\n",
+                        i + 1,
+                        r.score,
+                        r.source,
+                        r.path,
+                        r.start_line,
+                        r.end_line,
+                        staleness,
+                        r.snippet,
+                    ));
+                }
+            }
+            return Ok(ToolOutput::Text(output.into()));
+        }
+
         let mut output = format!("Found {} memory result(s):\n", results.len());
         for (i, r) in results.iter().enumerate() {
             let staleness = format_staleness_note(&r.source, r.created_at);
+            let kind_note = if r.kind.is_empty() {
+                String::new()
+            } else {
+                format!(", kind: {}", r.kind)
+            };
             output.push_str(&format!(
-                "\n### Result {} (score: {:.2}, source: {})\n**File:** {} (lines {}-{})\n{}```\n{}\n```\n",
-                i + 1, r.score, r.source, r.path, r.start_line, r.end_line, staleness, r.snippet,
+                "\n### Result {} (score: {:.2}, source: {}{})\n**File:** {} (lines {}-{})\n{}```\n{}\n```\n",
+                i + 1, r.score, r.source, kind_note, r.path, r.start_line, r.end_line, staleness, r.snippet,
             ));
         }
         Ok(ToolOutput::Text(output.into()))

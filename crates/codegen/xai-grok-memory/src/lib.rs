@@ -25,11 +25,14 @@
 pub mod archive;
 pub mod backend;
 pub mod chunker;
+pub mod compose;
 pub mod dream;
 pub mod dream_lock;
 pub mod embedding;
 pub mod index;
+pub mod kind;
 pub mod mmr;
+pub mod promote;
 pub mod query_expansion;
 pub mod schema;
 pub mod search;
@@ -37,8 +40,22 @@ pub mod storage;
 pub mod text_utils;
 pub mod watcher;
 
+#[cfg(test)]
+mod comprel_tests;
+
 pub use backend::{EndpointScopedCredentials, MemoryBackendImpl, MemoryBackendParams};
+pub use compose::{
+    CompositionalResults, compositional_search, compositional_search_sync, decompose_query,
+    embed_query, format_compositional_injection, hybrid_search_sync, is_compositional_query,
+};
 pub use index::{MemoryIndex, init_sqlite_vec};
+pub use kind::{ChunkMeta, MemoryKind, classify_chunk};
+pub use promote::{
+    CorePinConfig, CorePinSection, TypedEntry, extract_core_pins, format_core_pin_injection,
+    format_remember_note, load_core_pins, mark_superseded_in_markdown, promote_entry,
+    promote_with_supersession,
+};
+pub use search::{SearchFilter, SearchResult, hybrid_search, hybrid_search_filtered};
 pub use storage::{MemoryScope, MemoryStorage};
 
 /// Embed all chunks that don't have embeddings yet.

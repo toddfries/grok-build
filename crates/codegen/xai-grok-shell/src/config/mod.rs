@@ -3,9 +3,10 @@ pub mod watcher;
 use crate::bundle;
 use serde::Deserialize;
 pub use xai_grok_config_types::{
-    DEFAULT_RECENCY_DECAY, MemoryDreamConfig, MemoryEmbeddingConfig, MemoryFlushConfig,
-    MemoryGcConfig, MemoryIndexConfig, MemoryInitialInjectionConfig, MemorySearchConfig,
-    MemorySessionConfig, MemoryWatcherConfig, MmrConfig, PruningConfig, TemporalDecayConfig,
+    DEFAULT_RECENCY_DECAY, MemoryCorePinConfig, MemoryDreamConfig, MemoryEmbeddingConfig,
+    MemoryFlushConfig, MemoryGcConfig, MemoryIndexConfig, MemoryInitialInjectionConfig,
+    MemorySearchConfig, MemorySessionConfig, MemoryWatcherConfig, MmrConfig, PruningConfig,
+    TemporalDecayConfig,
 };
 /// Full configuration for the memory system.
 ///

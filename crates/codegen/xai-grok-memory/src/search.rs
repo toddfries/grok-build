@@ -21,6 +21,7 @@ use std::collections::HashMap;
 
 use super::embedding::EmbeddingProvider;
 use super::index::MemoryIndex;
+use super::kind::MemoryKind;
 use xai_grok_config_types::MemorySearchConfig;
 
 /// A search result with merged scoring from FTS and vector search.
@@ -34,6 +35,31 @@ pub struct SearchResult {
     pub snippet: String,
     pub source: String,
     pub created_at: i64,
+    /// Typed memory kind (Mem-E partition).
+    pub kind: MemoryKind,
+    /// Optional id/slug this chunk supersedes.
+    pub supersedes: Option<String>,
+    /// `active` or `superseded`.
+    pub status: String,
+}
+
+/// Optional filters applied during hybrid search.
+#[derive(Debug, Clone, Default)]
+pub struct SearchFilter {
+    /// Restrict to these kinds. `None` = all kinds.
+    pub kinds: Option<Vec<MemoryKind>>,
+    /// When true (default in compositional path), drop `status = superseded`.
+    pub exclude_superseded: bool,
+}
+
+impl SearchFilter {
+    /// Untyped search that still drops superseded chunks.
+    pub fn active_only() -> Self {
+        Self {
+            kinds: None,
+            exclude_superseded: true,
+        }
+    }
 }
 
 /// Returns `true` for sources that contain curated long-term knowledge
@@ -149,13 +175,39 @@ pub async fn hybrid_search(
     query: &str,
     config: &MemorySearchConfig,
 ) -> Result<Vec<SearchResult>, Box<dyn std::error::Error>> {
+    hybrid_search_filtered(
+        index,
+        embedding_provider,
+        query,
+        config,
+        &SearchFilter::default(),
+    )
+    .await
+}
+
+/// Hybrid search with optional kind / superseded filters (Mem-E typed stores).
+pub async fn hybrid_search_filtered(
+    index: &MemoryIndex,
+    embedding_provider: Option<&dyn EmbeddingProvider>,
+    query: &str,
+    config: &MemorySearchConfig,
+    filter: &SearchFilter,
+) -> Result<Vec<SearchResult>, Box<dyn std::error::Error>> {
     let candidate_limit = config.max_results * 3;
+    let kinds = filter.kinds.as_deref();
 
     // Phase 1 (sync): FTS search + supplemental evergreen query so
     // global/workspace chunks aren't crowded out by session volume.
-    let mut fts_results = index.search_fts(query, candidate_limit).unwrap_or_default();
+    let mut fts_results = index
+        .search_fts_filtered(query, candidate_limit, None, kinds)
+        .unwrap_or_default();
     let evergreen = index
-        .search_fts_by_sources(query, candidate_limit, &["global", "workspace"])
+        .search_fts_filtered(
+            query,
+            candidate_limit,
+            Some(&["global", "workspace"]),
+            kinds,
+        )
         .unwrap_or_default();
     let existing: std::collections::HashSet<String> =
         fts_results.iter().map(|r| r.chunk_id.clone()).collect();
@@ -187,7 +239,13 @@ pub async fn hybrid_search(
     };
 
     // Phase 3 (sync): vector search + scoring + merge
-    hybrid_search_merge(index, fts_results, query_embedding.as_deref(), config)
+    hybrid_search_merge(
+        index,
+        fts_results,
+        query_embedding.as_deref(),
+        config,
+        filter,
+    )
 }
 
 /// Synchronous merge phase: vector search (if embedding provided), score
@@ -197,6 +255,7 @@ pub(super) fn hybrid_search_merge(
     fts_results: Vec<super::index::FtsResult>,
     query_embedding: Option<&[f32]>,
     config: &MemorySearchConfig,
+    filter: &SearchFilter,
 ) -> Result<Vec<SearchResult>, Box<dyn std::error::Error>> {
     let candidate_limit = config.max_results * 3;
 
@@ -315,6 +374,17 @@ pub(super) fn hybrid_search_merge(
             continue;
         }
 
+        // Kind filter for vector-only hits that bypassed FTS kind restriction.
+        if let Some(kinds) = filter.kinds.as_deref() {
+            if !kinds.is_empty() && !kinds.contains(&chunk.kind) {
+                continue;
+            }
+        }
+
+        if filter.exclude_superseded && chunk.status == "superseded" {
+            continue;
+        }
+
         let decay_multiplier =
             temporal_decay_multiplier(&chunk.source, chunk.created_at, now_secs, half_life);
 
@@ -356,6 +426,9 @@ pub(super) fn hybrid_search_merge(
                     snippet: chunk.text.clone(),
                     source: chunk.source.clone(),
                     created_at: chunk.created_at,
+                    kind: chunk.kind,
+                    supersedes: chunk.supersedes.clone(),
+                    status: chunk.status.clone(),
                 },
             ));
         }
@@ -761,6 +834,7 @@ mod tests {
             idx.search_fts("rust ownership", 10).unwrap(),
             None,
             &config,
+            &SearchFilter::default(),
         )
         .unwrap();
 
@@ -836,6 +910,7 @@ mod tests {
             idx.search_fts("rust ownership", 10).unwrap(),
             None,
             &config,
+            &SearchFilter::default(),
         )
         .unwrap();
 
@@ -1054,7 +1129,7 @@ mod tests {
         };
 
         let results =
-            hybrid_search_merge(&idx, fts_results, Some(&query_embedding[0]), &config).unwrap();
+            hybrid_search_merge(&idx, fts_results, Some(&query_embedding[0]), &config, &SearchFilter::default()).unwrap();
 
         assert!(!results.is_empty(), "should find at least one result");
         // With absolute normalization, the combined score should be
@@ -1324,6 +1399,7 @@ mod tests {
             idx.search_fts("rust ownership", 10).unwrap(),
             None,
             &config,
+            &SearchFilter::default(),
         )
         .unwrap();
 

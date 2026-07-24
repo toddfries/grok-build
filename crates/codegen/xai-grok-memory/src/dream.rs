@@ -95,7 +95,9 @@ You may also receive an existing memory document \u{2014} merge it with new sess
 rather than discarding prior knowledge. Your job:
 
 1. **Merge** related information into coherent topic summaries
-2. **Resolve** contradictions \u{2014} if a recent session disproves an older fact, keep only the current truth
+2. **Resolve** contradictions \u{2014} if a recent session disproves an older fact, keep only the current truth. \
+When replacing a prior fact/decision, set `status: superseded` on the old section (keep it briefly) \
+and write the new section with `status: active` and `supersedes: <old-id>` when an id exists.
 3. **Convert** relative dates (\"yesterday\", \"last week\") to absolute dates
 4. **Discard** ephemeral details:
    - Greetings, meta-commentary, tool output noise
@@ -104,6 +106,12 @@ rather than discarding prior knowledge. Your job:
    - User preferences already in global memory (OS, shell, paths)
    - Session metadata (dates, message counts)
 5. **Preserve** decisions, rationale, architecture, preferences, and problem/solution pairs
+6. **Type every section** for Mem-E retrieval. Use one of these heading forms:
+   - `## Decision: <title>` with body fields `type: decision` and `status: active`
+   - `## Fact: <title>` with `type: fact` / `status: active`
+   - `## Preference: <title>` with `type: preference` / `status: active`
+   - `## Procedure: <title>` with `type: procedure` / `status: active`
+   Optional fields: `id: <slug>`, `supersedes: <old-id>`.
 
 Respond with a single markdown document. Use ## headers to separate topics. \
 Each topic should be self-contained and useful to a future session that knows \

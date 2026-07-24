@@ -1719,6 +1719,22 @@ impl SessionActor {
         use xai_grok_tools::types::memory_backend::MemoryBackend as _;
         let (injection_params, configured_min_score) =
             build_initial_injection_backend_params(params, &self.memory.initial_injection_config);
+
+        // Soft Mem-I core pin: always-on preferences + active decisions.
+        // Load before moving `storage` into the search backend.
+        let core_pin_text = if self.memory.initial_injection_config.core_pin.enabled {
+            let cfg = &self.memory.initial_injection_config.core_pin;
+            let pin_cfg = xai_grok_memory::CorePinConfig {
+                max_chars: cfg.max_chars,
+                max_sections: cfg.max_sections,
+                ..Default::default()
+            };
+            let pins = xai_grok_memory::load_core_pins(&storage, &pin_cfg);
+            xai_grok_memory::format_core_pin_injection(&pins)
+        } else {
+            None
+        };
+
         let backend = crate::session::memory::MemoryBackendImpl::from_session_params(
             storage,
             &injection_params,
@@ -1759,7 +1775,11 @@ impl SessionActor {
                 injection_duration_ms: inject_start.elapsed().as_millis() as u64,
             },
         );
-        crate::session::helpers::memory_context::format_memory_reminder(&inject_results)
+        // Memeic: include soft-internal core pin alongside search hits.
+        crate::session::helpers::memory_context::format_memory_reminder_with_core(
+            &inject_results,
+            core_pin_text.as_deref(),
+        )
     }
     /// Inspect `tool_calls` for a `StructuredOutput` call and decide the turn's
     /// next step, pushing the call's `tool_result` (correction / retry error /

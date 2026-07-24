@@ -127,6 +127,9 @@ fn placeholder_result() -> SearchResult {
         snippet: String::new(),
         source: String::new(),
         created_at: 0,
+        kind: crate::kind::MemoryKind::Unknown,
+        supersedes: None,
+        status: "active".to_string(),
     }
 }
 
@@ -144,6 +147,9 @@ mod tests {
             snippet: snippet.to_string(),
             source: "workspace".to_string(),
             created_at: 1_700_000_000,
+            kind: crate::kind::MemoryKind::Unknown,
+            supersedes: None,
+            status: "active".to_string(),
         }
     }
 

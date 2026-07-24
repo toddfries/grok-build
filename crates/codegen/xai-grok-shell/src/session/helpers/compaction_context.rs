@@ -62,6 +62,7 @@ pub fn to_system_reminder_sync(
         discovered_agents_md,
         skills,
         &[],
+        None,
         subagent_tool_names,
         mcp_tool_names,
     )
@@ -70,7 +71,9 @@ pub fn to_system_reminder_sync(
 /// Format state info as system reminder for injection into chat.
 ///
 /// When a `memory_backend` is provided, searches memory for relevant
-/// context from past sessions (post-compaction recovery).
+/// context from past sessions (post-compaction recovery). Also injects
+/// soft-internal core pins (preferences + active decisions) so compaction
+/// cannot wipe Mem-I style always-on knowledge.
 pub async fn to_system_reminder(
     ctx: &CompactionStateContext,
     discovered_agents_md: &[PathBuf],
@@ -83,7 +86,7 @@ pub async fn to_system_reminder(
     let mut memory_results = Vec::new();
     if let Some(memory) = memory_backend {
         let query = ctx.last_user_query.as_deref().unwrap_or("project context");
-        if let Ok(results) = memory.search(query, 3, 0.0).await {
+        if let Ok(results) = memory.search(query, 6, 0.0).await {
             tracing::debug!(
                 target: xai_grok_telemetry::memory_log::TARGET,
                 results = results.len(),
@@ -93,14 +96,35 @@ pub async fn to_system_reminder(
         }
     }
 
+    // Soft Mem-I: reload core pins from global MEMORY.md even when search
+    // returns empty — compaction must not erase always-on preferences.
+    let core_pin = load_global_core_pin_text();
+
     to_system_reminder_inner(
         ctx,
         discovered_agents_md,
         skills,
         &memory_results,
+        core_pin.as_deref(),
         subagent_tool_names,
         mcp_tool_names,
     )
+}
+
+/// Load soft-internal core pins from `~/.grok/memory/MEMORY.md` (global).
+fn load_global_core_pin_text() -> Option<String> {
+    let path = xai_grok_tools::util::grok_home::grok_home()
+        .join("memory")
+        .join("MEMORY.md");
+    let content = std::fs::read_to_string(path).ok()?;
+    if content.trim().is_empty() {
+        return None;
+    }
+    let pins = xai_grok_memory::extract_core_pins(
+        &content,
+        &xai_grok_memory::CorePinConfig::default(),
+    );
+    xai_grok_memory::format_core_pin_injection(&pins)
 }
 
 /// Shared implementation for both sync and async variants.
@@ -109,6 +133,7 @@ fn to_system_reminder_inner(
     discovered_agents_md: &[PathBuf],
     skills: &[xai_grok_tools::implementations::skills::types::SkillInfo],
     memory_results: &[xai_grok_tools::types::memory_backend::MemorySearchResult],
+    core_pin: Option<&str>,
     subagent_tool_names: Option<&SubagentToolNames>,
     mcp_tool_names: Option<&McpToolNames>,
 ) -> Option<String> {
@@ -227,9 +252,10 @@ fn to_system_reminder_inner(
         ));
     }
 
-    // Relevant memory from past sessions (post-compaction recovery; shell-only)
-    if !memory_results.is_empty()
-        && let Some(reminder) = super::memory_context::format_memory_reminder(memory_results)
+    // Relevant memory from past sessions (post-compaction recovery; shell-only).
+    // Core pins survive even when hybrid search is empty.
+    if let Some(reminder) =
+        super::memory_context::format_memory_reminder_with_core(memory_results, core_pin)
     {
         sections.push(reminder);
     }

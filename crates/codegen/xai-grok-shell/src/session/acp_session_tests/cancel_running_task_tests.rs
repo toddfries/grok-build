@@ -667,7 +667,8 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                     initial_injection_config: crate::config::MemoryInitialInjectionConfig {
                         enabled: false,
                         min_score: Some(0.8),
-                    },
+        ..Default::default()
+    },
                     context_injected: std::sync::atomic::AtomicBool::new(false),
                     flush_count: std::sync::atomic::AtomicU64::new(0),
                     last_flush_content: std::cell::RefCell::new(None),

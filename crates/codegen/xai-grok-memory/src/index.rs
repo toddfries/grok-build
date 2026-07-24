@@ -12,12 +12,14 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::Once;
 
 use rusqlite::params;
 use xai_sqlite_journal::JournalMode;
 
 use super::chunker::{chunk_hash, chunk_markdown};
+use super::kind::{self, MemoryKind};
 use super::schema;
 use super::storage::MemoryStorage;
 use xai_grok_config_types::MemoryIndexConfig;
@@ -61,6 +63,12 @@ pub struct ChunkRecord {
     pub source: String,
     pub access_count: i64,
     pub created_at: i64,
+    /// Typed memory kind (Mem-E store partition).
+    pub kind: MemoryKind,
+    /// Optional id/slug this chunk supersedes.
+    pub supersedes: Option<String>,
+    /// `active` or `superseded`.
+    pub status: String,
 }
 
 /// Result of a FTS5 keyword search.
@@ -145,8 +153,9 @@ impl MemoryIndex {
                 }
             };
 
-        // Create schema
+        // Create schema (idempotent) then migrate older DBs to current version.
         db.execute_batch(&schema::schema_sql(dimensions, vec_available))?;
+        schema::migrate(&db)?;
 
         // Store/verify embedding dimensions in meta table
         let stored_dims: Option<String> = db
@@ -254,23 +263,43 @@ impl MemoryIndex {
         for (i, chunk) in new_chunks.iter().enumerate() {
             let chunk_id = format!("{}:{}", path_str, i);
             let hash = chunk_hash(&chunk.text);
+            let meta = kind::classify_chunk(&chunk.text, source);
+            let kind_str = meta.kind.as_str();
+            let supersedes = meta.supersedes.as_deref();
+            let status = meta.status.as_str();
             seen_ids.insert(chunk_id.clone());
 
             match existing.get(&chunk_id) {
                 Some(old) if old.hash == hash => {
-                    // Unchanged — skip
+                    // Content unchanged — still refresh typed metadata so
+                    // classifier improvements apply without a content rewrite.
+                    if old.kind != meta.kind
+                        || old.supersedes != meta.supersedes
+                        || old.status != meta.status
+                    {
+                        tx.execute(
+                            "UPDATE chunks SET kind = ?1, supersedes = ?2, status = ?3, \
+                             updated_at = ?4 WHERE id = ?5",
+                            params![kind_str, supersedes, status, now, chunk_id],
+                        )?;
+                        result.updated += 1;
+                    }
                 }
                 Some(old) => {
                     // Changed: update chunk, delete stale FTS entry, insert new one
                     tx.execute(
                         "UPDATE chunks SET text = ?1, hash = ?2, start_line = ?3, \
-                         end_line = ?4, updated_at = ?5 WHERE id = ?6",
+                         end_line = ?4, updated_at = ?5, kind = ?6, supersedes = ?7, \
+                         status = ?8 WHERE id = ?9",
                         params![
                             chunk.text,
                             hash,
                             chunk.start_line,
                             chunk.end_line,
                             now,
+                            kind_str,
+                            supersedes,
+                            status,
                             chunk_id
                         ],
                     )?;
@@ -305,7 +334,8 @@ impl MemoryIndex {
                     // New chunk
                     tx.execute(
                         "INSERT INTO chunks (id, path, start_line, end_line, text, hash, source, \
-                         created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                         created_at, updated_at, kind, supersedes, status) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                         params![
                             chunk_id,
                             path_str,
@@ -316,6 +346,9 @@ impl MemoryIndex {
                             source,
                             now,
                             now,
+                            kind_str,
+                            supersedes,
+                            status,
                         ],
                     )?;
                     let rowid = tx.last_insert_rowid();
@@ -406,23 +439,89 @@ impl MemoryIndex {
     }
 
     pub fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<FtsResult>, rusqlite::Error> {
+        self.search_fts_filtered(query, limit, None, None)
+    }
+
+    /// FTS5 keyword search with optional source and kind filters.
+    ///
+    /// When `kinds` is non-empty, only chunks whose `kind` is in the list are
+    /// returned. When `sources` is non-empty, only those sources are included.
+    pub fn search_fts_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        sources: Option<&[&str]>,
+        kinds: Option<&[MemoryKind]>,
+    ) -> Result<Vec<FtsResult>, rusqlite::Error> {
         let keywords = super::query_expansion::extract_keywords(query);
         let fts_query = keywords.join(" OR ");
         if fts_query.is_empty() {
             return Ok(vec![]);
         }
 
-        let mut stmt = self.db.prepare(
-            "SELECT rowid, rank FROM chunks_fts WHERE chunks_fts MATCH ?1 \
-             ORDER BY rank LIMIT ?2",
-        )?;
+        let mut sql = String::from(
+            "SELECT f.rowid, f.rank FROM chunks_fts f \
+             JOIN chunks c ON f.rowid = c.rowid \
+             WHERE chunks_fts MATCH ?1",
+        );
+        let mut bind: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        bind.push(Box::new(fts_query));
+
+        if let Some(sources) = sources {
+            if sources.is_empty() {
+                return Ok(vec![]);
+            }
+            let start = bind.len() + 1;
+            let placeholders: Vec<String> = sources
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("?{}", start + i))
+                .collect();
+            sql.push_str(&format!(" AND c.source IN ({})", placeholders.join(", ")));
+            for s in sources {
+                bind.push(Box::new(s.to_string()));
+            }
+        }
+
+        if let Some(kinds) = kinds {
+            if kinds.is_empty() {
+                return Ok(vec![]);
+            }
+            let start = bind.len() + 1;
+            let placeholders: Vec<String> = kinds
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("?{}", start + i))
+                .collect();
+            sql.push_str(&format!(" AND c.kind IN ({})", placeholders.join(", ")));
+            for k in kinds {
+                bind.push(Box::new(k.as_str().to_string()));
+            }
+        }
+
+        sql.push_str(&format!(" ORDER BY f.rank LIMIT ?{}", bind.len() + 1));
+        bind.push(Box::new(limit as i64));
+
+        let mut stmt = self.db.prepare(&sql)?;
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            bind.iter().map(|p| p.as_ref()).collect();
         let rows = stmt
-            .query_map(params![fts_query, limit], |row| {
+            .query_map(param_refs.as_slice(), |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
         self.resolve_fts_rowids(rows)
+    }
+
+    /// FTS search restricted to the given memory kinds.
+    pub fn search_fts_by_kinds(
+        &self,
+        query: &str,
+        limit: usize,
+        kinds: &[MemoryKind],
+    ) -> Result<Vec<FtsResult>, rusqlite::Error> {
+        self.search_fts_filtered(query, limit, None, Some(kinds))
     }
 
     fn resolve_fts_rowids(&self, rows: Vec<(i64, f64)>) -> Result<Vec<FtsResult>, rusqlite::Error> {
@@ -447,24 +546,9 @@ impl MemoryIndex {
     pub fn get_chunk(&self, id: &str) -> Result<Option<ChunkRecord>, rusqlite::Error> {
         let mut stmt = self.db.prepare(
             "SELECT rowid, id, path, start_line, end_line, text, hash, source, access_count, \
-             created_at FROM chunks WHERE id = ?1",
+             created_at, kind, supersedes, status FROM chunks WHERE id = ?1",
         )?;
-        let result = stmt
-            .query_row(params![id], |row| {
-                Ok(ChunkRecord {
-                    rowid: row.get(0)?,
-                    id: row.get(1)?,
-                    path: row.get(2)?,
-                    start_line: row.get::<_, i64>(3)? as usize,
-                    end_line: row.get::<_, i64>(4)? as usize,
-                    text: row.get(5)?,
-                    hash: row.get(6)?,
-                    source: row.get(7)?,
-                    access_count: row.get(8)?,
-                    created_at: row.get(9)?,
-                })
-            })
-            .ok();
+        let result = stmt.query_row(params![id], map_chunk_row).ok();
         Ok(result)
     }
 
@@ -669,22 +753,9 @@ impl MemoryIndex {
     ) -> Result<HashMap<String, ChunkRecord>, rusqlite::Error> {
         let mut stmt = self.db.prepare(
             "SELECT rowid, id, path, start_line, end_line, text, hash, source, access_count, \
-             created_at FROM chunks WHERE path = ?1",
+             created_at, kind, supersedes, status FROM chunks WHERE path = ?1",
         )?;
-        let rows = stmt.query_map(params![path], |row| {
-            Ok(ChunkRecord {
-                rowid: row.get(0)?,
-                id: row.get(1)?,
-                path: row.get(2)?,
-                start_line: row.get::<_, i64>(3)? as usize,
-                end_line: row.get::<_, i64>(4)? as usize,
-                text: row.get(5)?,
-                hash: row.get(6)?,
-                source: row.get(7)?,
-                access_count: row.get(8)?,
-                created_at: row.get(9)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![path], map_chunk_row)?;
         let mut map = HashMap::new();
         for row in rows {
             let record = row?;
@@ -734,6 +805,31 @@ impl MemoryIndex {
         )?;
         Ok(())
     }
+}
+
+/// Map a `chunks` SELECT row (with typed columns) into a [`ChunkRecord`].
+fn map_chunk_row(row: &rusqlite::Row<'_>) -> Result<ChunkRecord, rusqlite::Error> {
+    let kind_str: String = row.get(10)?;
+    let kind = kind_str
+        .parse::<MemoryKind>()
+        .unwrap_or(MemoryKind::Unknown);
+    Ok(ChunkRecord {
+        rowid: row.get(0)?,
+        id: row.get(1)?,
+        path: row.get(2)?,
+        start_line: row.get::<_, i64>(3)? as usize,
+        end_line: row.get::<_, i64>(4)? as usize,
+        text: row.get(5)?,
+        hash: row.get(6)?,
+        source: row.get(7)?,
+        access_count: row.get(8)?,
+        created_at: row.get(9)?,
+        kind,
+        supersedes: row.get(11)?,
+        status: row
+            .get::<_, Option<String>>(12)?
+            .unwrap_or_else(|| "active".into()),
+    })
 }
 
 #[cfg(test)]

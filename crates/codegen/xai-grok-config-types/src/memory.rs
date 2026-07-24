@@ -233,6 +233,8 @@ pub struct MemoryInitialInjectionConfig {
     /// When `None`, the first-turn search uses the historical default of `0.0`
     /// (no threshold filtering).
     pub min_score: Option<f32>,
+    /// Soft Mem-I core-pin: always inject top preferences/decisions without search.
+    pub core_pin: MemoryCorePinConfig,
 }
 
 impl Default for MemoryInitialInjectionConfig {
@@ -240,6 +242,32 @@ impl Default for MemoryInitialInjectionConfig {
         Self {
             enabled: true,
             min_score: None,
+            core_pin: MemoryCorePinConfig::default(),
+        }
+    }
+}
+
+/// Soft-internal core pin configuration (`[memory.initial_injection.core_pin]`).
+///
+/// Always-on preferences and active decisions (Mem-I analog) injected on the
+/// first turn even when hybrid search returns nothing useful.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct MemoryCorePinConfig {
+    /// Whether core-pin injection is enabled.
+    pub enabled: bool,
+    /// Maximum characters of core-pin content to inject.
+    pub max_chars: usize,
+    /// Maximum number of evergreen sections to pin.
+    pub max_sections: usize,
+}
+
+impl Default for MemoryCorePinConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_chars: 2_000,
+            max_sections: 8,
         }
     }
 }

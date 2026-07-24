@@ -93,6 +93,32 @@ pub struct MemorySearchResult {
     /// Unix timestamp (seconds) when the chunk was created.
     /// `None` for backends that don't track creation time.
     pub created_at: Option<i64>,
+    /// Typed memory kind (`fact`, `decision`, `preference`, `procedure`,
+    /// `episode`, `entity`, `unknown`). Empty string when the backend does
+    /// not classify kinds.
+    pub kind: String,
+    /// Optional id/slug this chunk supersedes.
+    pub supersedes: Option<String>,
+    /// Lifecycle status (`active`, `superseded`, …). Defaults to `"active"`.
+    pub status: String,
+}
+
+impl Default for MemorySearchResult {
+    fn default() -> Self {
+        Self {
+            chunk_id: String::new(),
+            path: String::new(),
+            start_line: 0,
+            end_line: 0,
+            score: 0.0,
+            snippet: String::new(),
+            source: String::new(),
+            created_at: None,
+            kind: String::new(),
+            supersedes: None,
+            status: "active".to_string(),
+        }
+    }
 }
 
 /// Backend-agnostic interface for memory queries.

@@ -24,43 +24,150 @@ pub fn conversation_has_memory_context(items: &[ConversationItem]) -> bool {
 
 /// Format memory search results as a markdown section for system-reminder injection.
 ///
-/// Each result is formatted with score, source, file path, line range,
-/// and the snippet in a fenced code block (preserving newlines/markdown).
-/// This matches the output format of the `memory_search` tool for consistency.
+/// When results carry typed kinds (Mem-E), groups them into kind sections with
+/// a MemEIC-style connector instruction to compose across sections. Otherwise
+/// falls back to a flat numbered list (legacy format).
 ///
 /// Returns `None` if results are empty.
 pub fn format_memory_reminder(results: &[MemorySearchResult]) -> Option<String> {
-    if results.is_empty() {
+    format_memory_reminder_with_core(results, None)
+}
+
+/// Like [`format_memory_reminder`], with an optional soft-internal core-pin
+/// block (preferences + active decisions) prepended before search hits.
+///
+/// Returns `None` only when both search results and core pin are empty.
+pub fn format_memory_reminder_with_core(
+    results: &[MemorySearchResult],
+    core_pin: Option<&str>,
+) -> Option<String> {
+    let core = core_pin.map(str::trim).filter(|s| !s.is_empty());
+    if results.is_empty() && core.is_none() {
         return None;
     }
 
-    let mut section =
-        format!("{MEMORY_CONTEXT_OPEN_TAG}\n## Relevant Memory from Past Sessions\n\n");
+    let mut section = String::from(MEMORY_CONTEXT_OPEN_TAG);
+    section.push('\n');
 
-    for (i, r) in results.iter().enumerate() {
-        let truncated = r.snippet.chars().count() > SNIPPET_MAX_CHARS;
-        let mut snippet: String = r.snippet.chars().take(SNIPPET_MAX_CHARS).collect();
-        if truncated {
-            snippet.push_str("...");
+    if let Some(core) = core {
+        section.push_str(core);
+        section.push_str("\n\n");
+    }
+
+    if !results.is_empty() {
+        let typed = results
+            .iter()
+            .any(|r| !r.kind.is_empty() && r.kind != "unknown");
+        if typed {
+            section.push_str(&format_typed_memory_reminder_body(results));
+        } else {
+            section.push_str("## Relevant Memory from Past Sessions\n\n");
+            for (i, r) in results.iter().enumerate() {
+                let truncated = r.snippet.chars().count() > SNIPPET_MAX_CHARS;
+                let mut snippet: String = r.snippet.chars().take(SNIPPET_MAX_CHARS).collect();
+                if truncated {
+                    snippet.push_str("...");
+                }
+                let staleness = format_staleness_note(&r.source, r.created_at);
+                section.push_str(&format!(
+                    "### Result {} (score: {:.2}, source: {})\n\
+                     **File:** {} (lines {}-{})\n\
+                     {}```\n{}\n```\n\n",
+                    i + 1,
+                    r.score,
+                    r.source,
+                    r.path,
+                    r.start_line,
+                    r.end_line,
+                    staleness,
+                    snippet,
+                ));
+            }
         }
-        let staleness = format_staleness_note(&r.source, r.created_at);
-        section.push_str(&format!(
-            "### Result {} (score: {:.2}, source: {})\n\
-             **File:** {} (lines {}-{})\n\
-             {}```\n{}\n```\n\n",
-            i + 1,
-            r.score,
-            r.source,
-            r.path,
-            r.start_line,
-            r.end_line,
-            staleness,
-            snippet,
-        ));
     }
 
     section.push_str(MEMORY_CONTEXT_CLOSE_TAG);
     Some(section)
+}
+
+/// MemEIC Knowledge Connector analog: section by kind and instruct composition.
+///
+/// Returns the body (without outer memory-context tags).
+fn format_typed_memory_reminder_body(results: &[MemorySearchResult]) -> String {
+    use std::collections::BTreeMap;
+
+    let mut by_kind: BTreeMap<&str, Vec<&MemorySearchResult>> = BTreeMap::new();
+    for r in results {
+        let k = if r.kind.is_empty() {
+            "unknown"
+        } else {
+            r.kind.as_str()
+        };
+        by_kind.entry(k).or_default().push(r);
+    }
+
+    let mut section = String::from(
+        "## Relevant Memory from Past Sessions\n\n\
+         Prefer retrieved knowledge over model priors when they conflict. \
+         Compose across sections when the question needs more than one kind of knowledge.\n\n",
+    );
+
+    // Prefer a stable human-useful order rather than pure alphabetical.
+    const ORDER: &[&str] = &[
+        "decision",
+        "fact",
+        "procedure",
+        "preference",
+        "entity",
+        "episode",
+        "unknown",
+    ];
+    let mut emitted = std::collections::HashSet::new();
+    for kind in ORDER.iter().copied().chain(by_kind.keys().copied()) {
+        if !emitted.insert(kind) {
+            continue;
+        }
+        let Some(items) = by_kind.get(kind) else {
+            continue;
+        };
+        section.push_str(&format!("### {}\n\n", kind_section_title(kind)));
+        for (i, r) in items.iter().enumerate() {
+            let truncated = r.snippet.chars().count() > SNIPPET_MAX_CHARS;
+            let mut snippet: String = r.snippet.chars().take(SNIPPET_MAX_CHARS).collect();
+            if truncated {
+                snippet.push_str("...");
+            }
+            let staleness = format_staleness_note(&r.source, r.created_at);
+            section.push_str(&format!(
+                "{}. (score: {:.2}, source: {}, kind: {})\n\
+                 **File:** {} (lines {}-{})\n\
+                 {}```\n{}\n```\n\n",
+                i + 1,
+                r.score,
+                r.source,
+                kind,
+                r.path,
+                r.start_line,
+                r.end_line,
+                staleness,
+                snippet,
+            ));
+        }
+    }
+
+    section
+}
+
+fn kind_section_title(kind: &str) -> &'static str {
+    match kind {
+        "decision" => "Retrieved decisions",
+        "fact" => "Retrieved facts",
+        "procedure" => "Retrieved procedures",
+        "preference" => "Retrieved preferences",
+        "entity" => "Retrieved entities",
+        "episode" => "Retrieved session notes",
+        _ => "Retrieved memory",
+    }
 }
 
 /// Check if a message looks like a greeting or generic opener.
@@ -109,6 +216,9 @@ mod tests {
             snippet: "Use tracing for logging, never println!".to_string(),
             source: "workspace".to_string(),
             created_at: None,
+            kind: String::new(),
+            supersedes: None,
+            status: "active".to_string(),
         }];
         let output = format_memory_reminder(&results).unwrap();
         assert!(output.contains("<memory-context>"));
@@ -129,6 +239,9 @@ mod tests {
             snippet: "## Conventions\n\n- Use Rust\n- No clones".to_string(),
             source: "workspace".to_string(),
             created_at: None,
+            kind: String::new(),
+            supersedes: None,
+            status: "active".to_string(),
         }];
         let output = format_memory_reminder(&results).unwrap();
         assert!(
@@ -148,6 +261,9 @@ mod tests {
             snippet: "x".repeat(1000),
             source: "session".to_string(),
             created_at: None,
+            kind: String::new(),
+            supersedes: None,
+            status: "active".to_string(),
         }];
         let output = format_memory_reminder(&results).unwrap();
         // Snippet should be truncated to SNIPPET_MAX_CHARS (500) + "..."
@@ -167,6 +283,9 @@ mod tests {
                 snippet: "First result".to_string(),
                 source: "workspace".to_string(),
                 created_at: None,
+                kind: String::new(),
+                supersedes: None,
+                status: "active".to_string(),
             },
             MemorySearchResult {
                 chunk_id: "b:0".to_string(),
@@ -177,6 +296,9 @@ mod tests {
                 snippet: "Second result".to_string(),
                 source: "session".to_string(),
                 created_at: None,
+                kind: String::new(),
+                supersedes: None,
+                status: "active".to_string(),
             },
         ];
         let output = format_memory_reminder(&results).unwrap();
@@ -200,6 +322,9 @@ mod tests {
             snippet: "Project uses Rust for backend services.".into(),
             source: "workspace".into(),
             created_at: None,
+            kind: String::new(),
+            supersedes: None,
+            status: "active".to_string(),
         }
     }
 
@@ -256,6 +381,9 @@ mod tests {
             snippet: "old info".into(),
             source: "session".into(),
             created_at: Some(now - 86400 * 10),
+        kind: String::new(),
+        supersedes: None,
+        status: "active".to_string(),
         }];
         let output = format_memory_reminder(&results).unwrap();
         assert!(
@@ -279,6 +407,9 @@ mod tests {
             snippet: "workspace data".into(),
             source: "workspace".into(),
             created_at: Some(now - 86400 * 30),
+        kind: String::new(),
+        supersedes: None,
+        status: "active".to_string(),
         }];
         let output = format_memory_reminder(&results).unwrap();
         assert!(
@@ -347,6 +478,9 @@ mod tests {
             snippet: "Project uses Rust for backend services.".into(),
             source: "workspace".into(),
             created_at: None,
+            kind: String::new(),
+            supersedes: None,
+            status: "active".to_string(),
         }];
         let reminder = format_memory_reminder(&results);
         assert!(

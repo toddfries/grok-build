@@ -3581,11 +3581,18 @@ pub(crate) fn execute(
                                 &cwd,
                                 None,
                             );
-                            storage
-                                .append_to_memory(
-                                    xai_grok_shell::session::memory::MemoryScope::Global,
-                                    &text,
-                                )
+                            // Typed Mem-E promote: classify the note and write
+                            // kind/status fields so hybrid search can partition it.
+                            let typed = xai_grok_memory::format_remember_note(&text, None);
+                            let body = if typed.is_empty() { text } else { typed };
+                            // Prefer workspace evergreen when cwd is a real project;
+                            // fall back to global for ephemeral paths.
+                            let scope = if storage.is_ephemeral() {
+                                xai_grok_shell::session::memory::MemoryScope::Global
+                            } else {
+                                xai_grok_shell::session::memory::MemoryScope::Workspace
+                            };
+                            storage.append_to_memory(scope, &body)
                         })
                         .await
                         .map_err(|e| format!("task join error: {e}"))

@@ -30,6 +30,7 @@ fn initial_injection_backend_params_use_override_min_score() {
     let initial_injection = crate::config::MemoryInitialInjectionConfig {
         enabled: true,
         min_score: Some(0.72),
+        ..Default::default()
     };
     let (adjusted, effective_min_score) =
         build_initial_injection_backend_params(&params, &initial_injection);
@@ -512,6 +513,7 @@ async fn create_injection_ready_actor(
     config.initial_injection = crate::config::MemoryInitialInjectionConfig {
         enabled: true,
         min_score: None,
+        ..Default::default()
     };
     let mut actor =
         create_test_actor_with_memory(1_000, 100_000, 85, gateway_tx, persistence_tx, Some(config))
@@ -643,6 +645,9 @@ async fn test_first_turn_reminder_skips_when_block_persisted() {
                         snippet: "Project uses Rust for backend services.".into(),
                         source: "workspace".into(),
                         created_at: None,
+                        kind: String::new(),
+                        supersedes: None,
+                        status: "active".to_string(),
                     },
                 ])
                 .unwrap();

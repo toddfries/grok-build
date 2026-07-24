@@ -444,59 +444,41 @@ impl MemoryBackend for MemoryBackendImpl {
             }
         }
 
-        // ── Sync phase 2: FTS search ──
+        // ── Search (Send-safe): never borrow MemoryIndex across .await ──
+        // Pattern: sync FTS prep is inside compositional_search_sync /
+        // hybrid_search_sync; embed first without an active index borrow.
         let mut search_config = self.search_config.clone();
         search_config.max_results = max_results;
         search_config.min_score = min_score as f32;
 
         let search_start = std::time::Instant::now();
         let keyword_count = super::query_expansion::extract_keywords(query).len();
-        let candidate_limit = search_config.max_results * 3;
-        let mut fts_results = index.search_fts(query, candidate_limit).unwrap_or_default();
-
-        // Supplemental evergreen query: ensure global/workspace MEMORY.md
-        // chunks appear in candidates even when session volume crowds them
-        // out of the base FTS results. Mirrors hybrid_search() in search.rs.
-        let evergreen = index
-            .search_fts_by_sources(query, candidate_limit, &["global", "workspace"])
-            .unwrap_or_default();
-        let existing: std::collections::HashSet<String> =
-            fts_results.iter().map(|r| r.chunk_id.clone()).collect();
-        for r in evergreen {
-            if !existing.contains(&r.chunk_id) {
-                fts_results.push(r);
-            }
-        }
-
         let vec_available = index.vec_available() && provider.is_some();
 
-        // ── Async phase: embed query for vector search (no &index borrow) ──
-        let query_embedding = if vec_available {
-            if let Some(ref provider) = provider {
-                match provider.embed_batch(&[query]).await {
-                    Ok(embeddings) if !embeddings.is_empty() => {
-                        Some(embeddings.into_iter().next().unwrap())
-                    }
-                    Ok(_) => None,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "embedding query failed, falling back to FTS-only");
-                        None
-                    }
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        // Async embed only (no &index). Then sync merge under short borrows.
+        let provider_ref = provider
+            .as_ref()
+            .map(|p| p as &dyn super::embedding::EmbeddingProvider);
+        let query_embedding =
+            super::compose::embed_query(provider_ref, query, vec_available).await;
 
-        // ── Sync phase 3: vector search + scoring + merge (borrows &index) ──
-        let results = super::search::hybrid_search_merge(
-            &index,
-            fts_results,
-            query_embedding.as_deref(),
-            &search_config,
-        )
+        let results = if super::compose::is_compositional_query(query) {
+            super::compose::compositional_search_sync(
+                &index,
+                query_embedding.as_deref(),
+                query,
+                &search_config,
+            )
+            .map(|c| c.flat)
+        } else {
+            super::compose::hybrid_search_sync(
+                &index,
+                query_embedding.as_deref(),
+                query,
+                &search_config,
+                &super::search::SearchFilter::active_only(),
+            )
+        }
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
             Box::new(std::io::Error::other(e.to_string()))
         })?;
@@ -555,6 +537,9 @@ impl MemoryBackend for MemoryBackendImpl {
                 snippet: r.snippet,
                 source: r.source,
                 created_at: Some(r.created_at),
+                kind: r.kind.as_str().to_string(),
+                supersedes: r.supersedes,
+                status: r.status,
             })
             .collect())
     }
