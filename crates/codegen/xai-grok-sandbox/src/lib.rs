@@ -11,8 +11,9 @@
 //! and child processes. Network is left open at the process level (agent
 //! needs LLM API); child network is blocked per-subprocess via seccomp.
 //!
-//! The `enforce` feature (on by default) pulls in `nono` for
-//! kernel-enforced sandboxing (Landlock/Seatbelt). When disabled, the
+//! The `enforce` feature (on by default) enables kernel/OS sandboxing:
+//! Landlock (Linux) and Seatbelt (macOS) via `nono`, and unveil+pledge
+//! on OpenBSD via the in-crate `openbsd` backend. When disabled, the
 //! crate still provides lightweight helpers (`log_violation`,
 //! `should_restrict_child_network`, `child_net`) that compile on all
 //! targets including musl.
@@ -32,6 +33,8 @@ mod deny;
 mod hook_write_deny;
 mod logging;
 mod network_policy;
+#[cfg(all(feature = "enforce", target_os = "openbsd"))]
+mod openbsd;
 mod paths;
 mod profiles;
 mod types;
@@ -60,7 +63,7 @@ pub fn requires_hook_write_deny(profile: &ProfileName, workspace: &Path) -> bool
         _ => true,
     }
 }
-#[cfg(all(feature = "enforce", unix))]
+#[cfg(all(feature = "enforce", unix, not(target_os = "openbsd")))]
 use nono::Sandbox;
 use std::path::Path;
 #[cfg(any(target_os = "linux", test))]
@@ -175,7 +178,51 @@ impl SandboxManager {
     }
     /// Apply the sandbox to the current process. **Irreversible.**
     /// Degrades gracefully if the platform doesn't support it.
-    #[cfg(all(feature = "enforce", unix))]
+    ///
+    /// * Linux/macOS: nono (Landlock / Seatbelt)
+    /// * OpenBSD: native unveil(2) + pledge(2) (`openbsd` module)
+    #[cfg(all(feature = "enforce", target_os = "openbsd"))]
+    pub fn apply(&mut self, workspace: &Path) -> anyhow::Result<()> {
+        if self.profile == ProfileName::Off {
+            tracing::info!("Sandbox disabled (profile: off)");
+            return Ok(());
+        }
+        let config = profiles::load_sandbox_config(workspace);
+        let mut resolved = self.profile.resolve_profile(workspace, &config)?;
+        resolved.deny = deny::effective_deny_paths(workspace, &resolved.deny);
+        self.net_restricted = resolved.restrict_network;
+        match openbsd::apply_profile(&resolved) {
+            Ok(()) => {
+                self.applied = true;
+                self.logger.log(SandboxEvent::profile_applied(
+                    &self.profile.to_string(),
+                    workspace,
+                    &resolved,
+                ));
+                tracing::info!(
+                    profile = %self.profile,
+                    workspace = %workspace.display(),
+                    restrict_network_configured = self.net_restricted,
+                    "Sandbox applied (OpenBSD unveil+pledge, irreversible)"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!(
+                    profile = %self.profile,
+                    error = %e,
+                    "OpenBSD sandbox could not be applied, continuing without sandbox"
+                );
+                self.logger.log(SandboxEvent::apply_failed(
+                    &self.profile.to_string(),
+                    workspace,
+                    &e,
+                ));
+                Ok(())
+            }
+        }
+    }
+    #[cfg(all(feature = "enforce", unix, not(target_os = "openbsd")))]
     pub fn apply(&mut self, workspace: &Path) -> anyhow::Result<()> {
         if self.profile == ProfileName::Off {
             tracing::info!("Sandbox disabled (profile: off)");
@@ -259,7 +306,15 @@ impl SandboxManager {
         });
     }
     /// Check whether the current platform supports sandboxing.
-    #[cfg(all(feature = "enforce", unix))]
+    #[cfg(all(feature = "enforce", target_os = "openbsd"))]
+    pub fn support_info() -> nono::SupportInfo {
+        nono::SupportInfo {
+            is_supported: openbsd::is_supported(),
+            platform: "openbsd",
+            details: openbsd::support_details(),
+        }
+    }
+    #[cfg(all(feature = "enforce", unix, not(target_os = "openbsd")))]
     pub fn support_info() -> nono::SupportInfo {
         Sandbox::support_info()
     }

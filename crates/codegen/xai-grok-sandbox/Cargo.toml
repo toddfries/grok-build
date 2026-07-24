@@ -65,3 +65,7 @@ regex = { workspace = true }
 [[example]]
 name = "sandbox_smoke_test"
 required-features = ["enforce"]
+
+[[example]]
+name = "openbsd_sandbox_smoke"
+required-features = ["enforce"]
