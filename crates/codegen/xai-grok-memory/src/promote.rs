@@ -368,6 +368,153 @@ pub fn promote_with_supersession(
     promote_entry(storage, scope, entry)
 }
 
+/// Explicit forget: mark sections matching `target` as `status: superseded`.
+///
+/// `target` matches either an `id:` field value or a case-insensitive substring
+/// of the `##` heading title. Returns the number of sections marked.
+///
+/// Trust requires forget — wrong memories retained forever are false memory.
+pub fn forget_matching(
+    storage: &MemoryStorage,
+    scope: MemoryScope,
+    target: &str,
+) -> std::io::Result<usize> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Ok(0);
+    }
+    let path = match scope {
+        MemoryScope::Global => storage.global_memory_file(),
+        MemoryScope::Workspace => storage.workspace_memory_file(),
+    };
+    if !path.exists() {
+        return Ok(0);
+    }
+    let existing = std::fs::read_to_string(&path)?;
+    let (rewritten, count) = mark_matching_superseded(&existing, target);
+    if count > 0 {
+        storage.write_long_term(scope, &rewritten)?;
+    }
+    Ok(count)
+}
+
+/// Forget a single entry by exact `id:` field value.
+pub fn forget_by_id(
+    storage: &MemoryStorage,
+    scope: MemoryScope,
+    id: &str,
+) -> std::io::Result<bool> {
+    if id.trim().is_empty() {
+        return Ok(false);
+    }
+    // Prefer exact id match via mark_superseded_in_markdown when possible.
+    let path = match scope {
+        MemoryScope::Global => storage.global_memory_file(),
+        MemoryScope::Workspace => storage.workspace_memory_file(),
+    };
+    if !path.exists() {
+        return Ok(false);
+    }
+    let existing = std::fs::read_to_string(&path)?;
+    if let Some(rewritten) = mark_superseded_in_markdown(&existing, id.trim()) {
+        storage.write_long_term(scope, &rewritten)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Mark all H2 sections whose `id:` equals `target` or whose title contains
+/// `target` (case-insensitive) as superseded. Returns `(new_markdown, count)`.
+pub fn mark_matching_superseded(markdown: &str, target: &str) -> (String, usize) {
+    let target = target.trim();
+    if target.is_empty() {
+        return (markdown.to_string(), 0);
+    }
+    let target_lower = target.to_ascii_lowercase();
+    let sections = split_h2_sections_raw(markdown);
+    if sections.is_empty() {
+        return (markdown.to_string(), 0);
+    }
+
+    let mut changed = 0usize;
+    let mut out = String::new();
+    if let Some(preamble) = preamble_before_h2(markdown) {
+        out.push_str(preamble);
+        if !preamble.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+
+    for (heading_line, body) in sections {
+        let title = heading_line.trim_start_matches('#').trim();
+        let id_match = body.lines().any(|l| {
+            l.trim()
+                .strip_prefix("id:")
+                .is_some_and(|rest| rest.trim() == target)
+        });
+        let title_match = title.to_ascii_lowercase().contains(&target_lower);
+        let is_target = id_match || title_match;
+
+        out.push_str(&heading_line);
+        out.push('\n');
+
+        if is_target {
+            let already = body.lines().any(|l| {
+                l.trim()
+                    .strip_prefix("status:")
+                    .is_some_and(|rest| rest.trim() == "superseded")
+            });
+            let mut saw_status = false;
+            for line in body.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("status:") {
+                    out.push_str("status: superseded\n");
+                    saw_status = true;
+                } else {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+            if !saw_status {
+                out.push_str("status: superseded\n");
+            }
+            if !already {
+                changed += 1;
+            }
+        } else {
+            out.push_str(&body);
+            if !body.is_empty() && !body.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        out.push('\n');
+    }
+
+    (out, changed)
+}
+
+/// Age of a chunk in days from a unix timestamp, or `None` if unknown.
+pub fn age_days(created_at: Option<i64>, now_secs: i64) -> Option<f64> {
+    let created = created_at?;
+    Some(((now_secs - created) as f64 / 86400.0).max(0.0))
+}
+
+/// Whether a session-scoped chunk should be treated as stale for display.
+///
+/// Evergreen sources (`global`, `workspace`) never count as stale.
+/// Thresholds mirror [`xai_grok_tools::types::memory_backend::format_staleness_note`]:
+/// soft note after 1 day, strong warning after 7 days. This helper returns
+/// `true` for either (age > 1 day).
+pub fn is_session_stale(source: &str, created_at: Option<i64>, now_secs: i64) -> bool {
+    if matches!(source, "global" | "workspace") {
+        return false;
+    }
+    match age_days(created_at, now_secs) {
+        Some(days) => days > 1.0,
+        None => false,
+    }
+}
+
 /// Ensure dream / flush output keeps usable structure.
 pub fn ensure_typed_structure(content: &str) -> String {
     normalize_memory_content(content)
@@ -586,5 +733,105 @@ cargo test -p xai-grok-memory
         assert!(content.contains("status: superseded"));
         assert!(content.contains("worktrees"));
         assert!(content.contains("supersedes: dec-shared"));
+    }
+
+    #[test]
+    fn forget_by_id_marks_superseded() {
+        let tmp = TempDir::new().unwrap();
+        let global = tmp.path().join("memory");
+        let workspace = global.join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let storage = MemoryStorage::with_paths(global, workspace);
+        let entry = TypedEntry::new(MemoryKind::Fact, "wrong fact", "API is v1.")
+            .with_id("fact-api-v1");
+        promote_entry(&storage, MemoryScope::Workspace, &entry).unwrap();
+        assert!(forget_by_id(&storage, MemoryScope::Workspace, "fact-api-v1").unwrap());
+        let content = std::fs::read_to_string(storage.workspace_memory_file()).unwrap();
+        assert!(content.contains("status: superseded"));
+        assert!(!content.contains("status: active"));
+    }
+
+    #[test]
+    fn forget_matching_by_title_substring() {
+        let tmp = TempDir::new().unwrap();
+        let global = tmp.path().join("memory");
+        let workspace = global.join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let storage = MemoryStorage::with_paths(global, workspace);
+        promote_entry(
+            &storage,
+            MemoryScope::Workspace,
+            &TypedEntry::new(MemoryKind::Decision, "use npm", "We use npm."),
+        )
+        .unwrap();
+        promote_entry(
+            &storage,
+            MemoryScope::Workspace,
+            &TypedEntry::new(MemoryKind::Decision, "use worktrees", "Isolate."),
+        )
+        .unwrap();
+        let n = forget_matching(&storage, MemoryScope::Workspace, "npm").unwrap();
+        assert_eq!(n, 1);
+        let content = std::fs::read_to_string(storage.workspace_memory_file()).unwrap();
+        // npm decision forgotten
+        assert!(
+            content.contains("status: superseded"),
+            "expected superseded: {content}"
+        );
+        // worktrees still active
+        assert!(
+            content.contains("status: active"),
+            "worktrees should remain active: {content}"
+        );
+    }
+
+    #[test]
+    fn mark_matching_superseded_idempotent() {
+        let md = "# Memory\n\n## Decision: use npm\ntype: decision\nstatus: active\nid: d1\n\nBody.\n";
+        let (once, n1) = mark_matching_superseded(md, "d1");
+        assert_eq!(n1, 1);
+        let (twice, n2) = mark_matching_superseded(&once, "d1");
+        assert_eq!(n2, 0);
+        assert!(twice.contains("status: superseded"));
+    }
+
+    #[test]
+    fn age_and_staleness_helpers() {
+        let now = 1_700_000_000i64;
+        assert!(age_days(None, now).is_none());
+        assert!((age_days(Some(now - 86400 * 3), now).unwrap() - 3.0).abs() < 0.01);
+        assert!(!is_session_stale("workspace", Some(now - 86400 * 30), now));
+        assert!(!is_session_stale("global", Some(now - 86400 * 30), now));
+        assert!(!is_session_stale("session", Some(now - 3600), now)); // 1h
+        assert!(is_session_stale("session", Some(now - 86400 * 2), now));
+    }
+
+    #[test]
+    fn remember_path_typed_promote_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let global = tmp.path().join("memory");
+        let workspace = global.join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let storage = MemoryStorage::with_paths(global, workspace);
+
+        // Mirror the pager # remember path: format_remember_note then append.
+        let note = "always open PR links after push";
+        let typed = format_remember_note(note, None);
+        assert!(typed.contains("type: preference"));
+        storage
+            .append_to_memory(MemoryScope::Workspace, &typed)
+            .unwrap();
+
+        let content = std::fs::read_to_string(storage.workspace_memory_file()).unwrap();
+        assert!(content.contains("type: preference"));
+        assert!(content.contains("status: active"));
+        assert!(content.contains("always open PR links after push"));
+
+        // Core pins pick it up for soft-internal injection.
+        let pins = load_core_pins(&storage, &CorePinConfig::default());
+        assert!(
+            pins.iter().any(|p| p.kind == MemoryKind::Preference),
+            "remembered preference should become a core pin: {pins:?}"
+        );
     }
 }

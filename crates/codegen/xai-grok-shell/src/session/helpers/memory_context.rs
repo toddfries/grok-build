@@ -170,6 +170,44 @@ fn kind_section_title(kind: &str) -> &'static str {
     }
 }
 
+/// Whether mid-session Knowledge Connector re-retrieval should run.
+///
+/// First-turn injection persists core pins + search hits into the system
+/// prompt (KV-cache friendly). Mid-session re-query is reserved for
+/// **compositional** user turns after that latch has fired, so multi-hop
+/// questions re-compose typed stores without rewriting the system prefix.
+///
+/// Returns `false` for greetings, short text, non-compositional queries, or
+/// when first-turn injection has not run yet (first turn owns that path).
+pub fn should_mid_session_connector(query: &str, first_turn_done: bool) -> bool {
+    if !first_turn_done {
+        return false;
+    }
+    let q = query.trim();
+    if q.len() < 20 || is_greeting(q) {
+        return false;
+    }
+    xai_grok_memory::is_compositional_query(q)
+}
+
+/// Format a mid-session connector reminder body (no outer memory-context tags).
+///
+/// Unlike first-turn injection, this is pushed as a `<system-reminder>` so the
+/// always-on core-pin block in the system message stays cache-stable.
+pub fn format_mid_session_connector_reminder(
+    results: &[MemorySearchResult],
+) -> Option<String> {
+    if results.is_empty() {
+        return None;
+    }
+    let body = format_typed_memory_reminder_body(results);
+    Some(format!(
+        "Active memory connector (mid-session re-retrieval). \
+         Core preferences/decisions in the system prompt still apply. \
+         Compose across the sections below for this multi-hop question.\n\n{body}"
+    ))
+}
+
 /// Check if a message looks like a greeting or generic opener.
 ///
 /// Used to detect vague first messages that won't produce useful memory
@@ -487,5 +525,58 @@ mod tests {
             reminder.is_some(),
             "non-empty results must produce Some(_) — injection_count SHOULD increment"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // mid-session connector policy
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mid_session_skips_until_first_turn_done() {
+        assert!(!should_mid_session_connector(
+            "Why did we choose worktrees and how do we rebuild?",
+            false
+        ));
+    }
+
+    #[test]
+    fn mid_session_fires_on_compositional_after_first_turn() {
+        assert!(should_mid_session_connector(
+            "Why did we choose worktrees and how do we rebuild on OpenBSD?",
+            true
+        ));
+    }
+
+    #[test]
+    fn mid_session_skips_greetings_and_short() {
+        assert!(!should_mid_session_connector("hi", true));
+        assert!(!should_mid_session_connector("fix flaky test", true));
+    }
+
+    #[test]
+    fn mid_session_reminder_wraps_typed_body() {
+        let results = vec![MemorySearchResult {
+            chunk_id: "a:0".into(),
+            path: "MEMORY.md".into(),
+            start_line: 0,
+            end_line: 2,
+            score: 0.9,
+            snippet: "Use worktrees.".into(),
+            source: "workspace".into(),
+            created_at: None,
+            kind: "decision".into(),
+            supersedes: None,
+            status: "active".into(),
+        }];
+        let out = format_mid_session_connector_reminder(&results).unwrap();
+        assert!(out.contains("Active memory connector"));
+        assert!(out.contains("Retrieved decisions") || out.contains("decision"));
+        assert!(out.contains("Use worktrees"));
+        assert!(!out.contains("<memory-context>"));
+    }
+
+    #[test]
+    fn mid_session_reminder_empty_is_none() {
+        assert!(format_mid_session_connector_reminder(&[]).is_none());
     }
 }

@@ -1781,6 +1781,79 @@ impl SessionActor {
             core_pin_text.as_deref(),
         )
     }
+
+    /// Mid-session Knowledge Connector: re-retrieve compositional memory for
+    /// multi-hop user turns after first-turn injection has already latched.
+    ///
+    /// Injects as a `<system-reminder>` (not a system-prefix rewrite) so the
+    /// soft-internal core pin block stays KV-cache stable. Only runs on the
+    /// first sampling iteration of a turn (`loop_index == 1`) when the user
+    /// query is compositional.
+    pub(crate) async fn maybe_inject_mid_session_memory_connector(&self, loop_index: u32) {
+        // Only once per user prompt (first agentic-loop iteration).
+        if loop_index != 1 {
+            return;
+        }
+        if !self
+            .memory
+            .context_injected
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        if !self.memory.initial_injection_config.enabled {
+            return;
+        }
+        let (Some(storage), Some(params)) =
+            (self.memory.storage(), self.memory.backend_params.as_ref())
+        else {
+            return;
+        };
+        let conversation = self.chat_state_handle.get_conversation().await;
+        let raw_query =
+            crate::session::helpers::session_compact::extract_last_real_user_query(&conversation)
+                .unwrap_or_default();
+        if !crate::session::helpers::memory_context::should_mid_session_connector(
+            &raw_query,
+            true,
+        ) {
+            return;
+        }
+
+        use xai_grok_tools::types::memory_backend::MemoryBackend as _;
+        let (injection_params, configured_min_score) =
+            build_initial_injection_backend_params(params, &self.memory.initial_injection_config);
+        let backend = crate::session::memory::MemoryBackendImpl::from_session_params(
+            storage,
+            &injection_params,
+        );
+        let inject_start = std::time::Instant::now();
+        let Ok(results) = backend.search(&raw_query, 6, configured_min_score).await else {
+            return;
+        };
+        let Some(reminder) =
+            crate::session::helpers::memory_context::format_mid_session_connector_reminder(
+                &results,
+            )
+        else {
+            tracing::debug!(
+                target: xai_grok_telemetry::memory_log::TARGET,
+                "MEMORY_CONNECTOR: compositional query but no hits"
+            );
+            return;
+        };
+        self.push_system_reminder(&reminder);
+        self.memory
+            .injection_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!(
+            target: xai_grok_telemetry::memory_log::TARGET,
+            results = results.len(),
+            duration_ms = inject_start.elapsed().as_millis() as u64,
+            "MEMORY_CONNECTOR: mid-session compositional re-retrieval injected"
+        );
+    }
+
     /// Inspect `tool_calls` for a `StructuredOutput` call and decide the turn's
     /// next step, pushing the call's `tool_result` (correction / retry error /
     /// terminal) as a side effect. Validates the args against `validator` and
@@ -2124,6 +2197,11 @@ impl SessionActor {
                     target: xai_grok_telemetry::memory_log::TARGET,
                     "MEMORY_INJECT: first-turn memory context injected"
                 );
+            } else {
+                // After first-turn latch: re-compose multi-kind memory for
+                // compositional user turns without rewriting system prefix.
+                self.maybe_inject_mid_session_memory_connector(loop_index)
+                    .await;
             }
             self.maybe_inject_mcp_reminder().await;
             if self.tool_context.task_output_token_budget.is_none()

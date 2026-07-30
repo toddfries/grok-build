@@ -51,8 +51,9 @@ pub use compose::{
 pub use index::{MemoryIndex, init_sqlite_vec};
 pub use kind::{ChunkMeta, MemoryKind, classify_chunk};
 pub use promote::{
-    CorePinConfig, CorePinSection, TypedEntry, extract_core_pins, format_core_pin_injection,
-    format_remember_note, load_core_pins, mark_superseded_in_markdown, promote_entry,
+    CorePinConfig, CorePinSection, TypedEntry, age_days, extract_core_pins, forget_by_id,
+    forget_matching, format_core_pin_injection, format_remember_note, is_session_stale,
+    load_core_pins, mark_matching_superseded, mark_superseded_in_markdown, promote_entry,
     promote_with_supersession,
 };
 pub use search::{SearchFilter, SearchResult, hybrid_search, hybrid_search_filtered};
