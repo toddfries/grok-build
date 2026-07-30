@@ -47,8 +47,14 @@ pub fn chunk_markdown(content: &str, config: &MemoryIndexConfig) -> Vec<Chunk> {
         return vec![];
     }
 
-    // If the entire content fits in one chunk, return it directly.
-    if content.len() <= max_chars {
+    // Split into sections by ## headers first — typed Mem-E needs one chunk
+    // per H2 so classify_chunk can assign kind/status per section. Packing a
+    // multi-section MEMORY.md into a single under-budget chunk overwrites
+    // kinds (last `type:` field wins) and breaks compositional retrieval.
+    let sections = split_by_headers(&lines);
+
+    // Single section that fits: keep the fast path.
+    if sections.len() <= 1 && content.len() <= max_chars {
         return vec![Chunk {
             text: content.to_string(),
             start_line: 0,
@@ -56,8 +62,6 @@ pub fn chunk_markdown(content: &str, config: &MemoryIndexConfig) -> Vec<Chunk> {
         }];
     }
 
-    // Split into sections by ## headers
-    let sections = split_by_headers(&lines);
     let mut chunks = Vec::new();
 
     for section in &sections {
@@ -298,6 +302,29 @@ mod tests {
         );
         assert!(chunks[0].text.contains("Section 1"));
         assert!(chunks.last().unwrap().text.contains("Section 2"));
+    }
+
+    #[test]
+    fn test_chunk_splits_multi_h2_even_when_under_budget() {
+        // Typed Mem-E fixture: whole file is small, but each ## is a kind.
+        let content = "# Memory\n\n\
+            ## Decision: use worktrees\ntype: decision\nstatus: active\n\nIsolate.\n\n\
+            ## Procedure: rebuild\ntype: procedure\nstatus: active\n\n1. cargo test\n\n\
+            ## Fact: schema v2\ntype: fact\nstatus: active\n\nschema_version is 2\n";
+        assert!(
+            content.len() < default_config().max_chunk_chars,
+            "fixture must be under max_chunk_chars to test the multi-H2 early-return path"
+        );
+        let chunks = chunk_markdown(content, &default_config());
+        assert!(
+            chunks.len() >= 3,
+            "multi-H2 must yield per-section chunks, got {}: {:?}",
+            chunks.len(),
+            chunks.iter().map(|c| c.text.lines().next()).collect::<Vec<_>>()
+        );
+        assert!(chunks.iter().any(|c| c.text.contains("type: decision")));
+        assert!(chunks.iter().any(|c| c.text.contains("type: procedure")));
+        assert!(chunks.iter().any(|c| c.text.contains("type: fact")));
     }
 
     #[test]
