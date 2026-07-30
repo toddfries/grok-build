@@ -258,6 +258,25 @@ pub fn compositional_search_sync(
         }
     }
 
+    // If kind partitions are empty (common for untyped legacy MEMORY.md that
+    // still matches the query text), fall back to untyped hybrid so a
+    // compositional-looking phrase like "what is X? how to use it?" still
+    // retrieves plain content rather than returning nothing.
+    if out.flat.is_empty() {
+        let filter = SearchFilter {
+            kinds: None,
+            exclude_superseded: true,
+        };
+        let results =
+            hybrid_search_sync(index, query_embedding, query, config, &filter)?;
+        for r in results {
+            let kind = r.kind;
+            out.by_kind.entry(kind).or_default().push(r.clone());
+            out.flat.push(r);
+        }
+        return Ok(out);
+    }
+
     // Supersession: if any result declares supersedes pointing at another
     // result's path stem or chunk id fragment, drop the older one.
     apply_supersession(&mut out);
@@ -462,6 +481,13 @@ mod tests {
     #[test]
     fn format_empty_is_none() {
         assert!(format_compositional_injection(&CompositionalResults::default()).is_none());
+    }
+
+    #[test]
+    fn compositional_query_falls_back_when_kinds_missing() {
+        // "what is … how to …" decomposes to fact+procedure, but untyped
+        // evergreen should still be returned rather than empty.
+        assert!(is_compositional_query("what is rust? how to use it!"));
     }
 
     #[test]
