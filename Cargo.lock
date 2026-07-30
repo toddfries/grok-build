@@ -13746,6 +13746,7 @@ dependencies = [
  "xai-grok-config",
  "xai-grok-foreign-sessions",
  "xai-grok-markdown",
+ "xai-grok-memory",
  "xai-grok-mermaid",
  "xai-grok-pager-diff",
  "xai-grok-pager-pty-harness",
