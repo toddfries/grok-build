@@ -3,9 +3,10 @@
 use ratatui::style::Style;
 use ratatui::text::{Span, Text};
 
-use crate::diff::DiffHunk;
+use crate::appearance::AppearanceConfig;
 use crate::inline_media_ffmpeg::inline_media_reserved_rows;
 use crate::prompt_images::{InlineMediaInfo, ScrollbackImageRef, ScrollbackVideoRef};
+use xai_grok_pager_diff::DiffHunk;
 // Imported (rather than referenced as `crate::…`) so the default trait method
 // below stays free of `crate::` tokens: `#[enum_delegate::register]` captures
 // default method bodies into a generated macro, where `crate::` trips
@@ -17,7 +18,7 @@ use super::blocks::{
     EditToolCallBlock, ExecuteToolCallBlock, LineRange, ListDirToolCallBlock, OtherToolCallBlock,
     ReadToolCallBlock, SearchFileMatch, SearchToolCallBlock, SessionEvent, SessionEventBlock,
     SubagentBlock, SubagentBlockKind, SystemMessageBlock, ThinkingBlock, ToolCallBlock,
-    UserPromptBlock,
+    UserPromptBlock, WorkflowBlock,
 };
 use super::types::{
     AccentStyle, BlockBackground, BlockContext, BlockOutput, DisplayMode, RenderedBlockOutput,
@@ -84,8 +85,15 @@ pub trait BlockContent {
     }
 
     /// Vertical padding (blank line with accent top/bottom).
-    fn has_vpad(&self, _ctx: &BlockContext) -> bool {
+    ///
+    /// Borrows the appearance rather than taking a [`BlockContext`] so the
+    /// O(history) height passes do not build one per entry.
+    fn has_vpad_for(&self, _appearance: &AppearanceConfig) -> bool {
         true
+    }
+
+    fn has_vpad(&self, ctx: &BlockContext) -> bool {
+        self.has_vpad_for(&ctx.appearance)
     }
 
     /// Whether block supports raw mode toggle.
@@ -379,6 +387,7 @@ pub enum RenderBlock {
     BgTask(BgTaskBlock),
     /// Subagent lifecycle (started / completed / failed).
     Subagent(SubagentBlock),
+    Workflow(WorkflowBlock),
     /// /btw side-question response (golden accent).
     Btw(BtwBlock),
     /// `/context` snapshot with categorical bar + breakdown.
@@ -400,6 +409,7 @@ macro_rules! delegate_block {
             RenderBlock::SessionEvent(b) => b.$method($($arg),*),
             RenderBlock::BgTask(b) => b.$method($($arg),*),
             RenderBlock::Subagent(b) => b.$method($($arg),*),
+            RenderBlock::Workflow(b) => b.$method($($arg),*),
             RenderBlock::Btw(b) => b.$method($($arg),*),
             RenderBlock::ContextInfo(b) => b.$method($($arg),*),
             RenderBlock::CreditLimit(b) => b.$method($($arg),*),
@@ -488,8 +498,8 @@ impl BlockContent for RenderBlock {
         delegate_block!(self, background(ctx))
     }
 
-    fn has_vpad(&self, ctx: &BlockContext) -> bool {
-        delegate_block!(self, has_vpad(ctx))
+    fn has_vpad_for(&self, appearance: &AppearanceConfig) -> bool {
+        delegate_block!(self, has_vpad_for(appearance))
     }
 
     fn has_raw_mode(&self) -> bool {
@@ -978,6 +988,7 @@ impl RenderBlock {
         match self {
             RenderBlock::UserPrompt(_) => Some(theme.text_primary),
             RenderBlock::AgentMessage(_) => None, // No accent for agent messages
+            RenderBlock::Workflow(_) => None,
             RenderBlock::ToolCall(block) => {
                 // Execute: Green for success, red for failure
                 // Read/Edit/ListDir/Search: No accent
@@ -1134,9 +1145,12 @@ impl RenderBlock {
             RenderBlock::AgentMessage(b) => join_searchable([Some(b.copy_text(false))]),
             RenderBlock::Thinking(b) => join_searchable([Some(b.copy_text(false))]),
             RenderBlock::System(b) => join_searchable([Some(b.text.clone())]),
-            RenderBlock::SessionEvent(b) => join_searchable([Some(b.marker_text())]),
+            RenderBlock::SessionEvent(b) => join_searchable([Some(b.event.message())]),
             RenderBlock::BgTask(b) => {
                 join_searchable([Some(b.command.clone()), b.description.clone()])
+            }
+            RenderBlock::Workflow(b) => {
+                join_searchable([Some(b.name.clone()), Some(b.objective.clone())])
             }
             RenderBlock::Subagent(b) => {
                 // Only the failed variant carries an error string worth indexing.

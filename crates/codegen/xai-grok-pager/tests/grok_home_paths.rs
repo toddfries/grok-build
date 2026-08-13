@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 
 #[test]
+#[serial_test::serial(GROK_HOME)]
 fn grok_home_override_path_helpers() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let grok_home = tmp.path().to_path_buf();
@@ -30,8 +31,36 @@ fn grok_home_override_path_helpers() {
         "$GROK_HOME/memory/MEMORY.md"
     );
 
+    // Copy-toast paths follow the same abbreviation convention, so a custom
+    // $GROK_HOME outside $HOME still displays short.
+    assert_eq!(
+        xai_grok_pager::clipboard::display_copy_path(&grok_home.join("last-copy.txt")),
+        "$GROK_HOME/last-copy.txt"
+    );
+
     assert!(xai_grok_pager::util::is_under_user_grok_home(&memory_path));
     assert!(!xai_grok_pager::util::is_under_user_grok_home(
         PathBuf::from("/tmp/other").as_path()
     ));
+}
+
+/// Isolated because `grok_home()`'s `OnceLock` is already initialized by the
+/// time the shared lib-test binary reaches a case like this.
+#[test]
+#[serial_test::serial(GROK_HOME)]
+fn disk_usage_run_creates_no_grok_home() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ghost = tmp.path().join("ghost-home");
+    unsafe {
+        std::env::set_var("GROK_HOME", &ghost);
+    }
+
+    for json in [false, true] {
+        xai_grok_pager::disk_usage_cmd::run(xai_grok_pager::disk_usage_cmd::DiskUsageArgs { json })
+            .expect("a missing home is not an error");
+        assert!(
+            !ghost.exists(),
+            "grok du must not create the home it reports on (json={json})"
+        );
+    }
 }

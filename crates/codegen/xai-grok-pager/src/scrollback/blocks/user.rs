@@ -15,6 +15,7 @@ use crate::scrollback::types::{
 const USER_PROMPT_BODY_RANGE: u16 = 0;
 /// Max visible lines when a user prompt is collapsed.
 const COLLAPSED_MAX_LINES: usize = 3;
+use crate::appearance::AppearanceConfig;
 use crate::theme::Theme;
 
 /// Drop invalid token ranges (replay meta is untrusted): out of bounds, not
@@ -136,6 +137,7 @@ impl UserPromptBlock {
         let token_end = first_line
             .find(char::is_whitespace)
             .unwrap_or(first_line.len());
+        #[allow(clippy::single_range_in_vec_init)] // field is multi-range capable
         let skill_token_ranges = if token_end > 0 {
             vec![0..token_end]
         } else {
@@ -487,8 +489,8 @@ impl BlockContent for UserPromptBlock {
         ctx.appearance.scrollback.blocks.prompt.bg
     }
 
-    fn has_vpad(&self, ctx: &BlockContext) -> bool {
-        ctx.appearance.scrollback.blocks.prompt.vpad && !ctx.appearance.prompt.compact
+    fn has_vpad_for(&self, appearance: &AppearanceConfig) -> bool {
+        appearance.scrollback.blocks.prompt.vpad && !appearance.prompt.compact
     }
 
     fn has_raw_mode(&self) -> bool {

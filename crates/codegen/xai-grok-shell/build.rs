@@ -49,7 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // An explicit GROK_SHELL_BUNDLE_RG_PATH still bundles on Windows (the
     // override path below copies any binary regardless of target).
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    if (target_os == "windows" || target_os == "openbsd") && path_override.is_none() {
+    if target_os == "windows" && path_override.is_none() {
         return Ok(());
     }
 

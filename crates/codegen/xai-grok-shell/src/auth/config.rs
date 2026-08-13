@@ -22,6 +22,8 @@ fn default_oauth2_scopes() -> Vec<String> {
         "api:access".into(),
         "conversations:read".into(),
         "conversations:write".into(),
+        "workspaces:read".into(),
+        "workspaces:write".into(),
     ]
 }
 fn default_team_oauth2_scopes() -> Vec<String> {
@@ -33,6 +35,8 @@ fn default_team_oauth2_scopes() -> Vec<String> {
         "team:read".into(),
         "conversations:read".into(),
         "conversations:write".into(),
+        "workspaces:read".into(),
+        "workspaces:write".into(),
     ]
 }
 /// Pin automatic auth to one method (`[auth] preferred_method` in config.toml).
@@ -133,7 +137,7 @@ pub const XAI_OAUTH2_ISSUER: &str = "https://auth.x.ai";
 const PROD_ACCOUNTS_APP_ORIGINS: &[&str] = &["https://accounts.x.ai"];
 /// See the opt-in non-production feature variant above — builds without
 /// the feature accept only the production accounts app.
-pub fn allowed_accounts_app_origins() -> Vec<String> {
+pub(crate) fn allowed_accounts_app_origins() -> Vec<String> {
     PROD_ACCOUNTS_APP_ORIGINS
         .iter()
         .map(|o| o.to_string())
@@ -144,7 +148,7 @@ pub fn allowed_accounts_app_origins() -> Vec<String> {
 ///
 /// Callers can chain additional configuration (e.g. `.allow_headers(...)` or
 /// `.allow_private_network(true)`) onto the returned layer.
-pub fn accounts_app_cors_layer(method: axum::http::Method) -> tower_http::cors::CorsLayer {
+pub(crate) fn accounts_app_cors_layer(method: axum::http::Method) -> tower_http::cors::CorsLayer {
     tower_http::cors::CorsLayer::new()
         .allow_origin(tower_http::cors::AllowOrigin::list(
             allowed_accounts_app_origins()
@@ -164,7 +168,7 @@ const XAI_OAUTH2_LOCAL_ISSUER: &str = "http://localhost:22255";
 const DEFAULT_OAUTH2_REFERRER: &str = "grok-build";
 /// Returns `true` when `GROK_LOCAL_AUTH=1` is set,
 /// indicating the local accounts-app should be used as the OAuth2 issuer.
-pub fn use_local_auth() -> bool {
+pub(crate) fn use_local_auth() -> bool {
     std::env::var("GROK_LOCAL_AUTH")
         .map(|v| !v.is_empty() && v != "0")
         .unwrap_or(false)
@@ -187,7 +191,7 @@ pub fn is_xai_oauth2_issuer(issuer: &str) -> bool {
 }
 /// auth.json scope key used by the pre-OIDC `grok login --legacy` flow.
 /// Matches the key format produced by the original `accounts.x.ai` relay auth.
-pub const LEGACY_AUTH_SCOPE: &str = "https://accounts.x.ai/sign-in";
+pub(crate) const LEGACY_AUTH_SCOPE: &str = "https://accounts.x.ai/sign-in";
 impl GrokComConfig {
     /// Whether `xai.api_key` auth is disabled. Pinning a team
     /// (`force_login_team_uuid`) implies this — team membership can't be verified
@@ -197,7 +201,7 @@ impl GrokComConfig {
     /// otherwise set `disable_api_key_auth = false` and override it — so the env
     /// is OR-ed in here and cannot be turned back off by a user layer. Trusted
     /// `requirements.toml` already wins over `config.toml` via layer precedence.
-    pub fn api_key_auth_disabled(&self) -> bool {
+    pub(crate) fn api_key_auth_disabled(&self) -> bool {
         self.disable_api_key_auth == Some(true)
             || self.force_login_team_uuid.is_some()
             || env_lockdown_forced()
@@ -206,7 +210,7 @@ impl GrokComConfig {
     /// interactive browser login, external auth provider) must not run — the
     /// pin is fail-closed. Explicit `grok login --devbox` / `--api-key` bypass
     /// this by not consulting automatic flow helpers.
-    pub fn blocks_automatic_oidc(&self) -> bool {
+    pub(crate) fn blocks_automatic_oidc(&self) -> bool {
         matches!(self.preferred_method, Some(PreferredAuthMethod::ApiKey))
     }
     /// The auth.json scope key for this config.
@@ -248,7 +252,7 @@ impl OAuth2ProviderConfig {
         })
     }
     /// Convert to [`OidcAuthConfig`] to reuse the OIDC login flow.
-    pub fn as_oidc(&self) -> OidcAuthConfig {
+    pub(crate) fn as_oidc(&self) -> OidcAuthConfig {
         OidcAuthConfig {
             issuer: self.issuer.clone(),
             client_id: self.client_id.clone(),
@@ -256,7 +260,7 @@ impl OAuth2ProviderConfig {
             audience: None,
         }
     }
-    pub fn base_auth_scope(&self) -> String {
+    pub(crate) fn base_auth_scope(&self) -> String {
         format!("{}::{}", self.issuer.trim_end_matches('/'), self.client_id)
     }
     pub fn auth_scope(&self) -> String {
@@ -381,7 +385,7 @@ mod tests {
         assert_eq!(PROD_ACCOUNTS_APP_ORIGINS, &["https://accounts.x.ai"]);
         assert_eq!(allowed_accounts_app_origins(), PROD_ACCOUNTS_APP_ORIGINS);
     }
-    /// FROZEN client contract: the 8 scopes the xAI OAuth2 client requests.
+    /// FROZEN client contract: the 10 scopes the xAI OAuth2 client requests.
     /// The server must keep accepting all of them; existing tokens carry
     /// exactly this set. Frozen OAuth client scope contract.
     #[test]
@@ -399,6 +403,8 @@ mod tests {
                 "api:access",
                 "conversations:read",
                 "conversations:write",
+                "workspaces:read",
+                "workspaces:write",
             ]
         );
     }

@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use crate::computer::types::KillOutcome;
+use crate::computer::types::KillSource;
 use crate::computer::types::TaskKind;
 use crate::computer::types::TerminalBackend;
 use crate::registry::types::{
@@ -141,17 +142,22 @@ impl ToolBridge {
         template: &str,
         placeholders: &serde_json::Value,
     ) -> Option<String> {
-        let registry = &*self.registry;
-        let result;
-        {
-            result = registry
-                .resources
-                .lock()
-                .await
-                .get::<TemplateRenderer>()
-                .and_then(|r| r.render_with_extra(template, placeholders).ok());
-        }
-        result
+        self.registry
+            .resources
+            .lock()
+            .await
+            .get::<TemplateRenderer>()
+            .and_then(|renderer| renderer.render_with_extra(template, placeholders).ok())
+    }
+
+    /// Return the finalized template renderer for multi-part prompt assembly.
+    pub async fn template_renderer_snapshot(&self) -> Option<TemplateRenderer> {
+        self.registry
+            .resources
+            .lock()
+            .await
+            .get::<TemplateRenderer>()
+            .cloned()
     }
 
     pub async fn register_mcp_tools<T>(
@@ -415,6 +421,16 @@ impl ToolBridge {
             .unwrap_or_default()
     }
 
+    /// Every skill name from session-start discovery
+    /// (see `SkillManager::discovery_snapshot_names`).
+    pub async fn skill_discovery_snapshot_names(&self) -> Vec<String> {
+        let registry = &*self.registry;
+        let res = registry.resources.lock().await;
+        res.get::<crate::types::skill_discovery_tracker::SkillManager>()
+            .map(|m| m.discovery_snapshot_names().to_vec())
+            .unwrap_or_default()
+    }
+
     /// Get the paths that have been reminded about.
     pub async fn agents_md_reminded_paths(&self) -> std::collections::HashSet<std::path::PathBuf> {
         let registry = &*self.registry;
@@ -529,18 +545,47 @@ impl ToolBridge {
         let _ = self.registry.update_resource(resource).await;
     }
 
-    /// Kill any background task
+    /// Kill a background task, recording who initiated the kill.
     pub async fn kill_background_task(
         &self,
         task_id: &str,
+        source: KillSource,
     ) -> Result<KillOutcome, xai_tool_runtime::ToolError> {
         if let Some(terminal) = &self.terminal {
-            Ok(terminal.kill_task(task_id).await)
+            Ok(terminal.kill_task_with_source(task_id, source).await)
         } else {
             Err(xai_tool_runtime::ToolError::invalid_arguments(format!(
                 "Missing Task Id: {task_id}"
             )))
         }
+    }
+
+    /// Snapshot the session's scheduled tasks; empty when no scheduler is
+    /// registered or the actor has stopped.
+    pub async fn list_scheduled_tasks(
+        &self,
+    ) -> Vec<crate::implementations::grok_build::scheduler::types::ScheduledTask> {
+        use crate::implementations::grok_build::scheduler::types::{
+            SchedulerCommand, SchedulerHandle,
+        };
+        let sender = {
+            let res = self.registry.resources.lock().await;
+            match res.get::<SchedulerHandle>() {
+                Some(handle) => handle.0.clone(),
+                None => return Vec::new(),
+            }
+        };
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        if sender
+            .send(SchedulerCommand::List { reply: reply_tx })
+            .is_err()
+        {
+            return Vec::new();
+        }
+        reply_rx
+            .await
+            .map(|snapshot| snapshot.tasks)
+            .unwrap_or_default()
     }
 
     pub async fn delete_scheduled_task(
@@ -568,9 +613,15 @@ impl ToolBridge {
             .map_err(|_| {
                 xai_tool_runtime::ToolError::custom("process_manager", "Scheduler actor stopped")
             })?;
-        reply_rx.await.map_err(|_| {
-            xai_tool_runtime::ToolError::custom("process_manager", "Scheduler actor dropped reply")
-        })
+        reply_rx
+            .await
+            .map_err(|_| {
+                xai_tool_runtime::ToolError::custom(
+                    "process_manager",
+                    "Scheduler actor dropped reply",
+                )
+            })?
+            .map_err(crate::implementations::grok_build::scheduler::types::scheduler_tool_error)
     }
 
     /// Move a foreground command to background by tool_call_id.
@@ -594,8 +645,12 @@ impl ToolBridge {
 
     /// Drain newly-completed bash background tasks not yet reported.
     /// Marks returned tasks in [`ReportedTaskCompletions`] to prevent
-    /// duplicate reminders from [`TaskCompletionReminder`].
-    pub async fn drain_between_turn_bash_completions(&self) -> Vec<TaskSnapshot> {
+    /// duplicate reminders from [`TaskCompletionReminder`]. Reserved IDs stay
+    /// unreported for a later genuine user turn.
+    pub async fn drain_between_turn_bash_completions(
+        &self,
+        reserved_ids: &[String],
+    ) -> Vec<TaskSnapshot> {
         let tasks = match self.list_tasks().await {
             Some(t) => t,
             None => return Vec::new(),
@@ -625,6 +680,7 @@ impl ToolBridge {
         completed
             .into_iter()
             .filter(|t| task_owned_by_session(t, my_owner.as_deref()))
+            .filter(|t| !reserved_ids.contains(&t.task_id))
             .filter(|t| state.mark_reported(&t.task_id))
             .collect()
     }
@@ -789,7 +845,11 @@ mod tests {
             kind: Default::default(),
             block_waited: false,
             explicitly_killed: false,
+            kill_result_delivered: false,
             owner_session_id: owner.map(|s| s.to_string()),
+            description: None,
+            is_backgrounded: false,
+            output_total_bytes: 0,
         }
     }
 
@@ -817,7 +877,7 @@ mod tests {
             terminal: Some(backend),
         };
 
-        let drained = bridge.drain_between_turn_bash_completions().await;
+        let drained = bridge.drain_between_turn_bash_completions(&[]).await;
         let ids: Vec<&str> = drained.iter().map(|t| t.task_id.as_str()).collect();
 
         assert!(ids.contains(&"mine-task"), "own task must drain: {ids:?}");
@@ -828,6 +888,110 @@ mod tests {
         assert!(
             !ids.contains(&"parent-task"),
             "another session's task must NOT leak into this session: {ids:?}"
+        );
+    }
+
+    struct RecordingKillTerminal {
+        kills: std::sync::Mutex<Vec<(String, KillSource)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TerminalBackend for RecordingKillTerminal {
+        async fn run(
+            &self,
+            _: TerminalRunRequest,
+        ) -> Result<TerminalRunResult, crate::computer::types::ComputerError> {
+            unimplemented!()
+        }
+        async fn run_background(
+            &self,
+            _: TerminalRunRequest,
+        ) -> Result<BackgroundHandle, crate::computer::types::ComputerError> {
+            unimplemented!()
+        }
+        async fn kill_task(&self, task_id: &str) -> KillOutcome {
+            self.kill_task_with_source(task_id, KillSource::ModelTool)
+                .await
+        }
+        async fn kill_task_with_source(&self, task_id: &str, source: KillSource) -> KillOutcome {
+            self.kills
+                .lock()
+                .unwrap()
+                .push((task_id.to_string(), source));
+            KillOutcome::Killed
+        }
+        async fn get_task(&self, _: &str) -> Option<TaskSnapshot> {
+            None
+        }
+        async fn wait_for_completion(&self, _: &str, _: Option<Duration>) -> Option<TaskSnapshot> {
+            None
+        }
+        async fn list_tasks(&self) -> Vec<TaskSnapshot> {
+            vec![]
+        }
+    }
+
+    #[tokio::test]
+    async fn kill_background_task_forwards_source() {
+        let backend = Arc::new(RecordingKillTerminal {
+            kills: std::sync::Mutex::new(Vec::new()),
+        });
+        let bridge = ToolBridge {
+            registry: Arc::new(FinalizedToolset::empty_for_test()),
+            terminal: Some(backend.clone()),
+        };
+        assert_eq!(
+            bridge
+                .kill_background_task("t-ui", KillSource::ClientUi)
+                .await
+                .unwrap(),
+            KillOutcome::Killed
+        );
+        assert_eq!(
+            bridge
+                .kill_background_task("t-td", KillSource::Teardown)
+                .await
+                .unwrap(),
+            KillOutcome::Killed
+        );
+        assert_eq!(
+            *backend.kills.lock().unwrap(),
+            vec![
+                ("t-ui".into(), KillSource::ClientUi),
+                ("t-td".into(), KillSource::Teardown),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn between_turn_bash_completions_skip_reserved_ids_without_reporting_them() {
+        let toolset = FinalizedToolset::empty_for_test();
+        {
+            let mut res = toolset.resources.lock().await;
+            res.register_state::<ReportedTaskCompletions>();
+        }
+        let backend: Arc<dyn TerminalBackend> = Arc::new(MockTerminal {
+            tasks: vec![completed_task("reserved", None)],
+        });
+        let bridge = ToolBridge {
+            registry: Arc::new(toolset),
+            terminal: Some(backend),
+        };
+
+        assert!(
+            bridge
+                .drain_between_turn_bash_completions(&["reserved".to_string()])
+                .await
+                .is_empty()
+        );
+        assert_eq!(
+            bridge
+                .drain_between_turn_bash_completions(&[])
+                .await
+                .into_iter()
+                .map(|task| task.task_id)
+                .collect::<Vec<_>>(),
+            vec!["reserved".to_string()]
         );
     }
 }

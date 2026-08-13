@@ -9,9 +9,11 @@ pub mod client_identity;
 pub mod completions_cmd;
 mod config_toml_edit;
 pub mod diagnostics;
-pub mod diff;
+pub mod disk_usage_cmd;
 pub mod docs;
+pub mod doctor_cmd;
 pub mod export_cmd;
+pub(crate) mod fs_size;
 pub mod git_info;
 pub mod headless;
 pub mod hyperlink_route;
@@ -41,8 +43,8 @@ pub mod notifications;
 #[allow(unused_imports, unused_macros)]
 pub mod obf;
 pub mod plugin_cmd;
-pub mod project_picker;
 pub mod pty_wrap;
+pub mod recent_dirs;
 pub mod scrollback;
 pub mod search;
 pub mod sessions_cmd;
@@ -51,8 +53,11 @@ pub mod share_cmd;
 pub mod slash;
 pub mod startup;
 pub mod tips;
+pub mod tutorial_docs;
 pub mod wrap_clipboard_image;
 pub mod wrap_cmd;
+pub(crate) mod wrap_filter;
+pub(crate) mod wrap_restore;
 
 pub mod tool_usage;
 

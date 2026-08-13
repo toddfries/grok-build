@@ -1,12 +1,122 @@
-# Permissions and Safety Controls
+# Permissions and safety
 
-Grok can read files, search code, edit files, and run shell commands. The permission system controls what the agent is allowed to do. You can combine several independent layers: permission rules, permission modes, hooks, and the OS-level sandbox.
+Control what Grok can access and do: permission modes, allow/ask/deny rules, hooks, and the optional OS-level sandbox.
 
-This guide explains how a tool call is authorized, how to configure permission rules from the CLI, native configuration, or Claude settings, and how to use `PreToolUse` hooks for allow lists that apply in every mode.
+- **Modes** set how often Grok asks for approval (always-approve, auto, ask, and related).
+- **Rules** set which tools are allowed, asked about, or blocked within that baseline.
 
 ---
 
-## How a Tool Call Is Authorized
+## Permission modes
+
+When Grok edits a file, runs a command, or calls an external tool, it may pause for approval. Permission modes control how often that happens.
+
+Modes set a baseline. Allow, ask, and deny [rules](#configuring-permissions) still apply on top of any mode.
+
+### Starting points
+
+| Situation | Mode |
+| --------- | ---- |
+| Interactive TUI | Default (ask), or auto for fewer prompts with background checks |
+| Scripts, SDKs, CI, agent servers | Always-approve; add [deny rules](#configuring-permissions) or hooks for hard limits |
+
+```bash
+grok -p "Run the tests" --always-approve
+grok agent --always-approve stdio
+grok agent --always-approve serve --bind 127.0.0.1:2419 --secret <token>
+```
+
+ACP clients can set `"_meta": { "yoloMode": true }` on `session/new`. See [Agent mode](15-agent-mode.md#automation-and-sdks).
+
+### Available modes
+
+| Mode | What runs without asking | Best for |
+| ---- | ------------------------ | -------- |
+| `default` (**ask**) | Read-only tools and built-in read-only shell commands | Interactive day-to-day use |
+| `acceptEdits` | File edits without a prompt | Local coding while you review diffs later |
+| `plan` | Accepted for compatibility; use [plan mode](19-plan-mode.md) for gated planning | Claude-compatible settings |
+| `auto` | Work the safety check allows; other calls are blocked or escalated | Interactive sessions that want fewer prompts |
+| `dontAsk` | Only pre-approved tools and built-in read-only handling | Strict CI allowlists |
+| `bypassPermissions` (**always-approve**) | Tool calls in general (`deny` rules, hooks, and some shell `ask` rules still apply) | Trusted automation and agent servers |
+
+**Always-approve** is the product name; config and Claude-compatible settings may use `bypassPermissions` for the same mode. Always-approve and auto are mutually exclusive (always-approve takes precedence when both are requested).
+
+### How to set the mode
+
+**Interactive TUI:** `Shift+Tab` / `Ctrl+O`, `/always-approve` or `/auto`, or `/settings` ([shortcuts](03-keyboard-shortcuts.md), [commands](04-slash-commands.md)).
+
+**CLI:**
+
+```bash
+grok --always-approve -p "Run the test suite"
+grok --permission-mode auto
+grok agent --always-approve serve --bind 127.0.0.1:2419 --secret <token>
+```
+
+**Config:**
+
+```toml
+[ui]
+permission_mode = "always-approve"   # or "auto", "ask", …
+```
+
+Claude-compatible `defaultMode` in `.claude/settings.json` is also supported (see [Claude-compatible settings](#3-claude-code-compatibility-claudesettingsjson)). CLI overrides config for that process.
+
+### Always-approve
+
+Skips ordinary permission prompts so tools run without waiting for a click. `deny` rules, hooks, and some shell `ask` rules still apply. Admins can lock the mode off (below).
+
+| Mechanism | Example |
+| --------- | ------- |
+| CLI | `--always-approve` (alias `--yolo`), or `--permission-mode bypassPermissions` |
+| Config | `[ui] permission_mode = "always-approve"` |
+| Interactive | `/always-approve`, `Ctrl+O` |
+| ACP | `_meta.yoloMode: true` on `session/new` |
+
+#### Always-approve with hard limits
+
+Keep always-approve for automation, and add deny rules for paths or commands you never want run:
+
+```toml
+# project .grok/config.toml
+[ui]
+permission_mode = "always-approve"
+
+[permission]
+deny = [
+  "Bash(rm -rf *)",
+  "MCPTool(sales__delete_*)",
+]
+```
+
+```bash
+grok -p "Deploy the service" --always-approve --deny 'Bash(rm -rf *)'
+```
+
+Deny always wins over allow and over always-approve’s normal pass-through. See [Configuring permissions](#configuring-permissions).
+
+### Auto mode
+
+Reduces interactive prompts by checking many tool calls before they run. Routine local work often proceeds; other calls may be blocked or escalated. In non-interactive sessions, a blocked call fails and is reported to the model (for example `Auto mode blocked this action …`). Behavior is the same for `grok -p`, `agent stdio`, and `agent serve`.
+
+For automation that must run tools without interactive approval, use always-approve (and deny rules if you need hard blocks) rather than auto alone.
+
+### Disable always-approve (administrators)
+
+Organizations can prevent always-approve from being enabled via CLI, TUI, or `/always-approve`. Set this in `requirements.toml` (user-level under `~/.grok/`, or system-wide under `/etc/grok/` for enforcement users cannot remove):
+
+```toml
+[ui]
+disable_bypass_permissions_mode = true
+```
+
+Do not use `permission_mode` for this lock; that key is a switchable default. The legacy `[ui] yolo = false` key in `requirements.toml` also disables always-approve for compatibility.
+
+Grok can still load Claude-style permission **rules** from managed settings; always-approve is locked with `requirements.toml` as shown above.
+
+---
+
+## How a tool call is authorized
 
 When the model requests a tool, the following checks happen in order:
 
@@ -23,7 +133,7 @@ When the model requests a tool, the following checks happen in order:
 
 5. **Prompt policy** (set by the [permission mode](#permission-modes)): prompt you, auto-approve, or auto-deny the call.
 
-Always-approve mode (`bypassPermissions`) short-circuits this pipeline after step 2: `deny` rules, hooks, and `ask` rules that match a shell command's segments still apply, but remembered grants (including remembered "never allow" entries) are not consulted, and `ask` rules on non-shell tools do not prompt.
+[Always-approve](#always-approve) short-circuits this pipeline after step 2: `deny` rules, hooks, and `ask` rules that match a shell command's segments still apply, but remembered grants (including remembered "never allow" entries) are not consulted, and `ask` rules on non-shell tools do not prompt.
 
 ---
 
@@ -51,56 +161,20 @@ After splitting chained commands (on `&&`, `||`, `;`, and pipes), the following 
 
 **Git (read-only):**
 - `git status`, `git branch`, `git log`, `git diff`, `git ls-files`, `git show`, `git rev-parse`
+- `git blame`, `git describe`, `git merge-base`, `git shortlog`
+- `git check-ignore`, `git check-attr`, `git cat-file`, `git ls-tree`, `git show-ref`, `git for-each-ref`, `git rev-list`, `git name-rev`, `git count-objects`
 
 **Search and inspection:**
 - `grep`, `rg` (not `rg --pre` / `rg --pre=…`, which spawn a preprocessor per file)
 
-**Build and check (read-only):**
-- `cargo check`
-
 **Kubernetes (read-only):**
 - `kubectl get`, `kubectl logs`, `kubectl describe`
 
-> **Note:** `tee` is not on this list because it can write its input to arbitrary files.
+> **Note:** `tee` is not on this list because it can write its input to arbitrary files. `cargo check` is not on this list because it compiles and runs `build.rs`, proc-macros, and any `build.rustc-wrapper` from the repo (in Ask mode it therefore prompts; Auto mode may still heuristic-allow `cargo` as a project code runner). `sort --compress-program=…` (including unique long-option abbreviations), `git -c` / `--config-env` overrides, and a git command whose local/worktree config installs an executable hook (`core.fsmonitor`, a `diff.*.command`/`textconv`/`external` driver, or a shell `alias.<safe-subcommand> = !…`) raise a request-level floor and prompt rather than auto-approve, unless the user granted that exact full script or always-approve is enabled.
 
 These checks apply per segment. In a command like `ls && rm -rf /`, the `ls` segment is recognized as read-only, but the `rm` segment is not on the list. In `default` mode the `rm` segment prompts; under `dontAsk` it is denied.
 
 ---
-
-## Permission Modes
-
-The prompt policy is named by one of these modes:
-
-| Mode                | Behavior                                                                 | Typical Use                     |
-|---------------------|--------------------------------------------------------------------------|---------------------------------|
-| `default`           | Prompt for anything not pre-approved                                     | Daily interactive use           |
-| `dontAsk`           | Deny anything without an explicit allow rule or built-in auto-approval   | Headless, CI, high-security     |
-| `bypassPermissions` | Auto-approve tool calls (`deny` rules, hooks, and shell `ask` rules still apply) | Trusted environments    |
-| `acceptEdits`       | Auto-approve file edits (`search_replace`, `write`, etc.)                | "Accept edits" workflows        |
-| `plan`              | Accepted for compatibility; plan sessions are a separate feature (see [19-plan-mode.md](19-plan-mode.md)) | Structured planning sessions |
-
-### Setting the Mode
-
-The mode is set by `defaultMode` in `.claude/settings.json` (see [Claude Code Compatibility](#3-claude-code-compatibility-claudesettingsjson)). `dontAsk`, `acceptEdits`, and `bypassPermissions` change the prompt policy from there; `default` and `plan` keep standard prompting.
-
-The `--permission-mode` CLI flag applies `bypassPermissions` (always-approve) and `default`; an explicit flag value always wins over a mode set in configuration. Passing `dontAsk`, `acceptEdits`, or `plan` to the flag is accepted but does not enable that policy; set those through `defaultMode` instead.
-
-In headless runs (`-p`), a tool call that would prompt is cancelled and reported to the model instead of waiting for input. For deny-by-default in automation, set `defaultMode: "dontAsk"`.
-
-### Disabling Always-Approve Mode
-
-Administrators can turn always-approve (`bypassPermissions` / `--always-approve`) off so it cannot be enabled from the CLI, the TUI toggle, or the `/always-approve` command. Set the dedicated key in `requirements.toml`:
-
-```toml
-[ui]
-disable_bypass_permissions_mode = true   # default: false. true = locked off.
-```
-
-Do not use `permission_mode` for this; it is a user-switchable default, not a lock. The legacy `[ui] yolo = false` key in `requirements.toml` also disables the mode, for backward compatibility; in `config.toml` the same key remains a togglable preference.
-
-The user-level `~/.grok/requirements.toml` is under the user's control, so a developer can remove the lock by editing that file. For enforcement that users cannot override, deploy the setting in the root-owned system file `/etc/grok/requirements.toml`.
-
-> **Note:** Grok honors the permission rules in Claude Code's `managed-settings.json`, but not its `disableBypassPermissionsMode` lock. To disable always-approve in Grok, use `requirements.toml` as shown above.
 
 ---
 
@@ -223,11 +297,11 @@ Example:
 }
 ```
 
-Supported `defaultMode` values are `default`, `acceptEdits`, `bypassPermissions`, `dontAsk`, and `plan`. Grok reads `defaultMode` from its canonical location under `permissions`; a top-level `defaultMode` is also accepted when the nested key is absent.
+Supported `defaultMode` values include `default`, `auto`, `acceptEdits`, `bypassPermissions`, `dontAsk`, and `plan`. Grok reads `defaultMode` from its canonical location under `permissions`; a top-level `defaultMode` is also accepted when the nested key is absent.
 
 `permissions.allow`, `permissions.deny`, and `permissions.ask` entries are translated into native rules and then matched with the semantics in the [Rule Matching Reference](#rule-matching-reference). Translation notes:
 
-- Rules for MCP tools must use the `MCPTool(server__tool)` form; the `mcp__server__tool` form never matches (see [MCP Rules](#mcp-rules)).
+- Rules for MCP tools may use either the `mcp__server__tool` form found in `.claude/settings.json` files or the native `MCPTool(server__tool)` form (see [MCP Rules](#mcp-rules)).
 - Rules naming an unrecognized tool, and parameter rules such as `Agent(model:opus)`, are skipped with a warning rather than failing the load.
 - `permissions.additionalDirectories` is parsed but not supported.
 
@@ -265,19 +339,21 @@ A built-in list (`rm`, `chmod`, `chown`, `chgrp`, `chattr`, `pkill`, `kill`, `ki
 
 ### Read, Edit, and Grep Rules
 
-Path patterns are globs matched against the path string the tool was called with:
+Path patterns are globs matched against the tool path after lexical normalization (`.`/`..` collapsed; relative paths joined with the session working directory). A `~`-prefixed tool path is matched literally — never joined with the working directory — because tools expand `~` to the home directory only after the permission check:
 
 - `*` and `?` do not cross `/`; `**` does. `Read(src/*)` matches `src/main.rs` but not `src/nested/mod.rs`; use `Read(src/**)` for the whole tree.
 - A bare filename matches only that exact string. Use `**/.env` to match `.env` at any depth.
 - There are no anchor prefixes: a leading `//` or `~/` in a pattern is treated as literal glob text. Write absolute-path patterns or `**/` patterns instead.
-- Paths are matched as given, without canonicalization. Whether a path is absolute or relative depends on how the tool was invoked, so patterns intended as boundaries should cover both forms (for example both `/repo/secrets/**` and `secrets/**`).
+- Because `.`/`..` are collapsed before matching, rooted patterns cannot be escaped by traversal: `Read(./**)` scopes to the working directory (bare relatives like `src/main.rs` match; `./../../etc/passwd` does not), and `Read(src/**)` stays under `src/`. Unrooted patterns (`*`, or a leading `**` as in `**/*.rs`) intentionally match at any depth, anywhere.
 - `Read` rules also govern `grep` searches; `Grep(...)` rules match only grep.
 
-`Read` and `Edit` deny rules additionally apply to file paths that shell commands touch (for example `cat` or `sed` on a denied path), and that shell-level check resolves symlinks. The direct `read_file`/`search_replace` tool checks do not resolve symlinks. For OS-level enforcement that covers every process, combine deny rules with the sandbox ([18-sandbox.md](18-sandbox.md)).
+`Read` and `Edit` deny rules additionally apply to file paths that shell commands touch (for example `cat` or `sed` on a denied path), including literal inline scripts passed to `bash`, `sh`, `dash`, `zsh`, or `ksh` with `-c`; that shell-level check uses the same working-directory-aware normalization (an absolute operand under the working directory also matches rooted rules like `Read(src/**)`) and also resolves symlinks. The direct `read_file`/`search_replace` tool checks do not resolve symlinks. For OS-level enforcement that covers every process, combine deny rules with the sandbox ([18-sandbox.md](18-sandbox.md)).
 
 ### MCP Rules
 
-`MCPTool(...)` patterns match the full Grok tool name in `server__tool` form, with glob support: `MCPTool(linear__*)` matches every tool from the `linear` server. Grok tool names carry no `mcp__` prefix, so a rule written as `mcp__server__tool` never matches an MCP call; write `MCPTool(server__tool)` instead.
+`MCPTool(...)` patterns match the full Grok tool name in `server__tool` form, with glob support: `MCPTool(linear__*)` matches every tool from the `linear` server. Grok tool names carry no `mcp__` prefix.
+
+The `mcp__` rule spelling used in `.claude/settings.json` files is also accepted and rewritten onto the same matcher: `mcp__linear` (every tool on the `linear` server), `mcp__linear__get_issue` (one tool), `mcp__linear__*` (every tool on the server), and `mcp__*` (every MCP tool).
 
 ### WebFetch Rules
 
@@ -286,7 +362,7 @@ Path patterns are globs matched against the path string the tool was called with
 
 ### Tool Names
 
-Recognized tool names: `Bash`, `Read` (and `NotebookRead`), `Edit` (and `Write`, `NotebookEdit`), `Grep` (and `Glob`), `MCPTool`, `WebFetch`, `WebSearch`. A bare `*` rule matches every tool. Globs are not supported in the tool-name position.
+Recognized tool names: `Bash`, `Read`, `Edit` (and `Write`), `Grep` (and `Glob`), `MCPTool`, `WebFetch`, `WebSearch`. A bare `*` rule matches every tool. Globs are not supported in the tool-name position.
 
 Rules naming an unrecognized tool (for example `Agent(model:opus)`) are skipped with a warning rather than failing the load.
 
@@ -321,11 +397,13 @@ With the gate enabled, prompts gain:
 - A matching "never allow" row, which persists a deny the same way.
 - Equivalent "always allow" rows for MCP tools and web-fetch domains.
 
-The remembered prefix is limited to a short form of the command: read-only commands persist just their listed prefix (for example `git status`, not the full argument list), and other commands persist a short leading prefix. The prompt shows exactly what will be remembered before you confirm. Commands on the [dangerous list](#dangerous-commands) prompt again rather than using a remembered prefix.
+The remembered prefix is limited to a short form of the command: read-only commands persist just their listed prefix (for example `git status`, not the full argument list), and other commands persist a short leading prefix. The prompt shows exactly what will be remembered before you confirm.
+
+Commands on the [dangerous list](#dangerous-commands) (for example `git push` and `rm`) never honor a remembered *prefix*: only an exact grant for the entire command counts, so their "Always allow" row defaults to the full command. Approving it stops prompts for that exact invocation only; any different arguments prompt again. When no rememberable grant could stop a script from prompting again — a dangerous command behind an `env` prefix, or a chain whose other steps would still need approval — the "Always allow" row is not offered at all rather than saving a rule that would not work.
 
 ### Persistence Is Per Project
 
-Interactive grants are stored in Grok's own state directory under your home directory, scoped to the directory you launched Grok from. A grant made in one project never applies in another, grants are not written into the repository, and they are not meant to be hand-edited.
+Interactive grants are stored in Grok's own state directory under your home directory, scoped to the git repository you launched Grok in (its repository root), so a grant accepted at the repo root also applies in sessions started from a subdirectory of the same repository. Outside a git repository, grants are scoped to the launch directory, and each git worktree keeps its own grants. A grant made in one project never applies in another, grants are not written into the repository, and they are not meant to be hand-edited.
 
 Interactive grants are personal, per-machine state. For an allowlist you can review in code review and share with teammates, use declarative rules in the project's `.grok/config.toml` instead.
 
@@ -454,7 +532,7 @@ Recommended combination for untrusted code:
 ## Managing Permissions in the TUI
 
 - Permission decisions appear in the transcript.
-- The `/always-approve` command toggles always-approve mode; other modes are set through `defaultMode` (see [Setting the Mode](#setting-the-mode)).
+- The `/always-approve` command toggles always-approve mode; other modes are set through `defaultMode` (see [How to set the mode](#how-to-set-the-mode)).
 - With `[ui] remember_tool_approvals = true`, permission prompts include per-command "Always allow" options that persist for the current project only. See [Interactive Approvals](#interactive-approvals-and-where-they-persist).
 - To manage hooks and plugins, run `/hooks` or `/plugins` (on most terminals, **Ctrl+L** also opens the Extensions modal; on VS Code, Cursor, Windsurf, and Zed, `Ctrl+L` is mid-turn interject instead). See [10-hooks.md](10-hooks.md).
 
@@ -470,9 +548,11 @@ Recommended combination for untrusted code:
 
 ---
 
-## See Also
+## See also
 
-- [10-hooks.md](10-hooks.md) — Hook authoring guide
-- [14-headless-mode.md](14-headless-mode.md) — Headless flags, including permission-related ones
-- [18-sandbox.md](18-sandbox.md) — OS-level isolation profiles
-- [05-configuration.md](05-configuration.md) — Native `config.toml` structure
+- [Hooks](10-hooks.md) — PreToolUse and other lifecycle scripts
+- [Headless mode](14-headless-mode.md) — One-shot CLI and automation flags
+- [Agent mode](15-agent-mode.md) — ACP, stdio, and agent servers
+- [Sandbox](18-sandbox.md) — OS-level isolation profiles
+- [Configuration](05-configuration.md) — Native `config.toml` structure
+

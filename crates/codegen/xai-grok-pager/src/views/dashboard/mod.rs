@@ -26,6 +26,7 @@
 
 pub mod layout;
 pub mod peek;
+pub mod peek_tail;
 pub mod render;
 pub mod row;
 pub mod state;
@@ -37,7 +38,7 @@ pub use render::{
 };
 pub use row::{
     DashboardRow, RowBadge, build_rows, build_rows_with_roster, classify_subagent,
-    classify_top_level, sort_rows,
+    classify_top_level, roster_activity_to_state, sort_rows,
 };
 pub use state::{
     DashboardDispatchMode, DashboardRowId, DashboardState, Filter, FilterValue, Focusable,

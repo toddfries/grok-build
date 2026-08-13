@@ -89,6 +89,16 @@ impl ParsedPermissions {
 ///     the vendor schema) and are used only when the nested key is **absent** —
 ///     not when it is present but the wrong type.
 pub fn load_claude_settings(path: &Path) -> Option<ClaudeSettings> {
+    // Opening a FIFO for read blocks until a writer appears; this runs on the
+    // session actor, so refuse non-regular files up front.
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_file() => {}
+        Ok(_) => {
+            tracing::warn!(?path, "refusing to read non-regular settings file");
+            return None;
+        }
+        Err(_) => return None,
+    }
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
@@ -364,8 +374,8 @@ pub fn find_claude_settings_paths(cwd: &Path) -> Vec<PathBuf> {
 }
 
 /// Global (user-tier) `~/.claude` settings paths, highest-priority-first. Split
-/// out of [`find_claude_settings_paths`] so [`load_claude_env_with_project`] can
-/// load ONLY the user tier when a folder is untrusted.
+/// out of [`find_claude_settings_paths`] so [`claude_settings_paths_for_trust`]
+/// can load ONLY the user tier when a folder is untrusted.
 ///
 /// Use `dirs::home_dir()` to match the home-resolution strategy used by
 /// `claude_import.rs::scan_importable_settings` and `claude_import_state.rs`,
@@ -379,6 +389,20 @@ fn global_claude_settings_paths() -> Vec<PathBuf> {
         paths.push(global.join("settings.json"));
     }
     paths
+}
+
+/// Claude settings files to load under the folder-trust gate.
+///
+/// When `project_trusted` is true, same as [`find_claude_settings_paths`]
+/// (project tree + user `~/.claude`). When false, only user-tier `~/.claude`
+/// — the single choke point for env injection and permission resolution so
+/// the two cannot drift on which files an untrusted clone may contribute.
+pub(crate) fn claude_settings_paths_for_trust(cwd: &Path, project_trusted: bool) -> Vec<PathBuf> {
+    if project_trusted {
+        find_claude_settings_paths(cwd)
+    } else {
+        global_claude_settings_paths()
+    }
 }
 
 /// Whether a project-tree `.claude/settings.json` / `settings.local.json` exists
@@ -473,11 +497,7 @@ pub fn load_claude_env_with_project(cwd: &Path, project_trusted: bool) -> HashMa
 
     // Untrusted folder: load ONLY the user-tier `~/.claude` env, dropping the
     // repo-tree (project) contribution.
-    let paths = if project_trusted {
-        find_claude_settings_paths(cwd)
-    } else {
-        global_claude_settings_paths()
-    };
+    let paths = claude_settings_paths_for_trust(cwd, project_trusted);
     let mut merged = HashMap::new();
 
     // Paths are ordered highest-priority-first. Process in reverse so that

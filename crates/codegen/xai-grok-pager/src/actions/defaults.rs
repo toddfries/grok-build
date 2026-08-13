@@ -21,18 +21,65 @@ pub fn ctrl_dot_unreliable() -> bool {
     terminal_context().ctrl_dot_unreliable() || cfg!(target_os = "windows") || crate::host::is_wsl()
 }
 
-/// Build the default action definitions.
+/// Choose the one agent-screen action that owns Ctrl+G for this mode.
+fn mode_ctrl_g_action(screen_mode: crate::app::ScreenMode) -> ActionDef {
+    if screen_mode.is_minimal() {
+        ActionDef {
+            id: ActionId::EditPromptExternal,
+            label: "edit prompt",
+            description: "Edit prompt in external editor",
+            default_key: key!('g', CONTROL),
+            alt_keys: vec![],
+            category: Category::Input,
+            context: When::AgentScreen,
+            hint_priority: None,
+            hint_key_display: None,
+            requires_confirmation: false,
+            long_help: Some(
+                "Opens the current prompt draft in $VISUAL or $EDITOR, falling back to vi when neither is set.\nSaving and closing the editor returns the updated text to the composer; it does not send the prompt.\nAvailable in minimal mode for ordinary attachment-free drafts.",
+            ),
+        }
+    } else {
+        ActionDef {
+            id: ActionId::ToggleTasks,
+            label: "tasks",
+            description: "Toggle tasks pane",
+            default_key: key!('g', CONTROL),
+            alt_keys: vec![],
+            category: Category::Panels,
+            context: When::AgentScreen,
+            hint_priority: None,
+            hint_key_display: None,
+            requires_confirmation: false,
+            long_help: Some(
+                "Shows or hides the tasks pane, which lists background tasks and their status.\nUse it to monitor or return to work you sent to the background with Ctrl+B.\nA side pane; toggle off to reclaim width.",
+            ),
+        }
+    }
+}
+
+/// Build the default action definitions for a screen mode.
 ///
 /// `mouse_reporting_toggle_enabled` gates the opt-in `ToggleMouseCapture`
 /// shortcut (see below); pass `false` for the standard set.
-pub fn default_actions(mouse_reporting_toggle_enabled: bool) -> Vec<ActionDef> {
+pub(super) fn default_actions(
+    screen_mode: crate::app::ScreenMode,
+    mouse_reporting_toggle_enabled: bool,
+) -> Vec<ActionDef> {
     let ctx = terminal_context();
     // xterm.js embeds: no KKP; host often steals Ctrl+I. Share one family flag for
     // quit / half-page / interject so VS Code-family embeds match VS Code.
     let in_vscode_family = ctx.brand.is_vscode_family();
     let in_vscode = in_vscode_family;
     let in_apple_terminal = ctx.brand == TerminalName::AppleTerminal;
+    // Shared by ToggleQueue (Ctrl+4 primary) and OpenDashboard (omit Ctrl+4 alt).
+    let local_mac_vscode = in_vscode_family && !ctx.is_ssh && cfg!(target_os = "macos");
     let ctrl_dot_unreliable = ctrl_dot_unreliable();
+    let send_to_background_help = if screen_mode.is_minimal() {
+        "Detaches the running foreground Execute so it keeps working in the background while you read, queue prompts, or start something else.\nTrack background work with /tasks.\nOnly meaningful while a foreground Execute is actually running."
+    } else {
+        "Detaches the running foreground Execute so it keeps working in the background while you read, queue prompts, or start something else.\nTrack and resume it from the tasks pane (Ctrl+G).\nOnly meaningful while a foreground Execute is actually running."
+    };
 
     let mut actions = vec![
         // ── Navigation (scrollback) ─────────────────────────────────
@@ -395,7 +442,7 @@ pub fn default_actions(mouse_reporting_toggle_enabled: bool) -> Vec<ActionDef> {
             hint_key_display: None,
             requires_confirmation: false,
             long_help: Some(
-                "Rewinds the conversation to an earlier turn, restoring the file snapshot taken then and discarding later changes.\nPick a turn from the list and choose what to restore (everything, conversation only, or files only); a running turn is offered for cancel first, and any conflicts or errors are reported after it runs.\nDestructive: later turns are dropped.\nAlso reachable idle with an empty prompt via Esc Esc (within 800ms), same as `/rewind`.",
+                "Rewinds the conversation to an earlier turn, discarding later turns. File changes made after that turn are left as-is.\nPick a turn from the list; a running turn is offered for cancel first. When Confirm before rewind is on (default), each pick asks Yes / Yes, and don't ask again / No — don't ask again turns the setting off in /settings.\nDestructive: later turns are dropped.\nAlso reachable idle with an empty prompt via Esc Esc (within 800ms), same as `/rewind`.",
             ),
         },
         ActionDef {
@@ -452,7 +499,7 @@ pub fn default_actions(mouse_reporting_toggle_enabled: bool) -> Vec<ActionDef> {
             hint_key_display: None,
             requires_confirmation: false,
             long_help: Some(
-                "Moves focus from the prompt to the scrollback so you can navigate the transcript.\nTab works in both simple and vim scrollback modes.\nEsc is reserved for clear / rewind (idle) policy, not focus.",
+                "Moves focus from the prompt to the scrollback so you can navigate the transcript.\nTab works in both simple and vim scrollback modes.\nEsc is reserved for the cancel / clear / rewind policy, not focus.",
             ),
         },
         ActionDef {
@@ -467,7 +514,7 @@ pub fn default_actions(mouse_reporting_toggle_enabled: bool) -> Vec<ActionDef> {
             hint_key_display: None,
             requires_confirmation: false,
             long_help: Some(
-                "Interrupts the agent's current turn and stops generation, keeping the session open.\nCtrl+C cancels when the prompt is empty; with a non-empty draft it clears the prompt first and leaves the turn running.\nIt stops the turn, not the app; use the quit shortcut to exit.",
+                "Interrupts the agent's current turn and stops generation, keeping the session open.\nEsc cancels immediately while a turn is running in minimal mode or when vim scrollback mode is off (prompt or scrollback focused, even with a draft).\nCtrl+C cancels when the prompt is empty; with a non-empty draft it clears the prompt first and leaves the turn running.\nIt stops the turn, not the app; use the quit shortcut to exit.",
             ),
         },
         ActionDef {
@@ -487,6 +534,7 @@ pub fn default_actions(mouse_reporting_toggle_enabled: bool) -> Vec<ActionDef> {
             ),
         },
         // ── Panes (agent-level — toggle side panes) ─────────────────
+        mode_ctrl_g_action(screen_mode),
         ActionDef {
             id: ActionId::ToggleTodos,
             label: "todos",
@@ -503,35 +551,20 @@ pub fn default_actions(mouse_reporting_toggle_enabled: bool) -> Vec<ActionDef> {
             ),
         },
         ActionDef {
-            id: ActionId::ToggleTasks,
-            label: "tasks",
-            description: "Toggle tasks pane",
-            default_key: key!('b', CONTROL),
-            alt_keys: vec![],
-            category: Category::Panels,
-            context: When::AgentScreen,
-            hint_priority: None,
-            hint_key_display: None,
-            requires_confirmation: false,
-            long_help: Some(
-                "Shows or hides the tasks pane, which lists background tasks and their status.\nUse it to monitor or return to work you sent to the background with Ctrl+G.\nA side pane; toggle off to reclaim width.",
-            ),
-        },
-        ActionDef {
             id: ActionId::ToggleQueue,
             label: "queue",
             description: "Toggle prompt queue",
             // Local macOS VS Code family only: ; / ' often never arrive (saw
             // Ctrl+4 in input-debug). SSH and non-Mac keep ; (+ ' alt). Win/Linux
             // VS maps Ctrl+4 to focusFourthEditorGroup.
-            default_key: if in_vscode_family && !ctx.is_ssh && cfg!(target_os = "macos") {
+            default_key: if local_mac_vscode {
                 key!('4', CONTROL)
             } else {
                 key!(';', CONTROL)
             },
             // Apostrophe alt for consoles that drop Ctrl on `;`. Local Mac VS
             // also keeps ; / ' as alts alongside primary Ctrl+4.
-            alt_keys: if in_vscode_family && !ctx.is_ssh && cfg!(target_os = "macos") {
+            alt_keys: if local_mac_vscode {
                 vec![key!(';', CONTROL), key!('\'', CONTROL)]
             } else {
                 vec![key!('\'', CONTROL)]
@@ -584,16 +617,14 @@ pub fn default_actions(mouse_reporting_toggle_enabled: bool) -> Vec<ActionDef> {
             id: ActionId::SendToBackground,
             label: "send to bg",
             description: "Send running task to background",
-            default_key: key!('g', CONTROL),
+            default_key: key!('b', CONTROL),
             alt_keys: vec![],
             category: Category::Panels,
             context: When::AgentScreen,
             hint_priority: None,
             hint_key_display: None,
             requires_confirmation: false,
-            long_help: Some(
-                "Detaches the running turn so it keeps working in the background while you read, queue prompts, or start something else.\nTrack and resume it from the tasks pane (Ctrl+B).\nOnly meaningful while a turn is actually running.",
-            ),
+            long_help: Some(send_to_background_help),
         },
         // ── Prompt ───────────────────────────────────────────────────
         ActionDef {
@@ -863,7 +894,13 @@ pub fn default_actions(mouse_reporting_toggle_enabled: bool) -> Vec<ActionDef> {
             label: "dashboard",
             description: "Open the Agent Dashboard",
             default_key: key!('\\', CONTROL),
-            alt_keys: vec![],
+            // Classic C0 FS (0x1c): without KKP, Ctrl+\ arrives as Char('4')+CONTROL
+            // (e.g. Apple Terminal). Omit when ToggleQueue already owns Ctrl+4.
+            alt_keys: if local_mac_vscode {
+                vec![]
+            } else {
+                vec![key!('4', CONTROL)]
+            },
             category: Category::Dashboard,
             context: When::Always,
             hint_priority: None,
@@ -934,8 +971,8 @@ pub fn default_actions(mouse_reporting_toggle_enabled: bool) -> Vec<ActionDef> {
         },
         ActionDef {
             id: ActionId::DashboardStop,
-            label: "stop",
-            description: "Stop / Close agent",
+            label: "delete",
+            description: "Stop / Delete agent",
             default_key: key!('x', CONTROL),
             alt_keys: vec![],
             category: Category::Dashboard,
@@ -944,7 +981,7 @@ pub fn default_actions(mouse_reporting_toggle_enabled: bool) -> Vec<ActionDef> {
             hint_key_display: None,
             requires_confirmation: false,
             long_help: Some(
-                "Stops the selected agent and removes its row from the dashboard; a running turn is interrupted first.\nUse it to clear finished or unwanted agents without attaching to them.\nThe in-overlay equivalent (Ctrl+X) confirms before stopping.",
+                "On a busy top-level row, Ctrl+X cancels the running turn. Once the row is idle, press Ctrl+X again within 2s to permanently delete the session.\nOn a subagent row, Ctrl+X kills the subagent.",
             ),
         },
         ActionDef {
@@ -971,9 +1008,9 @@ pub fn default_actions(mouse_reporting_toggle_enabled: bool) -> Vec<ActionDef> {
             description: "Toggle row grouping",
             // `Ctrl+G` ("group"). `Ctrl+S` was reassigned to the peek /
             // dispatch "send + open" chord so `Shift+Enter` could be
-            // freed for newline insertion. (`Ctrl+G` is also bound to
-            // `SendToBackground`, but that lives in `When::AgentScreen`,
-            // a context that never overlaps the dashboard.)
+            // freed for newline insertion. (`Ctrl+G` also has a
+            // mode-specific `When::AgentScreen` action, a context that never
+            // overlaps the dashboard.)
             default_key: key!('g', CONTROL),
             alt_keys: vec![],
             category: Category::Dashboard,
@@ -1204,6 +1241,18 @@ pub fn default_actions(mouse_reporting_toggle_enabled: bool) -> Vec<ActionDef> {
             ),
         },
     ]);
+
+    // Minimal has no interactive scrollback or dashboard surface. Keep its
+    // logical prompt, agent-screen, and legitimate global actions, but do not
+    // register bindings whose target UI cannot exist in this process mode.
+    if screen_mode.is_minimal() {
+        actions.retain(|def| {
+            !matches!(
+                def.context,
+                When::ScrollbackFocused | When::DashboardFocused | When::DashboardOverlay
+            ) && !matches!(def.id, ActionId::OpenDashboard | ActionId::FocusScrollback)
+        });
+    }
 
     actions
 }

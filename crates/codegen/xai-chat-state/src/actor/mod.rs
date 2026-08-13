@@ -16,7 +16,7 @@ mod tests;
 use tokio::sync::mpsc;
 use tracing::debug;
 
-use crate::commands::ChatStateCommand;
+use crate::commands::{ChatStateCommand, StrictAppendAck};
 use crate::events::ChatStateEvent;
 use crate::handle::ChatStateHandle;
 use crate::persistence::ChatPersistence;
@@ -107,14 +107,14 @@ impl ChatStateActor {
                         debug!("ChatStateActor shutting down: all handles dropped");
                         break;
                     };
-                    self.handle_command(cmd);
+                    self.handle_command(cmd).await;
                 }
             }
         }
     }
 
     /// Dispatch a command to the appropriate mutation or query handler.
-    fn handle_command(&mut self, cmd: ChatStateCommand) {
+    async fn handle_command(&mut self, cmd: ChatStateCommand) {
         match cmd {
             // ═══ Mutations ═══
             ChatStateCommand::PushUserMessage { item } => {
@@ -123,6 +123,42 @@ impl ChatStateActor {
             ChatStateCommand::PushUserMessageAndAck { item, reply } => {
                 self.push_user_message(item);
                 let _ = reply.send(());
+            }
+            ChatStateCommand::AppendWorkingDirectorySwitchAndAck {
+                content,
+                cwd_generation,
+                reply,
+            } => {
+                let generation = cwd_generation.get();
+                let candidate = ConversationItem::working_directory_switch(content, generation);
+                let persist_rx = self
+                    .persistence
+                    .persist_working_directory_switch_and_ack(&candidate);
+                let result = persist_rx.await.unwrap_or_else(|_| {
+                    Err(crate::commands::StrictAppendError::Indeterminate(
+                        std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "working-directory switch acknowledgement dropped; retry by generation",
+                        ),
+                    ))
+                });
+                let authoritative = match &result {
+                    Ok(StrictAppendAck::Appended)
+                    | Err(crate::commands::StrictAppendError::Committed {
+                        acknowledgement: StrictAppendAck::Appended,
+                        ..
+                    }) => Some(&candidate),
+                    Ok(StrictAppendAck::AlreadyPresent(authoritative))
+                    | Err(crate::commands::StrictAppendError::Committed {
+                        acknowledgement: StrictAppendAck::AlreadyPresent(authoritative),
+                        ..
+                    }) => Some(authoritative),
+                    Err(_) => None,
+                };
+                if let Some(authoritative) = authoritative {
+                    self.converge_working_directory_switch(generation, authoritative.clone());
+                }
+                let _ = reply.send(result);
             }
             ChatStateCommand::PushUserMessageWithRepairReason { item, reason } => {
                 self.push_user_message_with_repair_reason(item, reason);
@@ -203,6 +239,28 @@ impl ChatStateActor {
                     Ok(self.repair_history(dry_run))
                 };
                 let _ = reply.send(result);
+            }
+            ChatStateCommand::StripConversationImages { urls, reply } => {
+                match self.strip_conversation_images(&urls) {
+                    None => {
+                        let _ = reply.send(crate::StripOutcome::NoMatch);
+                    }
+                    Some((stripped, ack_rx)) => {
+                        // Await the disk ack off-actor: the persistence
+                        // channel already orders the write against later
+                        // commands, and blocking here would stall reads
+                        // behind an fsync.
+                        tokio::spawn(async move {
+                            let outcome = match ack_rx.await {
+                                Ok(Ok(())) => crate::StripOutcome::Applied { stripped },
+                                Ok(Err(_)) | Err(_) => {
+                                    crate::StripOutcome::WriteFailed { stripped }
+                                }
+                            };
+                            let _ = reply.send(outcome);
+                        });
+                    }
+                }
             }
             ChatStateCommand::ReplaceSystemHead { prompt, reply } => {
                 let changed = self.replace_system_head(&prompt);
@@ -367,6 +425,9 @@ impl ChatStateActor {
             }
             ChatStateCommand::GetLastAssistantText { reply } => {
                 let _ = reply.send(self.get_last_assistant_text());
+            }
+            ChatStateCommand::GetLastAssistantTextInTurn { reply } => {
+                let _ = reply.send(self.get_last_assistant_text_in_turn());
             }
             ChatStateCommand::GetFirstUserText { reply } => {
                 let _ = reply.send(self.get_first_user_text());

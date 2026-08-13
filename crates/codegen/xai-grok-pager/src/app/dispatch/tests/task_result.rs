@@ -2,13 +2,361 @@
 
 use super::super::task_result::{
     X11_PRIMARY_PASTE_HINT, maybe_show_x11_primary_paste_hint, show_clipboard_failure,
+    wrap_host_image_request_eligible,
 };
 use super::*;
+use xai_grok_shell::session::unified_list::ListScope;
+
+fn doctor_target(app: &AppView, id: AgentId) -> crate::app::actions::DoctorFixTarget {
+    let agent = &app.agents[&id];
+    crate::app::actions::DoctorFixTarget {
+        agent_id: id,
+        session_id: agent.session.session_id.clone(),
+        session_binding_epoch: agent.session_binding_epoch,
+        cwd: agent.session.cwd.clone(),
+    }
+}
+
+#[test]
+fn doctor_planning_promotes_initial_session_binding() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    app.agents.get_mut(&id).unwrap().unbind_session_id();
+    let target = doctor_target(&app, id);
+    app.agents
+        .get_mut(&id)
+        .unwrap()
+        .bind_session_id("bound".into());
+    dispatch_task_result(
+        TaskResult::DoctorFixPlanned {
+            target,
+            result: Ok(crate::app::actions::DoctorPlanningOutcome::Plan(Box::new(
+                crate::diagnostics::test_fix_plan(temp.path()),
+            ))),
+        },
+        &mut app,
+    );
+    let Some(crate::views::question_view::LocalQuestionKind::DoctorFix { target, .. }) = app.agents
+        [&id]
+        .question_view
+        .as_ref()
+        .and_then(|question| question.local_kind.as_ref())
+    else {
+        panic!("planning must open the doctor modal");
+    };
+    assert_eq!(
+        target.session_id.as_ref().map(|id| id.0.as_ref()),
+        Some("bound")
+    );
+}
+
+#[test]
+fn doctor_planning_rejects_bind_replace_and_unbind_rebind() {
+    let temp = tempfile::tempdir().unwrap();
+    for replacement in ["bind-replace", "unbind-rebind"] {
+        let mut app = test_app_with_agent();
+        let id = AgentId(0);
+        app.agents.get_mut(&id).unwrap().unbind_session_id();
+        let target = doctor_target(&app, id);
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.bind_session_id("first".into());
+        if replacement == "bind-replace" {
+            agent.bind_session_id("second".into());
+        } else {
+            agent.unbind_session_id();
+            agent.bind_session_id("first".into());
+        }
+        dispatch_task_result(
+            TaskResult::DoctorFixPlanned {
+                target,
+                result: Ok(crate::app::actions::DoctorPlanningOutcome::Plan(Box::new(
+                    crate::diagnostics::test_fix_plan(temp.path()),
+                ))),
+            },
+            &mut app,
+        );
+        assert!(app.agents[&id].question_view.is_none(), "{replacement}");
+        assert!(
+            last_system_text(&app, id).contains("session changed"),
+            "{replacement}"
+        );
+    }
+}
+
+#[test]
+fn doctor_planning_opens_refuses_remote_and_rejects_stale_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let target = doctor_target(&app, id);
+
+    app.agents.get_mut(&id).unwrap().prompt.set_text("draft");
+    let scrollback_len = app.agents[&id].scrollback.len();
+    dispatch_task_result(
+        TaskResult::DoctorFixPlanned {
+            target: target.clone(),
+            result: Ok(crate::app::actions::DoctorPlanningOutcome::Plan(Box::new(
+                crate::diagnostics::test_fix_plan(temp.path()),
+            ))),
+        },
+        &mut app,
+    );
+    assert_eq!(app.agents[&id].prompt.text(), "");
+    assert_eq!(
+        app.agents[&id].scrollback.len(),
+        scrollback_len,
+        "the confirmation preview belongs only in the question modal"
+    );
+    let question = app.agents[&id]
+        .question_view
+        .as_ref()
+        .expect("doctor question")
+        .questions
+        .first()
+        .expect("doctor question contents");
+    assert!(
+        question.options[0]
+            .preview
+            .as_deref()
+            .is_some_and(|preview| preview.contains("Doctor Fix")),
+        "the modal must retain the exact fix preview"
+    );
+    app.agents.get_mut(&id).unwrap().question_view = None;
+
+    dispatch_task_result(
+        TaskResult::DoctorFixPlanned {
+            target: target.clone(),
+            result: Ok(crate::app::actions::DoctorPlanningOutcome::RunLocally(
+                "grok doctor fix ssh-wrap".to_owned(),
+            )),
+        },
+        &mut app,
+    );
+    assert!(
+        last_system_text(&app, id)
+            .contains("On your local computer, run: grok doctor fix ssh-wrap")
+    );
+
+    app.agents
+        .get_mut(&id)
+        .unwrap()
+        .bind_session_id("replacement".into());
+    dispatch_task_result(
+        TaskResult::DoctorFixPlanned {
+            target: target.clone(),
+            result: Ok(crate::app::actions::DoctorPlanningOutcome::Plan(Box::new(
+                crate::diagnostics::test_fix_plan(temp.path()),
+            ))),
+        },
+        &mut app,
+    );
+    assert!(app.agents[&id].question_view.is_none());
+    assert!(last_system_text(&app, id).contains("session changed"));
+}
+
+#[test]
+fn doctor_apply_completion_prefers_initiator_then_active_and_welcome_fallback() {
+    let mut app = three_agent_app();
+    let initiator = AgentId(0);
+    let active = AgentId(1);
+    app.active_view = ActiveView::Agent(active);
+    let target = doctor_target(&app, initiator);
+
+    dispatch_task_result(
+        TaskResult::DoctorFixApplied {
+            target: target.clone(),
+            result: Err("stale plan".to_owned()),
+        },
+        &mut app,
+    );
+    assert_eq!(
+        last_system_text(&app, initiator),
+        "Could not apply the fix: stale plan"
+    );
+
+    app.agents.shift_remove(&initiator);
+    dispatch_task_result(
+        TaskResult::DoctorFixApplied {
+            target: target.clone(),
+            result: Err("apply failed".to_owned()),
+        },
+        &mut app,
+    );
+    assert_eq!(
+        last_system_text(&app, active),
+        "Could not apply the fix: apply failed"
+    );
+
+    app.agents.clear();
+    app.active_view = ActiveView::Welcome;
+    dispatch_task_result(
+        TaskResult::DoctorFixApplied {
+            target,
+            result: Err("validator failed".to_owned()),
+        },
+        &mut app,
+    );
+    assert_eq!(
+        app.startup_warnings.last().unwrap().message,
+        "Could not apply the fix: validator failed"
+    );
+}
+
+#[test]
+fn doctor_apply_reload_success_does_not_claim_live_finding_disappeared() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let target = doctor_target(&app, id);
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join(".tmux.conf");
+    dispatch_task_result(
+        TaskResult::DoctorFixApplied {
+            target,
+            result: Ok(crate::diagnostics::FixOutcome::new_for_test(
+                crate::diagnostics::TMUX_CLIPBOARD_ID,
+                crate::diagnostics::FixStatus::Applied,
+                path.clone(),
+                None,
+                crate::diagnostics::FixActivation::RequiresReload,
+                None,
+            )),
+        },
+        &mut app,
+    );
+    let output = last_system_text(&app, id);
+    assert!(
+        output.starts_with(&format!(
+            "Added `set -g set-clipboard on` to `{}`.",
+            path.display()
+        )),
+        "{output}"
+    );
+    assert!(
+        output.contains("Reload tmux with `tmux source-file"),
+        "{output}"
+    );
+    assert!(output.contains("Run /doctor again to verify"), "{output}");
+    assert!(!output.contains("0 issues"), "{output}");
+    assert!(!output.contains("Environment\n"), "{output}");
+}
+
+#[test]
+fn doctor_apply_success_only_renders_resolution_instructions() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let target = doctor_target(&app, id);
+    let temp = tempfile::tempdir().unwrap();
+    dispatch_task_result(
+        TaskResult::DoctorFixApplied {
+            target,
+            result: Ok(crate::diagnostics::FixOutcome::new_for_test(
+                crate::diagnostics::SSH_WRAP_ID,
+                crate::diagnostics::FixStatus::Applied,
+                temp.path().join(".bashrc"),
+                None,
+                crate::diagnostics::FixActivation::SatisfiedNow,
+                Some(crate::diagnostics::ShellKind::Bash),
+            )),
+        },
+        &mut app,
+    );
+    let output = last_system_text(&app, id);
+    assert!(output.starts_with("Set up SSH wrapping in"), "{output}");
+    assert!(output.contains("Start a new shell"), "{output}");
+    assert!(!output.contains("Environment\n"), "{output}");
+    assert!(!output.contains("Findings\n"), "{output}");
+}
+
+#[test]
+fn stale_auth_copy_timeout_does_not_clear_newer_feedback() {
+    let mut app = test_app();
+    app.auth_state = AuthState::Authenticating {
+        request_seq: 1,
+        handle: None,
+        auth_url: Some("https://grok.com/auth".to_owned()),
+        mode: AuthMode::Command,
+    };
+
+    let first_effects = crate::app::dispatch::router::dispatch_copy_auth_url(&mut app, |_| {
+        crate::clipboard::ClipboardDelivery::Failed
+    });
+    let [
+        Effect::ScheduleClearAuthCopyFeedback {
+            generation: first_generation,
+        },
+    ] = first_effects.as_slice()
+    else {
+        panic!("first copy must schedule feedback clear");
+    };
+
+    let second_effects = crate::app::dispatch::router::dispatch_copy_auth_url(&mut app, |_| {
+        crate::clipboard::ClipboardDelivery::Confirmed
+    });
+    let [
+        Effect::ScheduleClearAuthCopyFeedback {
+            generation: second_generation,
+        },
+    ] = second_effects.as_slice()
+    else {
+        panic!("second copy must schedule feedback clear");
+    };
+    assert_ne!(first_generation, second_generation);
+    assert_eq!(
+        app.auth_clipboard_delivery,
+        Some(crate::clipboard::ClipboardDelivery::Confirmed)
+    );
+
+    dispatch_task_result(
+        TaskResult::AuthCopyFeedbackTimeout {
+            generation: *first_generation,
+        },
+        &mut app,
+    );
+    assert_eq!(
+        app.auth_clipboard_delivery,
+        Some(crate::clipboard::ClipboardDelivery::Confirmed),
+        "the first copy's stale timeout must preserve the second feedback"
+    );
+
+    dispatch_task_result(
+        TaskResult::AuthCopyFeedbackTimeout {
+            generation: *second_generation,
+        },
+        &mut app,
+    );
+    assert_eq!(app.auth_clipboard_delivery, None);
+}
+
+#[test]
+fn stale_workflows_result_does_not_repaint_replaced_session_modal() {
+    let mut app = test_app_with_agent();
+    app.agents.get_mut(&AgentId(0)).unwrap().extensions_modal =
+        Some(crate::views::extensions_modal::ExtensionsModalState::new(
+            crate::views::extensions_modal::ExtensionsTab::Skills,
+        ));
+    let _ = dispatch(
+        Action::TaskComplete(TaskResult::WorkflowsListLoaded {
+            agent_id: AgentId(0),
+            session_id: acp::SessionId::new("old-session"),
+            result: Ok(vec![]),
+        }),
+        &mut app,
+    );
+    assert!(matches!(
+        app.agents[&AgentId(0)]
+            .extensions_modal
+            .as_ref()
+            .unwrap()
+            .workflows_data,
+        crate::views::extensions_modal::TabDataState::Loading
+    ));
+}
 
 fn foreign_resume_hint(
-    tool: xai_grok_workspace::foreign_sessions::ForeignSessionTool,
-) -> xai_grok_workspace::foreign_sessions::RecentForeignSession {
-    xai_grok_workspace::foreign_sessions::RecentForeignSession {
+    tool: xai_grok_foreign_sessions::ForeignSessionTool,
+) -> xai_grok_foreign_sessions::RecentForeignSession {
+    xai_grok_foreign_sessions::RecentForeignSession {
         tool,
         native_id: "native-session".into(),
         age: std::time::Duration::from_secs(30),
@@ -18,11 +366,10 @@ fn foreign_resume_hint(
 #[test]
 fn foreign_resume_results_require_launch_token_and_canonical_cwd() {
     let mut launch = test_app();
-    launch.foreign_session_compat =
-        xai_grok_workspace::foreign_sessions::EnabledForeignSessionSources {
-            cursor: true,
-            ..Default::default()
-        };
+    launch.foreign_session_compat = xai_grok_foreign_sessions::EnabledForeignSessionSources {
+        cursor: true,
+        ..Default::default()
+    };
     let Effect::CanonicalizeForeignResumeCwd {
         requested_cwd,
         launch_token,
@@ -56,14 +403,14 @@ fn foreign_resume_results_require_launch_token_and_canonical_cwd() {
             canonical_cwd: canonical_cwd.clone(),
             launch_token,
             hint: Some(foreign_resume_hint(
-                xai_grok_workspace::foreign_sessions::ForeignSessionTool::Cursor,
+                xai_grok_foreign_sessions::ForeignSessionTool::Cursor,
             )),
         }),
         &mut launch,
     );
     assert_eq!(
         launch.foreign_resume_hint().map(|hint| hint.tool),
-        Some(xai_grok_workspace::foreign_sessions::ForeignSessionTool::Cursor)
+        Some(xai_grok_foreign_sessions::ForeignSessionTool::Cursor)
     );
 
     let mut stale = test_app();
@@ -81,7 +428,7 @@ fn foreign_resume_results_require_launch_token_and_canonical_cwd() {
             canonical_cwd: canonical_cwd.clone(),
             launch_token: launch_token + 1,
             hint: Some(foreign_resume_hint(
-                xai_grok_workspace::foreign_sessions::ForeignSessionTool::Codex,
+                xai_grok_foreign_sessions::ForeignSessionTool::Codex,
             )),
         }),
         &mut stale,
@@ -103,11 +450,10 @@ fn foreign_resume_results_require_launch_token_and_canonical_cwd() {
 #[test]
 fn foreign_resume_result_rejects_startup_conflict_before_completion() {
     let mut app = test_app();
-    app.foreign_session_compat =
-        xai_grok_workspace::foreign_sessions::EnabledForeignSessionSources {
-            cursor: true,
-            ..Default::default()
-        };
+    app.foreign_session_compat = xai_grok_foreign_sessions::EnabledForeignSessionSources {
+        cursor: true,
+        ..Default::default()
+    };
     let Effect::CanonicalizeForeignResumeCwd {
         requested_cwd,
         launch_token,
@@ -128,7 +474,7 @@ fn foreign_resume_result_rejects_startup_conflict_before_completion() {
             canonical_cwd,
             launch_token,
             hint: Some(foreign_resume_hint(
-                xai_grok_workspace::foreign_sessions::ForeignSessionTool::Cursor,
+                xai_grok_foreign_sessions::ForeignSessionTool::Cursor,
             )),
         }),
         &mut app,
@@ -170,6 +516,35 @@ fn x11_primary_hint_requires_canonical_full_miss_outcome() {
         app.agents[&AgentId(0)].toast.is_none(),
         "non-X11 FullMiss must not show X11 guidance"
     );
+}
+
+#[test]
+fn wrap_host_image_request_eligible_covers_full_miss_and_attachment_error_only() {
+    use crate::app::actions::{ClipboardPasteCompletion, ClipboardPasteFailure};
+
+    // A clean empty miss and a remote read *error* both fall through to the wrap
+    // host-image request — the headless-SSH `grok wrap` image-paste fix.
+    assert!(wrap_host_image_request_eligible(
+        ClipboardPasteCompletion::FullMiss
+    ));
+    assert!(wrap_host_image_request_eligible(
+        ClipboardPasteCompletion::Failed(ClipboardPasteFailure::AttachmentRead)
+    ));
+
+    // Every other outcome is a real dead end: it must keep toasting and never
+    // solicit the host image.
+    for completion in [
+        ClipboardPasteCompletion::Handled,
+        ClipboardPasteCompletion::Dropped,
+        ClipboardPasteCompletion::Failed(ClipboardPasteFailure::TextRead),
+        ClipboardPasteCompletion::Failed(ClipboardPasteFailure::TargetInsertion),
+        ClipboardPasteCompletion::Failed(ClipboardPasteFailure::AlreadyReported),
+    ] {
+        assert!(
+            !wrap_host_image_request_eligible(completion),
+            "{completion:?} must not route to the wrap host-image request"
+        );
+    }
 }
 
 #[test]
@@ -466,6 +841,63 @@ fn uninstall_result_notice_is_footer_only_not_row_anchored() {
         n.entry_index, None,
         "uninstall removes the row → footer-only, no stale row checkmark"
     );
+}
+
+#[test]
+fn confirmation_required_builds_plugins_confirmation_with_confirmed_true() {
+    use crate::views::extensions_modal::{
+        ConfirmationAction, ExtensionsModalState, ExtensionsTab, ModalMessage,
+    };
+
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    {
+        let mut modal = ExtensionsModalState::new(ExtensionsTab::Plugins);
+        modal.picker_state.selected = 2;
+        modal.pending_entry_index = Some(3);
+        modal.last_plugins_action = Some(xai_hooks_plugins_types::PluginsAction::Uninstall {
+            plugin_id: "user/ab12/gone".into(),
+            confirmed: false,
+        });
+        app.agents.get_mut(&id).unwrap().extensions_modal = Some(modal);
+    }
+
+    dispatch(
+        Action::TaskComplete(TaskResult::PluginsActionResult {
+            agent_id: id,
+            result: Ok(xai_hooks_plugins_types::ActionOutcome {
+                status: xai_hooks_plugins_types::OutcomeStatus::ConfirmationRequired,
+                message: "Uninstalling removes 2 plugins from this repository.".into(),
+                requires_reload: false,
+                requires_restart: false,
+            }),
+        }),
+        &mut app,
+    );
+
+    let modal = app.agents[&id].extensions_modal.as_ref().unwrap();
+    match &modal.modal_message {
+        Some(ModalMessage::Confirmation {
+            message,
+            action,
+            pending_entry_index,
+        }) => {
+            // Server message only; footer owns y/cancel hints.
+            assert_eq!(
+                message,
+                "Uninstalling removes 2 plugins from this repository."
+            );
+            assert_eq!(*pending_entry_index, Some(3));
+            assert_eq!(
+                action,
+                &ConfirmationAction::Plugins(xai_hooks_plugins_types::PluginsAction::Uninstall {
+                    plugin_id: "user/ab12/gone".into(),
+                    confirmed: true,
+                })
+            );
+        }
+        other => panic!("expected Confirmation overlay, got {other:?}"),
+    }
 }
 
 /// Regression (Bugbot): a failed `x.ai/subagent/cancel` RPC must NOT
@@ -1055,6 +1487,7 @@ fn no_deferred_switch_means_no_extra_effect() {
             agent_id: id,
             session_id: "new-session".into(),
             models: None,
+            scheduler_background_loops: None,
         }),
         &mut app,
     );
@@ -1066,6 +1499,62 @@ fn no_deferred_switch_means_no_extra_effect() {
             .any(|e| matches!(e, Effect::SwitchModel { .. }))
     );
     assert!(!app.agents[&id].session.model_switch_pending);
+}
+
+#[test]
+fn session_success_arms_finish_startup_obligation() {
+    xai_grok_telemetry::unified_log::redirect_to_temp_for_tests();
+    let id = AgentId(0);
+    let results = [
+        TaskResult::SessionCreated {
+            agent_id: id,
+            session_id: "new-session".into(),
+            models: None,
+            scheduler_background_loops: None,
+        },
+        TaskResult::SessionLoaded {
+            agent_id: id,
+            session_id: "resumed-session".into(),
+            models: None,
+            code_restored: false,
+            restore_summary: None,
+            restore_degree: None,
+            running_prompt_id: None,
+            scheduler_background_loops: None,
+        },
+        TaskResult::WorktreeSessionCreated {
+            agent_id: id,
+            session_id: "worktree-session".into(),
+            worktree_path: std::path::PathBuf::from("/tmp/wt"),
+            session_cwd: std::path::PathBuf::from("/tmp/wt"),
+            models: None,
+            scheduler_background_loops: None,
+        },
+        TaskResult::WorktreeForked {
+            agent_id: id,
+            session_id: "forked-session".into(),
+            worktree_path: std::path::PathBuf::from("/tmp/wt"),
+            session_cwd: std::path::PathBuf::from("/tmp/wt"),
+            code_restored: false,
+            restore_summary: None,
+            restore_degree: None,
+            resume_session_id: None,
+        },
+    ];
+
+    for result in results {
+        let mut app = test_app_with_agent();
+        app.agents.get_mut(&id).unwrap().session.session_id = None;
+        app.pending_startup = Some(xai_grok_telemetry::startup::PendingStartup::new());
+        let label = format!("{result:?}");
+
+        dispatch(Action::TaskComplete(result), &mut app);
+
+        assert!(
+            app.pending_startup.is_none(),
+            "a usable session must take the startup obligation: {label}",
+        );
+    }
 }
 
 #[test]
@@ -1259,13 +1748,18 @@ fn delete_session_complete_removes_only_matching_source_and_id() {
         .active_modal
         .as_mut()
     {
-        *pending_delete = Some(("local".into(), "s1".into(), "/r".into()));
+        *pending_delete = Some(crate::views::session_picker::PendingDelete {
+            source: "local".into(),
+            session_id: "s1".into(),
+            cwd: "/r".into(),
+        });
     }
 
     let _ = dispatch_task_result(
         TaskResult::DeleteSessionComplete {
             source: "local".into(),
             session_id: "s1".into(),
+            after: crate::app::actions::AfterSessionDelete::Stay,
         },
         &mut app,
     );
@@ -1335,17 +1829,18 @@ fn delete_both_session_clears_modal_and_welcome_content_hits() {
         .active_modal
         .as_mut()
     {
-        state.query = "shared".into();
+        state.set_query("shared");
         *content_results = Some(vec![hit.clone()]);
     }
     app.session_picker_entries = Some(vec![both, foreign]);
-    app.session_picker_state.query = "shared".into();
+    app.session_picker_state.set_query("shared");
     app.session_picker_content_results = Some(vec![hit]);
 
     let _ = dispatch_task_result(
         TaskResult::DeleteSessionComplete {
             source: "both".into(),
             session_id: "shared".into(),
+            after: crate::app::actions::AfterSessionDelete::Stay,
         },
         &mut app,
     );
@@ -1382,7 +1877,7 @@ fn delete_both_session_clears_modal_and_welcome_content_hits() {
             .iter()
             .any(|item| matches!(item, Some(PickerItem::Content { .. })))
     );
-    assert_eq!(modal_state.query.as_str(), "shared");
+    assert_eq!(modal_state.query(), "shared");
 
     let welcome_entries = app.session_picker_entries.as_deref().unwrap();
     let welcome_hits = app.session_picker_content_results.as_deref().unwrap();
@@ -1443,6 +1938,7 @@ fn delete_remote_session_clears_modal_and_welcome_content_hits() {
         TaskResult::DeleteSessionComplete {
             source: "remote".into(),
             session_id: "remote-only".into(),
+            after: crate::app::actions::AfterSessionDelete::Stay,
         },
         &mut app,
     );
@@ -1538,6 +2034,133 @@ fn rename_session_failed_keeps_local_display_name_and_pushes_system_block() {
     assert!(
         text.contains("Couldn't rename session: boom"),
         "system block must surface the error; got: {text:?}"
+    );
+}
+
+#[test]
+fn reset_session_title_failed_restores_pin_and_pushes_system_block() {
+    let mut app = test_app_with_agent();
+    if let Some(a) = app.agents.get_mut(&AgentId(0)) {
+        a.display_name = Some("Manual".into());
+        a.generated_session_title = Some("Auto".into());
+    }
+    let _ = dispatch_reset_session_title(&mut app);
+    assert!(app.agents[&AgentId(0)].display_name.is_none());
+    assert_eq!(
+        app.agents[&AgentId(0)].generated_session_title.as_deref(),
+        Some("Auto")
+    );
+    let scrollback_len_before = app.agents[&AgentId(0)].scrollback.len();
+
+    let _effects = dispatch_task_result(
+        TaskResult::ResetSessionTitleFailed {
+            agent_id: AgentId(0),
+            error: "boom".into(),
+            previous_display_name: Some("Manual".into()),
+            previous_generated_title: Some("Auto".into()),
+        },
+        &mut app,
+    );
+
+    assert_eq!(
+        app.agents[&AgentId(0)].display_name.as_deref(),
+        Some("Manual"),
+        "failed unpin must restore the optimistic-cleared pin"
+    );
+    assert_eq!(
+        app.agents[&AgentId(0)].generated_session_title.as_deref(),
+        Some("Auto"),
+        "failed unpin must restore the pre-clear generated title"
+    );
+    let scrollback = &app.agents[&AgentId(0)].scrollback;
+    assert_eq!(
+        scrollback.len(),
+        scrollback_len_before + 1,
+        "system block must be appended"
+    );
+    let last = scrollback.entry(scrollback.len() - 1).expect("last entry");
+    let text = match &last.block {
+        crate::scrollback::block::RenderBlock::System(b) => b.text.clone(),
+        other => panic!("expected System block, got {other:?}"),
+    };
+    assert!(
+        text.contains("Couldn't reset session title: boom"),
+        "system block must surface the error; got: {text:?}"
+    );
+}
+
+#[test]
+fn reset_session_title_failed_does_not_restore_after_unpin_fanout() {
+    let mut app = test_app_with_agent();
+    if let Some(a) = app.agents.get_mut(&AgentId(0)) {
+        a.display_name = Some("Manual".into());
+        a.generated_session_title = Some("Auto".into());
+    }
+    let _ = dispatch_reset_session_title(&mut app);
+    if let Some(a) = app.agents.get_mut(&AgentId(0)) {
+        a.title_unpin_committed = true;
+        a.display_name = None;
+        a.generated_session_title = Some("Auto".into());
+    }
+
+    let _effects = dispatch_task_result(
+        TaskResult::ResetSessionTitleFailed {
+            agent_id: AgentId(0),
+            error: "transport dropped".into(),
+            previous_display_name: Some("Manual".into()),
+            previous_generated_title: Some("Auto".into()),
+        },
+        &mut app,
+    );
+
+    let agent = &app.agents[&AgentId(0)];
+    assert!(
+        agent.display_name.is_none(),
+        "dropped RPC after fan-out must not re-pin"
+    );
+    assert_eq!(agent.generated_session_title.as_deref(), Some("Auto"));
+    assert!(!agent.title_unpin_committed);
+    let last = agent
+        .scrollback
+        .entry(agent.scrollback.len() - 1)
+        .expect("last entry");
+    let text = match &last.block {
+        crate::scrollback::block::RenderBlock::System(b) => b.text.clone(),
+        other => panic!("expected System block, got {other:?}"),
+    };
+    assert!(
+        text.contains("Session title reset to auto"),
+        "committed unpin should confirm, not error; got: {text:?}"
+    );
+}
+
+#[test]
+fn reset_session_title_complete_pushes_system_block() {
+    let mut app = test_app_with_agent();
+    if let Some(a) = app.agents.get_mut(&AgentId(0)) {
+        a.display_name = None;
+        a.generated_session_title = None;
+    }
+    let scrollback_len_before = app.agents[&AgentId(0)].scrollback.len();
+
+    let _effects = dispatch_task_result(
+        TaskResult::ResetSessionTitleComplete {
+            agent_id: AgentId(0),
+        },
+        &mut app,
+    );
+
+    assert!(app.agents[&AgentId(0)].display_name.is_none());
+    let scrollback = &app.agents[&AgentId(0)].scrollback;
+    assert_eq!(scrollback.len(), scrollback_len_before + 1);
+    let last = scrollback.entry(scrollback.len() - 1).expect("last entry");
+    let text = match &last.block {
+        crate::scrollback::block::RenderBlock::System(b) => b.text.clone(),
+        other => panic!("expected System block, got {other:?}"),
+    };
+    assert!(
+        text.contains("Session title reset to auto"),
+        "got: {text:?}"
     );
 }
 
@@ -2136,6 +2759,7 @@ fn session_list_partial_no_oauth_surfaces_login_hint() {
     open_session_picker_with(&mut app, vec![]);
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            scope: ListScope::Cwd,
             sessions: vec![],
             partial: Some(crate::app::effects::ConversationsPartial::NoOauth),
             seq: 0,
@@ -2149,6 +2773,121 @@ fn session_list_partial_no_oauth_surfaces_login_hint() {
     );
 }
 
+/// Notice fires once per relaxed run; survives search, re-arms on a cwd-scoped browse.
+#[test]
+fn session_list_relax_surfaces_notice_once() {
+    let relax_response = || {
+        Action::TaskComplete(TaskResult::SessionListLoaded {
+            scope: ListScope::Repo,
+            sessions: vec![make_picker_entry("local-other-cwd-1", "/elsewhere")],
+            partial: None,
+            seq: 0,
+            query: None,
+        })
+    };
+
+    let mut app = test_app_with_agent();
+    open_session_picker_with(&mut app, vec![]);
+    let _ = dispatch(relax_response(), &mut app);
+    assert!(
+        read_toast(&app).contains("this repo"),
+        "the relaxed scope must be explained"
+    );
+
+    app.agents.get_mut(&AgentId(0)).unwrap().toast = None;
+    let _ = dispatch(relax_response(), &mut app);
+    assert!(
+        app.agents[&AgentId(0)].toast.is_none(),
+        "the relax notice must not repeat while the scope is unchanged"
+    );
+
+    let _ = dispatch(
+        Action::TaskComplete(TaskResult::SessionListLoaded {
+            scope: ListScope::Cwd,
+            sessions: vec![],
+            partial: None,
+            seq: 0,
+            query: Some("needle".into()),
+        }),
+        &mut app,
+    );
+    let _ = dispatch(relax_response(), &mut app);
+    assert!(
+        app.agents[&AgentId(0)].toast.is_none(),
+        "a search response must not re-arm the relax notice"
+    );
+
+    let _ = dispatch(
+        Action::TaskComplete(TaskResult::SessionListLoaded {
+            scope: ListScope::Cwd,
+            sessions: vec![make_picker_entry("local-here-1", "/here")],
+            partial: None,
+            seq: 0,
+            query: None,
+        }),
+        &mut app,
+    );
+    let _ = dispatch(relax_response(), &mut app);
+    assert!(
+        read_toast(&app).contains("this repo"),
+        "a scope change back to relaxed must notify again"
+    );
+}
+
+/// Welcome view can't render toasts, so the one-shot notice must not latch there.
+#[test]
+fn session_list_relax_on_welcome_does_not_latch() {
+    let mut app = test_app();
+    assert!(matches!(app.active_view, ActiveView::Welcome));
+    let _ = dispatch(
+        Action::TaskComplete(TaskResult::SessionListLoaded {
+            scope: ListScope::All,
+            sessions: vec![make_picker_entry("local-other-cwd-1", "/elsewhere")],
+            partial: None,
+            seq: 0,
+            query: None,
+        }),
+        &mut app,
+    );
+    assert!(
+        app.session_picker_relaxed_notified_for.is_none(),
+        "a notice that cannot render must not latch"
+    );
+}
+
+/// The notice is keyed by browse cwd: a different directory re-notifies even
+/// though the prior latch is set.
+#[test]
+fn session_list_relax_renotifies_when_cwd_changes() {
+    let relax = || {
+        Action::TaskComplete(TaskResult::SessionListLoaded {
+            scope: ListScope::Repo,
+            sessions: vec![make_picker_entry("local-other-cwd-1", "/elsewhere")],
+            partial: None,
+            seq: 0,
+            query: None,
+        })
+    };
+
+    let mut app = test_app_with_agent();
+    open_session_picker_with(&mut app, vec![]);
+
+    app.cwd = std::path::PathBuf::from("/repo/a");
+    let _ = dispatch(relax(), &mut app);
+    assert!(
+        read_toast(&app).contains("this repo"),
+        "the first cwd must notify"
+    );
+
+    app.agents.get_mut(&AgentId(0)).unwrap().toast = None;
+    app.cwd = std::path::PathBuf::from("/repo/b");
+    let _ = dispatch(relax(), &mut app);
+    assert!(
+        read_toast(&app).contains("this repo"),
+        "a different cwd must re-notify even with the prior latch set"
+    );
+}
+
 /// Canary: an empty list without a degraded lane keeps the generic toast.
 #[test]
 fn session_list_empty_without_partial_keeps_generic_toast() {
@@ -2156,6 +2895,7 @@ fn session_list_empty_without_partial_keeps_generic_toast() {
     open_session_picker_with(&mut app, vec![]);
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            scope: ListScope::Cwd,
             sessions: vec![],
             partial: None,
             seq: 0,
@@ -2174,6 +2914,7 @@ fn session_list_nonempty_partial_toasts_retry_in_chat_mode_only() {
     app.chat_mode = true;
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            scope: ListScope::Cwd,
             sessions: vec![make_conversation_entry("conv-part-1")],
             partial: Some(crate::app::effects::ConversationsPartial::Timeout),
             seq: 0,
@@ -2194,6 +2935,7 @@ fn session_list_nonempty_partial_toasts_retry_in_chat_mode_only() {
     let mut app = test_app_with_agent();
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            scope: ListScope::Cwd,
             sessions: vec![make_picker_entry("local-part-1", "/r")],
             partial: Some(crate::app::effects::ConversationsPartial::Timeout),
             seq: 0,
@@ -2217,6 +2959,7 @@ fn session_list_nonempty_partial_modal_toasts_in_chat_mode_only() {
     open_session_picker_with(&mut app, vec![]);
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            scope: ListScope::Cwd,
             sessions: vec![make_conversation_entry("conv-part-m1")],
             partial: Some(crate::app::effects::ConversationsPartial::Timeout),
             seq: 0,
@@ -2245,6 +2988,7 @@ fn session_list_nonempty_partial_modal_toasts_in_chat_mode_only() {
     open_session_picker_with(&mut app, vec![]);
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            scope: ListScope::Cwd,
             sessions: vec![make_picker_entry("local-part-m1", "/r")],
             partial: Some(crate::app::effects::ConversationsPartial::Timeout),
             seq: 0,

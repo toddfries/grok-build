@@ -1,7 +1,18 @@
 //! Turn-completion concern for `SessionActor`: completion handling
 //! and turn-error classification.
 
+use super::turn_end_hooks::{cancel_details, cancel_reason_for_completion};
 use super::*;
+
+fn completion_cancel_trigger(result: &PromptTurnResult) -> Option<&str> {
+    match result.as_ref().ok()?.completion_kind {
+        PromptCompletionKind::Cancelled {
+            context: Some(ref ctx),
+            ..
+        } => ctx.trigger.as_deref(),
+        _ => None,
+    }
+}
 
 impl SessionActor {
     /// Emit a cosmetic `Plan` update at turn end to clear stale spinners.
@@ -79,8 +90,9 @@ impl SessionActor {
     }
 
     /// Emit `x.ai/git_head_changed` after an edit/shell command that may have
-    /// moved HEAD (e.g. `git checkout`), so clients update their status bar
-    /// immediately rather than waiting for the debounced fs-watch refresh.
+    /// moved HEAD (e.g. `git checkout`, `git commit`), so clients update their
+    /// status bar and changes panel immediately rather than waiting for the
+    /// debounced fs-watch refresh.
     pub(super) async fn maybe_notify_git_branch(&self) {
         if !self.git_head_enabled {
             return;
@@ -88,15 +100,21 @@ impl SessionActor {
         let cwd = self.tool_context.cwd.as_path();
 
         // `get_worktree_info` doubles as the "in a git repo?" probe (None when not).
-        let (worktree_info, branch) = tokio::join!(
+        let (worktree_info, branch, commit) = tokio::join!(
             xai_grok_workspace::session::git::get_worktree_info(cwd),
             xai_grok_workspace::session::git::get_branch(cwd),
+            xai_grok_workspace::session::git::get_current_commit(cwd),
         );
         let Some((is_worktree, main_repo)) = worktree_info else {
             return;
         };
 
-        let dedup_key = git_head_dedup_key(branch.as_deref(), is_worktree, main_repo.as_deref());
+        let dedup_key = git_head_dedup_key(
+            branch.as_deref(),
+            is_worktree,
+            main_repo.as_deref(),
+            commit.as_deref(),
+        );
         {
             let mut last = self.last_reported_branch.lock();
             if last.as_deref() == Some(&dedup_key) {
@@ -134,6 +152,7 @@ impl SessionActor {
         let (respond_to, rx) = tokio::sync::oneshot::channel();
         if tx
             .send(SubagentEvent::Outstanding(SubagentOutstandingRequest {
+                parent_session_id: self.session_id_string(),
                 prompt_id: prompt_id.to_string(),
                 respond_to,
             }))
@@ -163,12 +182,25 @@ impl SessionActor {
         };
         let _ = tx.send(SubagentEvent::ClearUsageNotApplied(
             SubagentClearUsageNotAppliedRequest {
+                parent_session_id: self.session_id_string(),
                 prompt_id: prompt_id.to_string(),
             },
         ));
     }
 
-    pub(super) async fn handle_completion(&self, prompt_id: String, result: PromptTurnResult) {
+    /// Returns whether this handler OWNED the completion (it matched and
+    /// dequeued the front prompt). `false` means a stale completion for a
+    /// turn another path (e.g. Cancel) already finalized — callers must not
+    /// treat it as a turn ending now.
+    pub(super) async fn handle_completion(
+        &self,
+        prompt_id: String,
+        result: PromptTurnResult,
+    ) -> bool {
+        let result = result.map(|mut ok| {
+            ok.tool_overrides = self.effective_tool_overrides();
+            ok
+        });
         let became_idle = {
             let mut current_prompt_id = self
                 .current_prompt_id
@@ -195,6 +227,13 @@ impl SessionActor {
             self.set_goal_loop_active_resource(false).await;
         }
 
+        // Read before the lock: the report below runs under it and cannot await.
+        let last_assistant_message = match result.as_ref().ok() {
+            Some(ok) if cancel_reason_for_completion(&ok.completion_kind).is_some() => {
+                self.last_assistant_message_for_cancel().await
+            }
+            _ => None,
+        };
         let mut state = self.state.lock().await;
         // True only when this completion matched the front prompt and dequeued
         // it. The unknown-prompt branch below must NOT emit a terminal: a turn
@@ -207,7 +246,7 @@ impl SessionActor {
             .is_some_and(|input| input.prompt_id == prompt_id)
         {
             let Some(input) = state.pending_inputs.pop_front() else {
-                return;
+                return false;
             };
             owned_completion = true;
             let _ = input.respond_to.send(result.clone()).ok();
@@ -224,6 +263,32 @@ impl SessionActor {
                     "prompt_id": prompt_id,
                     "running_prompt_id": state.running_prompt_id(),
                 })),
+            );
+        }
+        // Owned (dequeued at the front) only: the unknown-prompt branch above is a stale
+        // completion the Cancel path already finalized, and `RemovedFromQueue` never ran.
+        let finalizes_turn = owned_completion
+            && !matches!(
+                result,
+                Ok(PromptTurnOk {
+                    completion_kind: PromptCompletionKind::RemovedFromQueue,
+                    ..
+                })
+            );
+        // Under the lock that promotion needs and before the task is cleared, so this
+        // completion's turn is still the current one.
+        if finalizes_turn
+            && let Ok(ok) = &result
+            && let Some(reason) = cancel_reason_for_completion(&ok.completion_kind)
+        {
+            self.report_turn_end(
+                &prompt_id,
+                TurnEnd::Cancelled {
+                    reason,
+                    trigger: completion_cancel_trigger(&result).map(str::to_string),
+                    reason_details: cancel_details(&ok.completion_kind),
+                    last_assistant_message,
+                },
             );
         }
         // Ownership-gated: a stale completion must not null the promoted turn's
@@ -260,21 +325,8 @@ impl SessionActor {
         // replayed `_x.ai/session/update` rail so a viewer that re-attaches
         // mid-turn finalizes from replay instead of stranding on "Waiting…".
         // The caller flushed the replay buffer first, so this lands strictly
-        // after the turn's last `session/update` delta. Emit ONLY for a
-        // completion this handler owned (dequeued at the front): the
-        // unknown-prompt branch above is a stale completion for a turn the
-        // Cancel path already finalized, so emitting there would double-emit a
-        // terminal for the same prompt_id. A `RemovedFromQueue` result never
-        // started a turn, so it emits nothing either.
-        let emit_terminal = owned_completion
-            && !matches!(
-                result,
-                Ok(PromptTurnOk {
-                    completion_kind: PromptCompletionKind::RemovedFromQueue,
-                    ..
-                })
-            );
-        if emit_terminal {
+        // after the turn's last `session/update` delta.
+        if finalizes_turn {
             let mapped = result
                 .as_ref()
                 .map(|ok| ok.stop_reason)
@@ -289,19 +341,15 @@ impl SessionActor {
                     }
                 }
             };
-            // Surface the cancel trigger on the terminal `_meta` as `cancelTrigger`.
-            let cancel_trigger = result
-                .as_ref()
-                .ok()
-                .and_then(|ok| match &ok.completion_kind {
-                    PromptCompletionKind::Cancelled {
-                        context: Some(ctx), ..
-                    } => ctx.trigger.as_deref(),
-                    _ => None,
-                });
-            self.emit_turn_completed(prompt_id, &mapped, usage, cancel_trigger)
-                .await;
+            self.emit_turn_completed(
+                prompt_id.clone(),
+                &mapped,
+                usage,
+                completion_cancel_trigger(&result),
+            )
+            .await;
         }
+        owned_completion
     }
 
     /// Emit the durable, replayable `TurnCompleted` terminal — the single
@@ -314,6 +362,9 @@ impl SessionActor {
     ///
     /// `cancel_trigger` (when `Some`) rides the `_meta` as `cancelTrigger`;
     /// `"send_now"` marks a cancel-and-send end (marker suppressed).
+    ///
+    /// Both callers queue the turn-end report before this, but the worker can dispatch first,
+    /// so the terminal and the report race. The pager handles either order.
     pub(super) async fn emit_turn_completed(
         &self,
         prompt_id: String,
@@ -339,17 +390,54 @@ impl SessionActor {
         .await;
     }
 
+    /// Telemetry error category; delegates to `stop_failure_error_type` so the
+    /// two classifications cannot drift.
     pub(super) fn classify_turn_error(err: &acp::Error) -> String {
-        match i32::from(err.code) {
-            crate::sampling::error::RATE_LIMITED_ERROR_CODE => "rate_limit",
-            -32000 => "auth",
-            -32600 => "invalid_request",
-            -32603 => "internal",
-            _ => "unknown",
+        use xai_grok_hooks::event::StopFailureKind as K;
+        match Self::stop_failure_error_type(err) {
+            K::RateLimit => "rate_limit",
+            K::AuthenticationFailed => "auth",
+            K::InvalidRequest => "invalid_request",
+            K::ServerError => "internal",
+            K::MaxOutputTokens => "max_tokens",
+            K::Unknown => "unknown",
         }
         .to_string()
     }
 
+    /// The `StopFailure` hook input's classified `error`. Structured markers win
+    /// over the JSON-RPC code because they are more specific; anything the
+    /// runtime cannot distinguish stays `Unknown`.
+    pub(super) fn stop_failure_error_type(
+        err: &acp::Error,
+    ) -> xai_grok_hooks::event::StopFailureKind {
+        use xai_grok_hooks::event::StopFailureKind as K;
+        if crate::sampling::error::stop_reason_for_turn_error(err) == "MaxTokens" {
+            return K::MaxOutputTokens;
+        }
+        // The data-carried HTTP status discriminates over the JSON-RPC code. 403
+        // is content-safety, not auth: it folds into `invalid_request` on the turn
+        // path (carries `http_status: 403`) and `server_error` on the setup path
+        // (no status, so `-32603` below).
+        match crate::sampling::error::http_status_from_error(err) {
+            Some(401) => return K::AuthenticationFailed,
+            Some(429) | Some(503) | Some(529) => return K::RateLimit,
+            Some(s) if (400..500).contains(&s) => return K::InvalidRequest,
+            Some(s) if s >= 500 => return K::ServerError,
+            _ => {}
+        }
+        match i32::from(err.code) {
+            crate::sampling::error::RATE_LIMITED_ERROR_CODE => K::RateLimit,
+            -32000 => K::AuthenticationFailed,
+            -32002 | -32600 | -32602 => K::InvalidRequest,
+            -32603 => K::ServerError,
+            _ => K::Unknown,
+        }
+    }
+
+    /// Whether a turn error is transient infra worth a goal retry. Keys on the
+    /// JSON-RPC code only (unlike `stop_failure_error_type`), so `-32603` counts
+    /// as infra.
     pub(super) fn is_infra_turn_error(err: &acp::Error) -> bool {
         matches!(
             i32::from(err.code),
@@ -357,12 +445,18 @@ impl SessionActor {
         )
     }
 
-    /// `(turn_succeeded, infra_pause_message)` for the completion handler.
-    /// `infra_pause_message` is extracted before `handle_completion` consumes
-    /// `result`.
+    /// `(turn_succeeded, suppress_goal_continuation, infra_pause_message)`.
+    /// StationarityEnded is success for the streak but skips GoalSummary re-queue.
+    /// `infra_pause_message` is extracted before `handle_completion` consumes `result`.
     pub(super) fn post_turn_goal_degradation_plan(
         result: &PromptTurnResult,
-    ) -> (bool, Option<String>) {
+    ) -> (bool, bool, Option<String>) {
+        let suppress_goal_continuation = result.as_ref().ok().is_some_and(|ok| {
+            matches!(
+                ok.completion_kind,
+                crate::session::commands::PromptCompletionKind::StationarityEnded
+            )
+        });
         let turn_cancelled = result.as_ref().ok().is_some_and(|ok| {
             matches!(
                 ok.completion_kind,
@@ -370,13 +464,20 @@ impl SessionActor {
                     | crate::session::commands::PromptCompletionKind::MaxTurnsReached { .. }
             )
         });
-        let turn_succeeded = result.is_ok() && !turn_cancelled;
+        let turn_succeeded = result
+            .as_ref()
+            .ok()
+            .is_some_and(|ok| !turn_cancelled && ok.stop_reason != acp::StopReason::Refusal);
         let infra_pause_message = result
             .as_ref()
             .err()
             .filter(|err| Self::is_infra_turn_error(err))
             .map(Self::format_turn_error_message);
-        (turn_succeeded, infra_pause_message)
+        (
+            turn_succeeded,
+            suppress_goal_continuation,
+            infra_pause_message,
+        )
     }
 
     pub(super) async fn apply_infra_pause_after_turn_err(&self, message: String) -> bool {
@@ -400,7 +501,7 @@ impl SessionActor {
     }
 
     /// Extract the best human-readable detail from an infra turn error.
-    fn turn_error_detail(err: &acp::Error) -> Option<String> {
+    pub(super) fn turn_error_detail(err: &acp::Error) -> Option<String> {
         err.data
             .as_ref()
             .and_then(crate::sampling::error::error_detail_from_data)

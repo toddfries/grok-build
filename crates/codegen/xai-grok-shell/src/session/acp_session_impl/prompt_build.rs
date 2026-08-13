@@ -3,11 +3,6 @@
 //! payload preparation.
 #![allow(clippy::items_after_test_module)]
 use super::*;
-/// Partition the AGENTS.md / Claude.md / `.grok/rules/*.md` files returned
-/// by `read_agents_config_with_paths` into "workspace" (cwd / repo root /
-/// extra workspace user dir) and "user" (`~/.grok/`, `~/.claude/`,
-/// `~/.grok/bundled/`) buckets, mirroring the split between
-/// `<always_applied_workspace_rules>` and `<user_rules>`.
 /// Normalize a free-form name (e.g. an MCP server identifier) into a
 /// single safe filesystem segment.
 ///
@@ -41,26 +36,235 @@ pub(super) fn pick_user_image_url(image: &agent_client_protocol::ImageContent) -
 }
 fn partition_rules_by_scope(
     files: Vec<xai_grok_agent::prompt::agents_md::AgentConfigFile>,
+    grok_home: &std::path::Path,
+    vendor_homes: &[(std::path::PathBuf, bool)],
+    workspace_roots: &[&std::path::Path],
 ) -> (
     Vec<xai_grok_agent::prompt::user_message::RuleEntry>,
     Vec<xai_grok_agent::prompt::user_message::RuleEntry>,
 ) {
-    let home = dirs::home_dir().map(|p| p.to_string_lossy().to_string());
-    let user_prefixes: Vec<String> = match home {
-        Some(h) => vec![format!("{h}/.grok/"), format!("{h}/.claude/")],
-        None => vec![],
-    };
     let mut workspace = Vec::new();
     let mut user = Vec::new();
-    for f in files {
-        let entry = xai_grok_agent::prompt::user_message::RuleEntry::from(f);
-        if user_prefixes.iter().any(|p| entry.path.starts_with(p)) {
+    for file in files {
+        let is_user_rule = crate::util::is_user_instruction_path(
+            std::path::Path::new(&file.file_path),
+            grok_home,
+            vendor_homes,
+            workspace_roots,
+        );
+        let entry = xai_grok_agent::prompt::user_message::RuleEntry::from(file);
+        if is_user_rule {
             user.push(entry);
         } else {
             workspace.push(entry);
         }
     }
     (workspace, user)
+}
+#[cfg(test)]
+mod partition_rules_by_scope_tests {
+    use super::partition_rules_by_scope;
+    use std::path::Path;
+    use xai_grok_agent::prompt::agents_md::AgentConfigFile;
+    fn file(path: &str) -> AgentConfigFile {
+        AgentConfigFile {
+            file_name: Path::new(path)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            file_path: path.to_string(),
+            content: path.to_string(),
+        }
+    }
+    fn paths(entries: &[xai_grok_agent::prompt::user_message::RuleEntry]) -> Vec<&str> {
+        entries.iter().map(|entry| entry.content.as_str()).collect()
+    }
+    #[test]
+    fn partitions_custom_grok_and_vendor_home_rules_as_user_scope() {
+        let files = vec![
+            file("/custom/config/rules/a.md"),
+            file("/home/user/.cursor/rules/b.md"),
+            file("/repo/.cursor/rules/c.md"),
+            file("/repo/src/AGENTS.md"),
+            file("/custom/config/rules/d.md"),
+        ];
+        let vendor_homes = vec![
+            (Path::new("/home/user/.claude").to_path_buf(), true),
+            (Path::new("/home/user/.cursor").to_path_buf(), true),
+        ];
+        let (workspace, user) = partition_rules_by_scope(
+            files,
+            Path::new("/custom/config"),
+            &vendor_homes,
+            &[Path::new("/repo")],
+        );
+        assert_eq!(
+            paths(&user),
+            vec![
+                "/custom/config/rules/a.md",
+                "/home/user/.cursor/rules/b.md",
+                "/custom/config/rules/d.md",
+            ]
+        );
+        assert_eq!(
+            paths(&workspace),
+            vec!["/repo/.cursor/rules/c.md", "/repo/src/AGENTS.md"]
+        );
+    }
+    #[test]
+    fn grok_home_nested_in_workspace_keeps_direct_surfaces_user_scoped() {
+        let files = vec![
+            file("/repo/config/AGENTS.md"),
+            file("/repo/config/rules/global.md"),
+            file("/repo/config/.grok/rules/project.md"),
+            file("/repo/config/src/AGENTS.md"),
+        ];
+        let (workspace, user) =
+            partition_rules_by_scope(files, Path::new("/repo/config"), &[], &[Path::new("/repo")]);
+        assert_eq!(
+            paths(&user),
+            vec!["/repo/config/AGENTS.md", "/repo/config/rules/global.md"]
+        );
+        assert_eq!(
+            paths(&workspace),
+            vec![
+                "/repo/config/.grok/rules/project.md",
+                "/repo/config/src/AGENTS.md",
+            ]
+        );
+    }
+    #[test]
+    fn vendor_home_nested_in_workspace_keeps_direct_surfaces_user_scoped() {
+        let files = vec![
+            file("/repo/.claude/rules/global.md"),
+            file("/repo/.claude/CLAUDE.md"),
+            file("/repo/.claude/.claude/rules/project.md"),
+            file("/repo/.claude/src/AGENTS.md"),
+        ];
+        let vendor_homes = vec![(Path::new("/repo/.claude").to_path_buf(), true)];
+        let (workspace, user) = partition_rules_by_scope(
+            files,
+            Path::new("/other/grok"),
+            &vendor_homes,
+            &[Path::new("/repo")],
+        );
+        assert_eq!(
+            paths(&user),
+            vec!["/repo/.claude/rules/global.md", "/repo/.claude/CLAUDE.md"]
+        );
+        assert_eq!(
+            paths(&workspace),
+            vec![
+                "/repo/.claude/.claude/rules/project.md",
+                "/repo/.claude/src/AGENTS.md",
+            ]
+        );
+    }
+    #[test]
+    fn nested_grok_home_workspace_files_stay_workspace_scoped() {
+        let files = vec![
+            file("/custom/grok/rules/global.md"),
+            file("/custom/grok/worktrees/repo/.cursor/rules/project.md"),
+            file("/custom/grok/worktrees/repo/src/AGENTS.md"),
+        ];
+        let (workspace, user) = partition_rules_by_scope(
+            files,
+            Path::new("/custom/grok"),
+            &[],
+            &[Path::new("/custom/grok/worktrees/repo")],
+        );
+        assert_eq!(paths(&user), vec!["/custom/grok/rules/global.md"]);
+        assert_eq!(
+            paths(&workspace),
+            vec![
+                "/custom/grok/worktrees/repo/.cursor/rules/project.md",
+                "/custom/grok/worktrees/repo/src/AGENTS.md",
+            ]
+        );
+    }
+    #[test]
+    fn partitioned_snapshot_bodies_match_rules_and_old_reminder() {
+        let files = vec![
+            AgentConfigFile {
+                file_name: "AGENTS.md".into(),
+                file_path: "/repo/AGENTS.md".into(),
+                content: "repo-agents-body".into(),
+            },
+            AgentConfigFile {
+                file_name: "CLAUDE.md".into(),
+                file_path: "/repo/CLAUDE.md".into(),
+                content: "repo-claude-body".into(),
+            },
+            AgentConfigFile {
+                file_name: "AGENTS.md".into(),
+                file_path: "/home/user/.grok/AGENTS.md".into(),
+                content: "home-grok-body".into(),
+            },
+            AgentConfigFile {
+                file_name: "CLAUDE.md".into(),
+                file_path: "/home/user/.claude/CLAUDE.md".into(),
+                content: "home-claude-body".into(),
+            },
+            AgentConfigFile {
+                file_name: "x.md".into(),
+                file_path: "/repo/.grok/rules/x.md".into(),
+                content: "repo-grok-rules-x".into(),
+            },
+        ];
+        let vendor_homes = vec![(Path::new("/home/user/.claude").to_path_buf(), true)];
+        let (workspace, user) = partition_rules_by_scope(
+            files.clone(),
+            Path::new("/home/user/.grok"),
+            &vendor_homes,
+            &[Path::new("/repo")],
+        );
+        let rules =
+            xai_grok_agent::prompt::user_message::format_rules_section(&workspace, &user).unwrap();
+        let reminder = xai_grok_agent::prompt::agents_md::format_agents_md_section(&files).unwrap();
+        for body in [
+            "repo-agents-body",
+            "repo-claude-body",
+            "home-grok-body",
+            "home-claude-body",
+            "repo-grok-rules-x",
+        ] {
+            assert!(rules.contains(body), "rules missing {body}");
+            assert!(reminder.contains(body), "reminder missing {body}");
+        }
+        assert!(rules.contains("name=\"/repo/AGENTS.md\""));
+        assert!(rules.contains("name=\"/repo/CLAUDE.md\""));
+        assert!(rules.contains("name=\"/repo/.grok/rules/x.md\""));
+        assert!(rules.contains("<user_rule>home-grok-body</user_rule>"));
+        assert!(rules.contains("<user_rule>home-claude-body</user_rule>"));
+        assert!(!rules.contains("## From:"));
+        assert!(!rules.contains("<system-reminder>"));
+    }
+    #[test]
+    fn fork_ondisk_and_display_prefixes_both_count_as_workspace() {
+        let files = vec![
+            file("/home/user/.grok/worktrees/repo/AGENTS.md"),
+            file("/home/user/repo/crates/foo/AGENTS.md"),
+            file("/home/user/.grok/AGENTS.md"),
+        ];
+        let (workspace, user) = partition_rules_by_scope(
+            files,
+            Path::new("/home/user/.grok"),
+            &[],
+            &[
+                Path::new("/home/user/.grok/worktrees/repo"),
+                Path::new("/home/user/repo/crates/foo"),
+            ],
+        );
+        assert_eq!(
+            paths(&workspace),
+            vec![
+                "/home/user/.grok/worktrees/repo/AGENTS.md",
+                "/home/user/repo/crates/foo/AGENTS.md",
+            ]
+        );
+        assert_eq!(paths(&user), vec!["/home/user/.grok/AGENTS.md"]);
+    }
 }
 /// True iff `conversation` already contains a project-instructions reminder,
 /// either tagged [`SyntheticReason::ProjectInstructions`] or a legacy untagged
@@ -318,8 +522,8 @@ impl SessionActor {
         drop_startup_skill_reminder: bool,
     ) {
         let is_prefix_slot = matches!(
-            conversation.get(1), Some(ConversationItem::User(u)) if u.synthetic_reason
-            .is_none()
+            conversation.get(1),
+            Some(ConversationItem::User(u)) if u.synthetic_reason.is_none()
         );
         if is_prefix_slot {
             conversation[1] = ConversationItem::user(new_prefix);
@@ -330,8 +534,10 @@ impl SessionActor {
         if drop_startup_skill_reminder {
             conversation.retain(|item| {
                 !matches!(
-                    item, ConversationItem::User(u) if u.synthetic_reason ==
-                    Some(xai_grok_sampling_types::SyntheticReason::SystemReminder)
+                    item,
+                    ConversationItem::User(u)
+                        if u.synthetic_reason
+                            == Some(xai_grok_sampling_types::SyntheticReason::SystemReminder)
                 )
             });
         }
@@ -344,13 +550,15 @@ impl SessionActor {
             .unwrap_or(&self.session_info.cwd);
         let cwd = std::path::Path::new(display_path);
         use xai_grok_agent::prompt::user_message::UserMessageTemplate;
-        let template = self
-            .agent
-            .borrow()
-            .definition()
-            .user_message_template
-            .clone();
-        #[allow(unused_mut)]
+        let (template, include_verification) = {
+            let agent = self.agent.borrow();
+            let def = agent.definition();
+            (
+                def.user_message_template.clone(),
+                def.include_browser_verification(),
+            )
+        };
+        let mut prefix_carries_fallback_date = false;
         let mut out = if !matches!(template, UserMessageTemplate::Default) {
             if let Some(rendered) = self
                 .build_templated_user_message(cwd, template.clone())
@@ -361,6 +569,7 @@ impl SessionActor {
                 tracing::warn!(
                     "templated user message render failed; falling back to legacy prefix"
                 );
+                prefix_carries_fallback_date = !template.surfaces_local_date();
                 if self.startup_hints.skip_git_status {
                     construct_user_message_minimal(cwd, None)
                 } else {
@@ -372,9 +581,61 @@ impl SessionActor {
         } else {
             construct_user_message(cwd, self.vcs_kind, None, None).await
         };
+        if matches!(template, UserMessageTemplate::Default) && include_verification {
+            let (workspace_rules, mut user_rules) = self.gather_partitioned_rules();
+            user_rules.splice(
+                0..0,
+                xai_grok_agent::prompt::browser_verification::synthetic_user_rules(),
+            );
+            xai_grok_agent::prompt::user_message::append_rules_section(
+                &mut out,
+                &workspace_rules,
+                &user_rules,
+            );
+        }
         self.last_announced_local_date
             .set(chrono::Local::now().date_naive());
+        self.prefix_carries_fallback_date
+            .set(prefix_carries_fallback_date);
         out
+    }
+    fn gather_partitioned_rules(
+        &self,
+    ) -> (
+        Vec<xai_grok_agent::prompt::user_message::RuleEntry>,
+        Vec<xai_grok_agent::prompt::user_message::RuleEntry>,
+    ) {
+        let files = self.agent.borrow().prompt_context().agents_md_files.clone();
+        let grok_home = xai_grok_config::grok_home();
+        let vendor_homes = dirs::home_dir()
+            .map(|home_dir| {
+                vec![
+                    (
+                        home_dir.join(".claude"),
+                        self.rebuild_spec.compat.claude.agents,
+                    ),
+                    (
+                        home_dir.join(".cursor"),
+                        self.rebuild_spec.compat.cursor.agents,
+                    ),
+                ]
+            })
+            .unwrap_or_default();
+        let on_disk_cwd = std::path::Path::new(&self.session_info.cwd);
+        let on_disk_root = git2::Repository::discover(on_disk_cwd)
+            .ok()
+            .and_then(|repo| repo.workdir().map(std::path::Path::to_path_buf))
+            .unwrap_or_else(|| on_disk_cwd.to_path_buf());
+        let display_root = self
+            .display_cwd
+            .get()
+            .map(|s| std::path::PathBuf::from(s.as_str()));
+        let workspace_roots: Vec<&std::path::Path> = display_root
+            .as_deref()
+            .into_iter()
+            .chain(std::iter::once(on_disk_root.as_path()))
+            .collect();
+        partition_rules_by_scope(files, &grok_home, &vendor_homes, &workspace_roots)
     }
     /// Build the custom-templated first user message.
     ///
@@ -386,16 +647,25 @@ impl SessionActor {
         cwd: &std::path::Path,
         template: xai_grok_agent::prompt::user_message::UserMessageTemplate,
     ) -> Option<String> {
-        use xai_grok_agent::prompt::agents_md::read_agents_config_with_paths;
         use xai_grok_agent::prompt::user_message::UserMessageContext;
         self.wait_for_mcp_templated_prefix_ready(&template).await;
-        let cwd_str = cwd.to_string_lossy().to_string();
         let bridge = self.agent.borrow().tool_bridge().clone();
         let (vcs_root, vcs_status) = self.gather_vcs_for_prefix(cwd).await;
-        let agents_files = read_agents_config_with_paths(&cwd_str, self.rebuild_spec.compat).await;
-        let (workspace_rules, user_rules) = partition_rules_by_scope(agents_files);
-        let skills = bridge.slash_skills().await;
+        let (workspace_rules, user_rules) = self.gather_partitioned_rules();
+        let mut user_rules = user_rules;
+        let skills = self.slash_skills_for_resolve().await;
         let mcp_servers = self.gather_mcp_servers(cwd).await;
+        if self
+            .agent
+            .borrow()
+            .definition()
+            .include_browser_verification()
+        {
+            user_rules.splice(
+                0..0,
+                xai_grok_agent::prompt::browser_verification::synthetic_user_rules(),
+            );
+        }
         let shell = resolve_session_shell();
         let today_local = chrono::Local::now().date_naive();
         let mcps_root = Self::workspace_mcps_root(cwd).map(|p| p.to_string_lossy().to_string());
@@ -486,9 +756,10 @@ impl SessionActor {
         )> = {
             let state = self.mcp_state.lock().await;
             tracing::debug!(
-                session_id = % self.session_info.id.0, client_count = state.owned_clients
-                .len() + state.shared_clients.len(), initializing_count = state
-                .handshaking_servers_count(), finished_init = state.has_finished_init(),
+                session_id = %self.session_info.id.0,
+                client_count = state.owned_clients.len() + state.shared_clients.len(),
+                initializing_count = state.handshaking_servers_count(),
+                finished_init = state.has_finished_init(),
                 config_count = state.configs.len(),
                 "gather_mcp_servers: snapshotting MCP state for user preamble render"
             );
@@ -667,10 +938,15 @@ impl SessionActor {
     ) -> Result<String, acp::Error> {
         let prior = self.chat_state_handle.get_conversation().await;
         let outline = crate::session::image_describe::build_conversation_outline(&prior);
-        let session_dir = crate::session::persistence::session_dir(&crate::session::info::Info {
-            id: self.session_info.id.clone(),
-            cwd: self.session_info.cwd.clone(),
-        });
+        let session_dir = crate::session::persistence::ensure_owner_only_session_dir(
+            &crate::session::info::Info {
+                id: self.session_info.id.clone(),
+                cwd: self.session_info.cwd.clone(),
+            },
+        )
+        .map_err(|e| {
+            acp::Error::internal_error().data(format!("failed to create session dir: {e}"))
+        })?;
         let persisted = crate::session::image_describe::persist_user_images(&session_dir, images)
             .map_err(|e| {
             acp::Error::internal_error()
@@ -704,8 +980,10 @@ impl SessionActor {
         let skip_count = persisted.len().saturating_sub(limit);
         if skip_count > 0 {
             tracing::info!(
-                session_id = % self.session_info.id, total = persisted.len(), skipped =
-                skip_count, limit,
+                session_id = %self.session_info.id,
+                total = persisted.len(),
+                skipped = skip_count,
+                limit,
                 "image transcription: skipping oldest images due to processing limit",
             );
         }

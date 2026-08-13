@@ -56,11 +56,17 @@ impl AgentView {
             }
         });
     }
-    /// Return the URL of the currently highlighted link, if any.
-    pub fn highlighted_link_url(&self) -> Option<&str> {
+    /// Return the semantic target of the currently highlighted link, if any.
+    pub fn highlighted_link_target(&self) -> Option<&crate::render::osc8::LinkTarget> {
         self.highlighted_link_idx
             .and_then(|idx| self.visible_link_map.links().get(idx))
-            .map(|link| &*link.url)
+            .map(|link| &link.target)
+    }
+    /// Return the current OSC 8 URL for the highlighted link preview.
+    pub fn highlighted_link_url(&self) -> Option<std::sync::Arc<str>> {
+        self.highlighted_link_target()
+            .and_then(crate::render::osc8::resolve_link_target)
+            .and_then(|resolved| resolved.osc8_url)
     }
     /// True when `(x, y)` lies inside an overlay drawn over the scrollback this
     /// frame (dropdown, goal detail). Such positions belong to the overlay, not
@@ -134,6 +140,20 @@ impl AgentView {
                 id: None,
             });
         }
+    }
+    /// Hit-test `(col, row)` and arm [`Self::pending_link_click`] when the app
+    /// owns the open. Returns `true` when a link was hit so the caller can skip
+    /// text-drag even if the terminal owns the open (pending stays unset).
+    pub(in crate::app) fn try_arm_link_click(&mut self, col: u16, row: u16) -> bool {
+        if has_native_link_hover() || self.pos_occluded(col, row) {
+            return false;
+        }
+        let Some(link) = self.visible_link_map.link_at(col, row) else {
+            return false;
+        };
+        self.pending_link_click =
+            app_should_open_link_on_click(link).then(|| (col, row, link.target.clone()));
+        true
     }
     /// Re-evaluate which link (if any) is under the cursor for the given
     /// modifier state.  Returns `true` when `hovered_link_idx` changed.
@@ -275,16 +295,32 @@ mod link_click_tests {
         agent.active_pane = AgentPane::Scrollback;
     }
     /// Add a link to the visible_link_map covering (col_start..col_end, row).
-    fn add_visible_link(agent: &mut AgentView, row: u16, col_start: u16, col_end: u16, url: &str) {
+    fn add_visible_target(
+        agent: &mut AgentView,
+        row: u16,
+        col_start: u16,
+        col_end: u16,
+        target: crate::render::osc8::LinkTarget,
+    ) {
         let mut overlay = LinkOverlay::new();
         overlay.push(OverlayLink {
             screen_row: row,
             col_start,
             col_end,
-            url: Arc::from(url),
+            target,
+            presentation: crate::render::osc8::LinkPresentation::Opaque,
             id: Some(1),
         });
         agent.visible_link_map.rebuild(1, &overlay, vec![]);
+    }
+    fn add_visible_link(agent: &mut AgentView, row: u16, col_start: u16, col_end: u16, url: &str) {
+        add_visible_target(
+            agent,
+            row,
+            col_start,
+            col_end,
+            crate::render::osc8::LinkTarget::Url(Arc::from(url)),
+        );
     }
     fn mouse_down(col: u16, row: u16) -> MouseEvent {
         MouseEvent {
@@ -318,10 +354,9 @@ mod link_click_tests {
             modifiers: crossterm::event::KeyModifiers::empty(),
         }
     }
-    /// Drive a real `Down`→`Drag` through `handle_input` on a selectable
-    /// scrollback line so `drag_selection` is genuinely promoted, then leave the
-    /// button held with no `Up` — the latched state the recovery guard targets.
-    fn latch_real_scrollback_drag(agent: &mut AgentView, reg: &ActionRegistry) {
+    /// One selectable line on screen row 5, cols 0..40, in an 80x24
+    /// scrollback pane — the shared surface for the drag-latch tests.
+    fn install_selectable_line(agent: &mut AgentView) {
         setup_scrollback_area(agent, Rect::new(0, 0, 80, 24));
         let mut model = ResolvedSelectionModel::default();
         model.push_line(crate::scrollback::text_selection::ResolvedSelectableLine {
@@ -335,6 +370,12 @@ mod link_click_tests {
             joiner_to_previous: None,
         });
         agent.update_scrollback_selection_state(model, Default::default());
+    }
+    /// Drive a real `Down`→`Drag` through `handle_input` on a selectable
+    /// scrollback line so `drag_selection` is genuinely promoted, then leave the
+    /// button held with no `Up` — the latched state the recovery guard targets.
+    fn latch_real_scrollback_drag(agent: &mut AgentView, reg: &ActionRegistry) {
+        install_selectable_line(agent);
         let _ = agent.handle_input(&Event::Mouse(mouse_down(2, 5)), reg);
         let _ = agent.handle_input(&Event::Mouse(mouse_drag(10, 5)), reg);
         assert!(
@@ -342,6 +383,14 @@ mod link_click_tests {
             "setup: Down→Drag on a selectable line must promote drag_selection"
         );
         assert!(agent.left_mouse_down, "setup: button must still be held");
+    }
+    fn mouse_button_event(kind: MouseEventKind, col: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: col,
+            row,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        }
     }
     #[test]
     fn esc_unsticks_latched_drag() {
@@ -362,7 +411,53 @@ mod link_click_tests {
         assert!(agent.drag_selection.is_none());
     }
     #[test]
-    fn fresh_mouse_down_clears_prior_latch() {
+    fn live_drag_events_not_interrupted() {
+        let mut agent = make_agent();
+        let reg = ActionRegistry::defaults();
+        latch_real_scrollback_drag(&mut agent, &reg);
+        let _ = agent.handle_input(&Event::Mouse(mouse_drag(20, 5)), &reg);
+        assert!(agent.drag_selection.is_some());
+    }
+    /// A bare `Moved` while the latch is held means the release was lost:
+    /// the drag finishes as the Up would have (copy delivered, highlight
+    /// persisted) instead of extending on every hover forever.
+    #[test]
+    fn bare_moved_finishes_lost_up_drag() {
+        let mut agent = make_agent();
+        let reg = ActionRegistry::defaults();
+        latch_real_scrollback_drag(&mut agent, &reg);
+        let outcome = agent.handle_input(&Event::Mouse(mouse_moved(30, 5)), &reg);
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert!(!agent.left_mouse_down);
+        assert!(agent.drag_selection.is_none(), "finished, not extended");
+        assert!(
+            agent.persistent_text_selection.is_some(),
+            "the finished drag delivered its copy and persisted the highlight"
+        );
+        let _ = agent.handle_input(&Event::Mouse(mouse_moved(40, 5)), &reg);
+        assert!(agent.drag_selection.is_none());
+    }
+    /// A press whose release is lost before any drag motion: the first bare
+    /// `Moved` drops the latch without promoting a selection or copying.
+    #[test]
+    fn bare_moved_after_plain_press_drops_latch_without_promoting() {
+        let mut agent = make_agent();
+        let reg = ActionRegistry::defaults();
+        install_selectable_line(&mut agent);
+        let _ = agent.handle_input(&Event::Mouse(mouse_down(2, 5)), &reg);
+        assert!(agent.pending_text_drag.is_some(), "setup: press armed");
+        let _ = agent.handle_input(&Event::Mouse(mouse_moved(10, 5)), &reg);
+        assert!(!agent.left_mouse_down);
+        assert!(agent.pending_text_drag.is_none(), "latch dropped");
+        assert!(agent.drag_selection.is_none(), "hover must not select");
+        assert!(agent.persistent_text_selection.is_none(), "nothing copied");
+        let _ = agent.handle_input(&Event::Mouse(mouse_moved(20, 5)), &reg);
+        assert!(agent.drag_selection.is_none());
+    }
+    /// A press following a lost release finishes the interrupted gesture
+    /// (delivering its copy) before starting the next one.
+    #[test]
+    fn fresh_mouse_down_finishes_prior_latched_drag() {
         let mut agent = make_agent();
         let reg = ActionRegistry::defaults();
         latch_real_scrollback_drag(&mut agent, &reg);
@@ -371,16 +466,105 @@ mod link_click_tests {
             agent.drag_selection.is_none(),
             "the stale promoted selection must not survive into the fresh press"
         );
+        assert!(agent.left_mouse_down, "the new press owns the button latch");
     }
+    /// Replay of a VS Code context-menu gesture captured live: the press
+    /// landed on the menu (never reported), so the pager sees `Down(Right)`
+    /// → `Drag(Left)`×N → `Up(Left)` with no `Down(Left)` anywhere. With no
+    /// armed left gesture it must stay inert.
     #[test]
-    fn live_drag_events_not_interrupted() {
+    fn vscode_menu_gesture_right_press_left_drags_left_release_is_inert() {
+        let mut agent = make_agent();
+        let reg = ActionRegistry::defaults();
+        install_selectable_line(&mut agent);
+        let _ = agent.handle_input(
+            &Event::Mouse(mouse_button_event(
+                MouseEventKind::Down(MouseButton::Right),
+                2,
+                5,
+            )),
+            &reg,
+        );
+        for col in [4u16, 8, 12, 16] {
+            let _ = agent.handle_input(&Event::Mouse(mouse_drag(col, 5)), &reg);
+        }
+        let _ = agent.handle_input(&Event::Mouse(mouse_up(16, 5)), &reg);
+        let _ = agent.handle_input(&Event::Mouse(mouse_moved(25, 5)), &reg);
+        let _ = agent.handle_input(&Event::Mouse(mouse_moved(30, 5)), &reg);
+        assert!(!agent.left_mouse_down);
+        assert!(agent.drag_selection.is_none());
+        assert!(agent.pending_text_drag.is_none());
+        assert!(agent.persistent_text_selection.is_none());
+        assert!(!agent.scrollback_drag_latched());
+    }
+    /// An unpaired right release while the left latch is held still means
+    /// the gesture ended: the drag finishes with its copy.
+    #[test]
+    fn unpaired_right_release_finishes_left_drag() {
         let mut agent = make_agent();
         let reg = ActionRegistry::defaults();
         latch_real_scrollback_drag(&mut agent, &reg);
-        let _ = agent.handle_input(&Event::Mouse(mouse_drag(20, 5)), &reg);
-        assert!(agent.drag_selection.is_some());
-        let _ = agent.handle_input(&Event::Mouse(mouse_moved(25, 5)), &reg);
-        assert!(agent.drag_selection.is_some());
+        let outcome = agent.handle_input(
+            &Event::Mouse(mouse_button_event(
+                MouseEventKind::Up(MouseButton::Right),
+                10,
+                5,
+            )),
+            &reg,
+        );
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert!(!agent.left_mouse_down);
+        assert!(agent.drag_selection.is_none(), "finished, not stuck");
+        assert!(
+            agent.persistent_text_selection.is_some(),
+            "the finished drag delivered its copy and persisted the highlight"
+        );
+    }
+    /// Replay of the wedged VS Code state captured live: `Down(Left)` per
+    /// click, never `Up(Left)` or `Drag(Left)`, only bare `Moved`. Clicks
+    /// must stay inert instead of growing a runaway selection each.
+    #[test]
+    fn wedged_terminal_clicks_without_releases_stay_inert() {
+        let mut agent = make_agent();
+        let reg = ActionRegistry::defaults();
+        install_selectable_line(&mut agent);
+        for (i, col) in [4u16, 12, 20, 28].iter().enumerate() {
+            let _ = agent.handle_input(&Event::Mouse(mouse_down(*col, 5)), &reg);
+            let _ = agent.handle_input(&Event::Mouse(mouse_moved(col + 3, 5)), &reg);
+            let _ = agent.handle_input(&Event::Mouse(mouse_moved(col + 6, 5)), &reg);
+            assert!(
+                agent.drag_selection.is_none(),
+                "click {i}: bare Moved must not grow a selection"
+            );
+            assert!(
+                agent.persistent_text_selection.is_none(),
+                "click {i}: nothing was selected, so nothing may persist"
+            );
+            assert!(!agent.left_mouse_down, "click {i}: latch dropped");
+        }
+    }
+    /// An unpaired right drag while the left latch is held is held motion:
+    /// the latch survives and the left release finishes normally.
+    #[test]
+    fn unpaired_right_drag_keeps_left_latch() {
+        let mut agent = make_agent();
+        let reg = ActionRegistry::defaults();
+        latch_real_scrollback_drag(&mut agent, &reg);
+        let _ = agent.handle_input(
+            &Event::Mouse(mouse_button_event(
+                MouseEventKind::Drag(MouseButton::Right),
+                12,
+                5,
+            )),
+            &reg,
+        );
+        assert!(
+            agent.drag_selection.is_some(),
+            "mis-encoded drag must not drop the live gesture"
+        );
+        let _ = agent.handle_input(&Event::Mouse(mouse_up(14, 5)), &reg);
+        assert!(agent.drag_selection.is_none());
+        assert!(agent.persistent_text_selection.is_some(), "copy delivered");
     }
     #[test]
     fn non_esc_key_clears_latch() {
@@ -470,6 +654,16 @@ mod link_click_tests {
         banner_height: u16,
         cols: u16,
     ) -> Buffer {
+        draw_frame_privacy(agent, reg, announcements, banner_height, cols, false)
+    }
+    fn draw_frame_privacy(
+        agent: &mut AgentView,
+        reg: &ActionRegistry,
+        announcements: &[xai_grok_announcements::RemoteAnnouncement],
+        banner_height: u16,
+        cols: u16,
+        privacy_banner: bool,
+    ) -> Buffer {
         let area = Rect::new(0, 0, cols, 30);
         let bundle = crate::app::bundle::BundleState::default();
         let mut buf = Buffer::empty(area);
@@ -481,16 +675,19 @@ mod link_click_tests {
             &mut scratch,
             None,
             false,
-            banner_height,
-            announcements,
-            &std::collections::BTreeSet::new(),
-            None,
+            crate::app::agent_view::BannerSlotParams {
+                height: banner_height,
+                announcements,
+                hidden_ids: &std::collections::BTreeSet::new(),
+                privacy_banner,
+                mouse_pos: None,
+                tip: None,
+            },
             &bundle,
             false,
+            false,
             &mut Vec::new(),
-            false,
-            false,
-            None,
+            crate::app::agent_view::AppRenderParams::default(),
         );
         buf
     }
@@ -535,6 +732,89 @@ mod link_click_tests {
             !matches!(outcome, InputOutcome::Action(Action::AnnouncementsHide)),
             "click where [hide] used to be must not hide-and-persist under a dropdown"
         );
+    }
+    /// Privacy upsell banner: when the caller passes `privacy_banner: true`,
+    /// the render layer gives it the slot (even over an announcement — the
+    /// critical-outranks-privacy ranking lives in `AppView::draw`, which
+    /// never passes `true` while a critical announcement is live), arms its
+    /// three rects, and clicks dispatch the banner actions. Turning it off
+    /// clears the rects.
+    #[test]
+    fn privacy_banner_owns_slot_and_clicks_dispatch() {
+        let reg = ActionRegistry::defaults();
+        let mut agent = make_agent();
+        agent.last_terminal_size = (80, 30);
+        let critical = [xai_grok_announcements::RemoteAnnouncement {
+            severity: Some("critical".into()),
+            title: Some("ZZCRIT".into()),
+            message: Some("outage".into()),
+            ..Default::default()
+        }];
+        let buf = draw_frame_privacy(&mut agent, &reg, &critical, 2, 80, true);
+        let text: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(text.contains("Help improve Grok"), "banner copy painted");
+        assert!(
+            !text.contains("ZZCRIT"),
+            "critical announcement yields the slot to the privacy banner"
+        );
+        assert!(
+            agent.hit_announcement_hide.rect.is_none(),
+            "announcement [hide] must not be clickable under the privacy banner"
+        );
+        let rect = agent
+            .privacy_banner
+            .hit_opt_in
+            .rect
+            .expect("accept rect armed");
+        let outcome = agent.handle_input(&Event::Mouse(mouse_down(rect.x + 1, rect.y)), &reg);
+        assert!(matches!(
+            outcome,
+            InputOutcome::Action(Action::PrivacyBannerOptIn)
+        ));
+        let rect = agent
+            .privacy_banner
+            .hit_opt_out
+            .rect
+            .expect("customize rect armed");
+        let outcome = agent.handle_input(&Event::Mouse(mouse_down(rect.x + 1, rect.y)), &reg);
+        assert!(matches!(
+            outcome,
+            InputOutcome::Action(Action::PrivacyBannerOptOut)
+        ));
+        let rect = agent
+            .privacy_banner
+            .hit_terms
+            .rect
+            .expect("terms rect armed");
+        let outcome = agent.handle_input(&Event::Mouse(mouse_down(rect.x + 1, rect.y)), &reg);
+        assert!(matches!(
+            outcome,
+            InputOutcome::Action(Action::OpenUrl(ref url))
+                if url == crate::views::privacy_banner::PRIVACY_BANNER_TERMS_URL
+        ));
+        let rect = agent
+            .privacy_banner
+            .hit_policy
+            .rect
+            .expect("privacy policy rect armed");
+        let outcome = agent.handle_input(&Event::Mouse(mouse_down(rect.x + 1, rect.y)), &reg);
+        assert!(matches!(
+            outcome,
+            InputOutcome::Action(Action::OpenUrl(ref url))
+                if url == crate::views::privacy_banner::PRIVACY_BANNER_POLICY_URL
+        ));
+        draw_frame_privacy(&mut agent, &reg, &critical, 2, 80, false);
+        assert!(agent.privacy_banner.hit_opt_in.rect.is_none());
+        assert!(agent.privacy_banner.hit_opt_out.rect.is_none());
+        assert!(agent.privacy_banner.hit_terms.rect.is_none());
+        assert!(agent.privacy_banner.hit_policy.rect.is_none());
+        assert!(agent.hit_announcement_hide.rect.is_some());
     }
     /// Promo twin of the [hide] suppression test: the [label] CTA rect must
     /// also drop under an open dropdown so a dropdown click cannot open a URL
@@ -628,6 +908,38 @@ mod link_click_tests {
             "click where stop used to be must not cancel the turn under a dropdown"
         );
     }
+    /// Clicking the still-running watcher cue toggles the tasks pane like
+    /// Ctrl+G; only the first click that reveals the pane shows the one-time
+    /// shortcut toast.
+    #[test]
+    fn watching_cue_click_opens_tasks_pane_with_one_time_shortcut_toast() {
+        let reg = ActionRegistry::defaults();
+        let mut agent = make_agent();
+        agent.last_terminal_size = (80, 30);
+        super::test_fixtures::add_running_bg_task(&mut agent);
+        draw_banner_frame(&mut agent, &reg, &[], 0);
+        let rect = agent.hit_watching_cue.rect.expect("cue rect must be armed");
+        let click = Event::Mouse(mouse_down(rect.x + 1, rect.y));
+        let _ = agent.handle_input(&click, &reg);
+        assert!(agent.tasks.overlay.focused);
+        assert!(agent.toast.is_none(), "focus-only click must not toast");
+        agent.tasks.overlay.hide();
+        agent.tasks.on_state_change();
+        draw_banner_frame(&mut agent, &reg, &[], 0);
+        let _ = agent.handle_input(&click, &reg);
+        assert!(agent.tasks.overlay.visible && agent.tasks.overlay.focused);
+        assert_eq!(agent.active_pane, AgentPane::Tasks);
+        let toast = agent.toast.clone().map(|(msg, _)| msg);
+        assert_eq!(toast.as_deref(), Some("Tip: Ctrl+G toggles the tasks pane"));
+        agent.toast = None;
+        draw_banner_frame(&mut agent, &reg, &[], 0);
+        let _ = agent.handle_input(&click, &reg);
+        assert!(!agent.tasks.overlay.visible);
+        draw_banner_frame(&mut agent, &reg, &[], 0);
+        let _ = agent.handle_input(&click, &reg);
+        assert!(agent.tasks.overlay.visible);
+        assert!(agent.toast.is_none(), "toast fires only once per session");
+    }
     /// Bg twin: the `[↓]` demote button rides the same turn-status row, so its
     /// rect must drop under an open dropdown too — a dropdown click must never
     /// background the running execute tool.
@@ -675,6 +987,24 @@ mod link_click_tests {
         assert!(
             !matches!(outcome, InputOutcome::Action(Action::DemoteToBackground)),
             "click where the bg button used to be must not demote under a dropdown"
+        );
+    }
+    #[test]
+    fn subagent_view_suppresses_background_button() {
+        let reg = ActionRegistry::defaults();
+        let mut parent = make_agent();
+        let mut child = make_agent();
+        super::test_fixtures::add_running_execute(&mut child);
+        parent
+            .subagent_views
+            .insert("child-sid".into(), Box::new(child));
+        assert!(!parent.subagent_views["child-sid"].is_subagent_view);
+        parent.open_subagent_fullscreen("child-sid".into());
+        let child = parent.subagent_views.get_mut("child-sid").unwrap();
+        draw_banner_frame(child, &reg, &[], 0);
+        assert!(
+            child.hit_bg_button.rect.is_none(),
+            "read-only child view must not advertise a background button"
         );
     }
     /// Header twin: the top-header upgrade CTA rect must drop under an open
@@ -1032,7 +1362,11 @@ mod link_click_tests {
         let mut agent = make_agent();
         let area = Rect::new(0, 0, 80, 24);
         setup_scrollback_area(&mut agent, area);
-        agent.pending_link_click = Some((15, 5, "https://example.com".into()));
+        agent.pending_link_click = Some((
+            15,
+            5,
+            crate::render::osc8::LinkTarget::Url("https://example.com".into()),
+        ));
         agent.left_mouse_down = true;
         let outcome = agent.handle_mouse(&mouse_drag(16, 5));
         assert!(matches!(
@@ -1042,22 +1376,29 @@ mod link_click_tests {
         assert!(agent.pending_link_click.is_none());
     }
     #[test]
-    fn up_at_same_position_returns_open_url_action() {
+    fn up_at_same_position_returns_open_link_action() {
         let mut agent = make_agent();
         let area = Rect::new(0, 0, 80, 24);
         setup_scrollback_area(&mut agent, area);
-        agent.pending_link_click = Some((15, 5, "https://example.com".into()));
+        agent.pending_link_click = Some((
+            15,
+            5,
+            crate::render::osc8::LinkTarget::Url("https://example.com".into()),
+        ));
         agent.left_mouse_down = true;
         let outcome = agent.handle_mouse(&mouse_up(15, 5));
         match outcome {
-            InputOutcome::Action(Action::OpenUrl(url)) => {
-                assert_eq!(url, "https://example.com");
+            InputOutcome::Action(Action::OpenLink(target)) => {
+                assert_eq!(
+                    target,
+                    crate::render::osc8::LinkTarget::Url("https://example.com".into())
+                );
             }
-            other => panic!("expected Action::OpenUrl, got {other:?}"),
+            other => panic!("expected Action::OpenLink, got {other:?}"),
         }
     }
-    /// A modifier+click on a `file://` link dispatches `OpenUrl` (Ctrl on
-    /// Linux/Windows; macOS polls CoreGraphics so the Down step isn't
+    /// A modifier+click preserves a filesystem target through app activation
+    /// (Ctrl on Linux/Windows; macOS polls CoreGraphics so the Down step isn't
     /// reproducible in a unit test).
     #[test]
     #[cfg(not(target_os = "macos"))]
@@ -1065,21 +1406,41 @@ mod link_click_tests {
         let mut agent = make_agent();
         let area = Rect::new(0, 0, 80, 24);
         setup_scrollback_area(&mut agent, area);
-        add_visible_link(&mut agent, 5, 10, 30, "file:///tmp/session/images/1.png");
+        add_visible_target(
+            &mut agent,
+            5,
+            10,
+            30,
+            crate::render::osc8::LinkTarget::File(Arc::from(std::path::Path::new(
+                "/tmp/session/images/1.png",
+            ))),
+        );
         let mut down = mouse_down(15, 5);
         down.modifiers = crossterm::event::KeyModifiers::CONTROL;
         assert!(matches!(agent.handle_mouse(&down), InputOutcome::Changed));
         match agent.handle_mouse(&mouse_up(15, 5)) {
-            InputOutcome::Action(Action::OpenUrl(url)) => {
-                assert_eq!(url, "file:///tmp/session/images/1.png");
+            InputOutcome::Action(Action::OpenLink(target)) => {
+                assert_eq!(
+                    target,
+                    crate::render::osc8::LinkTarget::File(Arc::from(std::path::Path::new(
+                        "/tmp/session/images/1.png",
+                    )))
+                );
             }
-            other => panic!("expected Action::OpenUrl(file://…), got {other:?}"),
+            other => panic!("expected Action::OpenLink(file), got {other:?}"),
         }
     }
     fn test_link(url: &str, painted_w: u16) -> crate::scrollback::VisibleLink {
         crate::scrollback::VisibleLink {
             rects: vec![Rect::new(0, 0, painted_w, 1)],
-            url: std::sync::Arc::from(url),
+            target: crate::render::osc8::LinkTarget::Url(std::sync::Arc::from(url)),
+            id: None,
+        }
+    }
+    fn test_file_link(path: &std::path::Path, painted_w: u16) -> crate::scrollback::VisibleLink {
+        crate::scrollback::VisibleLink {
+            rects: vec![Rect::new(0, 0, painted_w, 1)],
+            target: crate::render::osc8::LinkTarget::File(Arc::from(path)),
             id: None,
         }
     }
@@ -1115,13 +1476,14 @@ mod link_click_tests {
             true,
             &test_link(bare, bare_w.saturating_add(40))
         ));
+        let file_path = std::path::Path::new("/tmp/session/images/1.png");
         assert!(app_should_open_link_on_click_with(
             true,
-            &test_link(file, file_w)
+            &test_file_link(file_path, file_w)
         ));
         assert!(app_should_open_link_on_click_with(
             true,
-            &test_link(file, 8)
+            &test_file_link(file_path, 8)
         ));
     }
     /// Regression: while the plan preview (line viewer) is open and the
@@ -1192,10 +1554,17 @@ mod link_click_tests {
         let mut agent = make_agent();
         let area = Rect::new(0, 0, 80, 24);
         setup_scrollback_area(&mut agent, area);
-        agent.pending_link_click = Some((15, 5, "https://example.com".into()));
+        agent.pending_link_click = Some((
+            15,
+            5,
+            crate::render::osc8::LinkTarget::Url("https://example.com".into()),
+        ));
         agent.left_mouse_down = true;
         let outcome = agent.handle_mouse(&mouse_up(16, 5));
-        assert!(!matches!(outcome, InputOutcome::Action(Action::OpenUrl(_))));
+        assert!(!matches!(
+            outcome,
+            InputOutcome::Action(Action::OpenLink(_))
+        ));
         assert!(agent.pending_link_click.is_none());
     }
     #[test]
@@ -1204,17 +1573,28 @@ mod link_click_tests {
         let area = Rect::new(0, 0, 80, 24);
         setup_scrollback_area(&mut agent, area);
         add_visible_link(&mut agent, 5, 10, 30, "https://example.com");
-        agent.pending_link_click = Some((15, 5, "https://example.com".into()));
+        agent.pending_link_click = Some((
+            15,
+            5,
+            crate::render::osc8::LinkTarget::Url("https://example.com".into()),
+        ));
         let outcome = agent.handle_mouse(&mouse_down(5, 3));
         assert!(matches!(outcome, InputOutcome::Changed));
         assert!(agent.pending_link_click.is_none());
     }
+    /// The lost-release finish drops the press's link arm so a later
+    /// unrelated Up can't fire it.
     #[test]
-    fn moved_with_left_mouse_down_clears_pending_link_click() {
+    fn moved_with_left_mouse_down_finishes_press_and_drops_link_arm() {
         let mut agent = make_agent();
+        let reg = ActionRegistry::defaults();
         let area = Rect::new(0, 0, 80, 24);
         setup_scrollback_area(&mut agent, area);
-        agent.pending_link_click = Some((15, 5, "https://example.com".into()));
+        agent.pending_link_click = Some((
+            15,
+            5,
+            crate::render::osc8::LinkTarget::Url("https://example.com".into()),
+        ));
         agent.left_mouse_down = true;
         agent.pending_text_drag = Some(PendingTextDrag {
             start_col: 15,
@@ -1227,10 +1607,13 @@ mod link_click_tests {
             },
             anchor_content_width: None,
         });
-        let _outcome = agent.handle_mouse(&mouse_moved(16, 5));
+        let outcome = agent.handle_input(&Event::Mouse(mouse_moved(16, 5)), &reg);
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert!(!agent.left_mouse_down, "lost release finished the press");
+        assert!(agent.pending_text_drag.is_none());
         assert!(
             agent.pending_link_click.is_none(),
-            "Moved with left_mouse_down should clear pending_link_click"
+            "the finished press must not leave its link arm dangling"
         );
     }
     #[test]
@@ -1238,14 +1621,21 @@ mod link_click_tests {
         let mut agent = make_agent();
         setup_scrollback_area(&mut agent, Rect::new(0, 0, 80, 20));
         agent.active_pane = AgentPane::Prompt;
-        agent.pending_link_click = Some((15, 5, "https://example.com".into()));
+        agent.pending_link_click = Some((
+            15,
+            5,
+            crate::render::osc8::LinkTarget::Url("https://example.com".into()),
+        ));
         agent.left_mouse_down = true;
         let outcome = agent.handle_mouse(&mouse_up(15, 5));
         match outcome {
-            InputOutcome::Action(Action::OpenUrl(url)) => {
-                assert_eq!(url, "https://example.com");
+            InputOutcome::Action(Action::OpenLink(target)) => {
+                assert_eq!(
+                    target,
+                    crate::render::osc8::LinkTarget::Url("https://example.com".into())
+                );
             }
-            other => panic!("expected Action::OpenUrl, got {other:?}"),
+            other => panic!("expected Action::OpenLink, got {other:?}"),
         }
     }
     /// `/btw` panel links share the pane-agnostic Up path: once Down records
@@ -1258,14 +1648,21 @@ mod link_click_tests {
         agent.active_pane = AgentPane::Prompt;
         agent.btw_focused = true;
         add_visible_link(&mut agent, 20, 4, 40, "https://example.com/btw");
-        agent.pending_link_click = Some((10, 20, "https://example.com/btw".into()));
+        agent.pending_link_click = Some((
+            10,
+            20,
+            crate::render::osc8::LinkTarget::Url("https://example.com/btw".into()),
+        ));
         agent.left_mouse_down = true;
         let outcome = agent.handle_mouse(&mouse_up(10, 20));
         match outcome {
-            InputOutcome::Action(Action::OpenUrl(url)) => {
-                assert_eq!(url, "https://example.com/btw");
+            InputOutcome::Action(Action::OpenLink(target)) => {
+                assert_eq!(
+                    target,
+                    crate::render::osc8::LinkTarget::Url("https://example.com/btw".into())
+                );
             }
-            other => panic!("expected Action::OpenUrl for btw link, got {other:?}"),
+            other => panic!("expected Action::OpenLink for btw link, got {other:?}"),
         }
     }
     /// On mouse-fallback terminals, Down on a `/btw` link with the link
@@ -1292,11 +1689,12 @@ mod link_click_tests {
             let outcome = agent.handle_mouse(&down);
             assert!(matches!(outcome, InputOutcome::Changed));
             assert_eq!(
-                agent
-                    .pending_link_click
-                    .as_ref()
-                    .map(|(c, r, u)| (*c, *r, u.as_str())),
-                Some((10, 20, "https://example.com/btw"))
+                agent.pending_link_click.as_ref(),
+                Some(&(
+                    10,
+                    20,
+                    crate::render::osc8::LinkTarget::Url("https://example.com/btw".into())
+                ))
             );
         }
     }
@@ -1311,7 +1709,10 @@ mod link_click_tests {
                     screen_row: 20,
                     col_start: 4,
                     col_end: 40,
-                    url: Arc::from("https://example.com/btw"),
+                    target: crate::render::osc8::LinkTarget::Url(Arc::from(
+                        "https://example.com/btw",
+                    )),
+                    presentation: crate::render::osc8::LinkPresentation::Opaque,
                     id: Some(1),
                 });
                 o
@@ -1362,8 +1763,30 @@ mod link_click_tests {
                 screen_row: i as u16,
                 col_start: 0,
                 col_end: 10,
-                url: Arc::from(*url),
+                target: crate::render::osc8::LinkTarget::Url(Arc::from(*url)),
+                presentation: crate::render::osc8::LinkPresentation::Opaque,
                 id: Some(i as u32),
+            });
+        }
+        agent.visible_link_map.rebuild(1, &overlay, vec![]);
+    }
+    fn add_colliding_id_links(agent: &mut AgentView) {
+        let mut overlay = LinkOverlay::new();
+        for (i, url) in [
+            "https://first.com",
+            "https://second.com",
+            "https://third.com",
+        ]
+        .iter()
+        .enumerate()
+        {
+            overlay.push(OverlayLink {
+                screen_row: (i as u16) + 3,
+                col_start: 0,
+                col_end: 10,
+                target: crate::render::osc8::LinkTarget::Url(Arc::from(*url)),
+                presentation: crate::render::osc8::LinkPresentation::Opaque,
+                id: Some(0),
             });
         }
         agent.visible_link_map.rebuild(1, &overlay, vec![]);
@@ -1374,7 +1797,10 @@ mod link_click_tests {
         add_multiple_links(&mut agent);
         agent.cycle_highlighted_link(true);
         assert_eq!(agent.highlighted_link_idx, Some(0));
-        assert_eq!(agent.highlighted_link_url(), Some("https://a.com"));
+        assert_eq!(
+            agent.highlighted_link_url().as_deref(),
+            Some("https://a.com")
+        );
     }
     #[test]
     fn cycle_backward_from_none_selects_last() {
@@ -1382,7 +1808,10 @@ mod link_click_tests {
         add_multiple_links(&mut agent);
         agent.cycle_highlighted_link(false);
         assert_eq!(agent.highlighted_link_idx, Some(2));
-        assert_eq!(agent.highlighted_link_url(), Some("https://c.com"));
+        assert_eq!(
+            agent.highlighted_link_url().as_deref(),
+            Some("https://c.com")
+        );
     }
     #[test]
     fn cycle_forward_wraps_around() {
@@ -1408,6 +1837,76 @@ mod link_click_tests {
         assert_eq!(agent.highlighted_link_idx, None);
     }
     #[test]
+    fn colliding_ids_hover_paints_only_the_hit_link() {
+        let mut agent = make_agent();
+        setup_scrollback_area(&mut agent, Rect::new(0, 0, 80, 24));
+        add_colliding_id_links(&mut agent);
+        assert_eq!(agent.visible_link_map.len(), 3);
+        assert_eq!(
+            agent.visible_link_map.link_at(5, 4).map(|l| &l.target),
+            Some(&crate::render::osc8::LinkTarget::Url(Arc::from(
+                "https://second.com"
+            )))
+        );
+        agent.last_mouse_pos = (5, 4);
+        if !has_native_link_hover() {
+            assert!(agent.update_hovered_link(true));
+            assert_eq!(agent.hovered_link_idx, Some(1));
+        } else {
+            agent.hovered_link_idx = Some(1);
+        }
+        let style = Style::default().add_modifier(ratatui::style::Modifier::UNDERLINED);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 8));
+        agent.paint_link_highlights(&mut buf, style, 0..agent.visible_link_map.len());
+        assert!(
+            buf[(5, 4)]
+                .style()
+                .add_modifier
+                .contains(ratatui::style::Modifier::UNDERLINED)
+        );
+        assert!(
+            !buf[(5, 3)]
+                .style()
+                .add_modifier
+                .contains(ratatui::style::Modifier::UNDERLINED)
+        );
+        assert!(
+            !buf[(5, 5)]
+                .style()
+                .add_modifier
+                .contains(ratatui::style::Modifier::UNDERLINED)
+        );
+    }
+    #[test]
+    fn colliding_ids_modifier_click_opens_hit_url() {
+        if has_native_link_hover() {
+            return;
+        }
+        let mut agent = make_agent();
+        setup_scrollback_area(&mut agent, Rect::new(0, 0, 80, 24));
+        add_colliding_id_links(&mut agent);
+        #[cfg(not(target_os = "macos"))]
+        {
+            let mut down = mouse_down(5, 5);
+            down.modifiers = crossterm::event::KeyModifiers::CONTROL;
+            assert!(matches!(agent.handle_mouse(&down), InputOutcome::Changed));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert!(agent.try_arm_link_click(5, 5));
+            agent.left_mouse_down = true;
+        }
+        match agent.handle_mouse(&mouse_up(5, 5)) {
+            InputOutcome::Action(Action::OpenLink(target)) => {
+                assert_eq!(
+                    target,
+                    crate::render::osc8::LinkTarget::Url(Arc::from("https://third.com"))
+                );
+            }
+            other => panic!("expected Action::OpenLink(third), got {other:?}"),
+        }
+    }
+    #[test]
     fn enter_opens_highlighted_link() {
         let mut agent = make_agent();
         setup_scrollback_area(&mut agent, Rect::new(0, 0, 80, 24));
@@ -1417,10 +1916,13 @@ mod link_click_tests {
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         let outcome = agent.handle_scrollback_key(&enter, &registry);
         match outcome {
-            InputOutcome::Action(Action::OpenUrl(url)) => {
-                assert_eq!(url, "https://b.com");
+            InputOutcome::Action(Action::OpenLink(target)) => {
+                assert_eq!(
+                    target,
+                    crate::render::osc8::LinkTarget::Url("https://b.com".into())
+                );
             }
-            other => panic!("expected Action::OpenUrl, got {other:?}"),
+            other => panic!("expected Action::OpenLink, got {other:?}"),
         }
         assert_eq!(agent.highlighted_link_idx, None);
     }
@@ -1433,7 +1935,10 @@ mod link_click_tests {
         let registry = ActionRegistry::defaults();
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         let outcome = agent.handle_scrollback_key(&enter, &registry);
-        assert!(!matches!(outcome, InputOutcome::Action(Action::OpenUrl(_))));
+        assert!(!matches!(
+            outcome,
+            InputOutcome::Action(Action::OpenLink(_))
+        ));
     }
     /// Enter with a previous user prompt selected enters inline edit mode
     /// (edit-and-resubmit) instead of falling through to OpenBlockViewer.
@@ -1453,8 +1958,16 @@ mod link_click_tests {
         let registry = ActionRegistry::defaults();
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         let outcome = agent.handle_scrollback_key(&enter, &registry);
-        assert!(matches!(outcome, InputOutcome::Changed), "got {outcome:?}");
-        assert!(agent.inline_edit.is_some(), "Enter must start inline edit");
+        if crate::app::inline_edit::INLINE_EDIT_ENABLED {
+            assert!(matches!(outcome, InputOutcome::Changed), "got {outcome:?}");
+            assert!(agent.inline_edit.is_some(), "Enter must start inline edit");
+        } else {
+            assert!(agent.inline_edit.is_none(), "feature gated off: no edit");
+            assert!(
+                matches!(outcome, InputOutcome::Action(Action::OpenBlockViewer)),
+                "gated off: Enter must fall through to OpenBlockViewer, got {outcome:?}"
+            );
+        }
     }
     /// Bash prompts are not inline-editable: Enter falls through to the
     /// registry (OpenBlockViewer) exactly as before.
@@ -1475,8 +1988,10 @@ mod link_click_tests {
             "expected fall-through to OpenBlockViewer, got {outcome:?}"
         );
     }
-    /// Double-click on a user prompt enters inline edit mode (replacing the
-    /// old fold-toggle for editable prompts).
+    /// Double-click on a user prompt: enters inline edit when the feature is
+    /// enabled; while gated off it does NOT edit (falls through to the fold
+    /// arm), leaving the prompt free for text selection. Written for both flag
+    /// states so it stays valid when INLINE_EDIT_ENABLED is flipped back on.
     #[test]
     fn double_click_on_user_prompt_enters_inline_edit() {
         let mut agent = make_agent();
@@ -1492,10 +2007,17 @@ mod link_click_tests {
         let now = std::time::Instant::now();
         (agent.last_click, _) = agent.handle_scrollback_click(now, 0, false);
         let _ = agent.handle_scrollback_click(now + std::time::Duration::from_millis(10), 0, false);
-        assert!(
-            agent.inline_edit.is_some(),
-            "double-click must start inline edit"
-        );
+        if crate::app::inline_edit::INLINE_EDIT_ENABLED {
+            assert!(
+                agent.inline_edit.is_some(),
+                "double-click must start inline edit"
+            );
+        } else {
+            assert!(
+                agent.inline_edit.is_none(),
+                "feature gated off: double-click must not edit"
+            );
+        }
     }
     #[test]
     fn enter_on_subagent_group_header_falls_through_to_group_toggle() {
@@ -1603,7 +2125,7 @@ mod link_click_tests {
         let mut agent = make_agent();
         add_multiple_links(&mut agent);
         agent.highlighted_link_idx = Some(99);
-        assert_eq!(agent.highlighted_link_url(), None);
+        assert!(agent.highlighted_link_url().is_none());
     }
     fn make_search_agent() -> (AgentView, ActionRegistry) {
         use crate::scrollback::block::RenderBlock;
@@ -1743,14 +2265,14 @@ mod link_click_tests {
         let (mut agent, reg) = make_search_agent();
         agent
             .permission_queue
-            .push_back(super::paste_key_tests::make_followup_permission_state());
+            .push_back(super::test_fixtures::make_followup_permission_state());
         route_slash(&mut agent, &reg);
         assert!(agent.scrollback_search.is_none());
     }
     #[test]
     fn router_slash_blocked_while_plan_approval_pending() {
         let (mut agent, reg) = make_search_agent();
-        agent.plan_approval_view = Some(super::paste_key_tests::make_plan_approval_view_state());
+        agent.plan_approval_view = Some(super::test_fixtures::make_plan_approval_view_state());
         route_slash(&mut agent, &reg);
         assert!(agent.scrollback_search.is_none());
     }
@@ -1987,16 +2509,12 @@ mod link_click_tests {
             &mut scratch,
             None,
             false,
-            0,
-            &[],
-            &std::collections::BTreeSet::new(),
-            None,
+            crate::app::agent_view::BannerSlotParams::none(),
             &bundle,
             false,
+            false,
             &mut Vec::new(),
-            false,
-            false,
-            None,
+            crate::app::agent_view::AppRenderParams::default(),
         );
         buf
     }
@@ -2090,16 +2608,15 @@ mod link_click_tests {
             &mut scratch,
             None,
             false,
-            0,
-            &[],
-            &std::collections::BTreeSet::new(),
-            Some("ZZSESSIONTIPZZ never shown in agent view"),
+            crate::app::agent_view::BannerSlotParams {
+                tip: Some("ZZSESSIONTIPZZ never shown in agent view"),
+                ..crate::app::agent_view::BannerSlotParams::none()
+            },
             &bundle,
             false,
+            false,
             &mut Vec::new(),
-            false,
-            false,
-            None,
+            crate::app::agent_view::AppRenderParams::default(),
         );
         let tip_y = (0..tall.height)
             .find(|&y| buffer_row(&buf, tall.width, y).contains("Queued"))
@@ -2166,16 +2683,19 @@ mod link_click_tests {
             &mut scratch,
             None,
             false,
-            2,
-            &critical,
-            &std::collections::BTreeSet::new(),
-            Some(long_tip.as_str()),
+            crate::app::agent_view::BannerSlotParams {
+                height: 2,
+                announcements: &critical,
+                hidden_ids: &std::collections::BTreeSet::new(),
+                privacy_banner: false,
+                mouse_pos: None,
+                tip: Some(long_tip.as_str()),
+            },
             &bundle,
             false,
+            false,
             &mut Vec::new(),
-            false,
-            false,
-            None,
+            crate::app::agent_view::AppRenderParams::default(),
         );
         let frame: String = (0..tall.height)
             .map(|y| buffer_row(&buf, tall.width, y))

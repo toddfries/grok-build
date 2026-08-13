@@ -5,8 +5,8 @@ use super::common::*;
 /// 22. **Send-now delivery vs. explicit cancel.** (Historical name: the chord
 /// used to buffer a same-turn interjection that a cancel could discard.)
 /// The chord is now cancel-and-send: text + Ctrl+Enter mid-stream silently
-/// cancels the running turn and delivers the text as its OWN next turn (no
-/// interjection preamble on the wire). A later explicit Ctrl+C still renders
+/// cancels the running turn and delivers the text as its OWN next turn (with
+/// the interjection preamble). A later explicit Ctrl+C still renders
 /// its "Turn cancelled by user" marker — the consumed send-now expectation
 /// must never suppress a real user cancel.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -14,11 +14,16 @@ use super::common::*;
 async fn cancel_discards_buffered_interjection() {
     let content = ContentController::start().await.expect("start content");
     content.set_chunk_delay(Some(Duration::from_millis(150)));
-    content.set_turns([
-        slow_turn_text("CANCELTURN"),
+    let _cancelled_turn =
+        content.expect_agent_turn("turn cancelled by send-now", slow_turn_text("CANCELTURN"));
+    let _explicitly_cancelled_turn = content.expect_agent_turn(
+        "send-now turn cancelled explicitly",
         slow_turn_text("STEERTURN"),
-        "FRESHTURN after cancel.".to_owned(),
-    ]);
+    );
+    let _fresh_turn = content.expect_agent_turn(
+        "fresh turn after explicit cancel",
+        "FRESHTURN after cancel.",
+    );
 
     let binary = pager_binary().expect("resolve pager binary");
     let mut harness =
@@ -80,12 +85,12 @@ async fn cancel_discards_buffered_interjection() {
     );
     for s in &steers {
         assert!(
-            !s.contains(INTERJECTION_WIRE_PREFIX),
-            "send-now must not use the interjection preamble: {s}"
+            s.contains(INTERJECTION_WIRE_PREFIX),
+            "send-now must use the interjection preamble: {s}"
         );
         assert!(
             s.contains("<user_query>"),
-            "send-now must arrive as a standard user_query prompt: {s}"
+            "send-now must wrap the steered text in user_query: {s}"
         );
     }
 

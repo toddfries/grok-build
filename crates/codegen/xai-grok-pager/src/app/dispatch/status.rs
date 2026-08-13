@@ -1,6 +1,9 @@
 //! Session status, sharing, privacy, usage, and info dispatchers.
 
+use agent_client_protocol as acp;
+
 use super::ctx::get_active_agent;
+use super::queue::push_and_page_flip;
 use super::settings::ui::refresh_open_settings_modals;
 use crate::app::actions::Effect;
 use crate::app::agent::AgentId;
@@ -9,44 +12,112 @@ use crate::app::app_view::{ActiveView, AppView};
 use crate::notifications::{NotificationEvent, NotificationEventKind};
 use crate::scrollback::block::RenderBlock;
 
-/// Toggle YOLO mode (auto-approve all permissions).
-///
-/// When turning ON: auto-approve all currently queued permissions and
-/// restore the stashed prompt. Future incoming permissions will be
-/// auto-approved in `handle_permission_request`.
-///
-/// Share the current session via a public URL.
-///
-/// Produces Effect::ShareSession which spawns an async ACP ext request.
-/// On completion, TaskResult::ShareSessionComplete shows the URL in scrollback.
+/// Temporary kill switch: client share links are disabled.
 pub(super) fn dispatch_share_session(app: &mut AppView) -> Vec<Effect> {
-    if !app.sharing_enabled {
-        app.show_toast("Sharing is disabled");
-        return vec![];
+    app.show_toast("Session sharing is temporarily disabled");
+    vec![]
+}
+
+/// Monotonic generation for usage-modal fetches. Each open stamps the modal
+/// and its effects with a fresh value so a reply from a previous open (same
+/// session, modal closed and reopened) can't overwrite newer results. `0` is
+/// reserved for the minimal-mode paths, which never touch the modal.
+static USAGE_FETCH_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_usage_fetch_nonce() -> u64 {
+    USAGE_FETCH_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+/// The agent's open usage modal state, if any.
+pub(super) fn usage_modal_state_mut(
+    agent: &mut AgentView,
+) -> Option<&mut crate::views::usage_modal::UsageInfoModalState> {
+    match agent.active_modal.as_mut() {
+        Some(crate::views::modal::ActiveModal::UsageInfo { state }) => Some(state),
+        _ => None,
     }
+}
+
+/// Open (or re-tab) the usage/session-info modal and fire the fetch effects
+/// that populate it. Full-TUI only — minimal mode keeps scrollback blocks.
+pub(super) fn open_usage_info_modal(
+    app: &mut AppView,
+    tab: crate::views::usage_modal::UsageInfoTab,
+) -> Vec<Effect> {
+    use crate::views::modal::ActiveModal;
+    use crate::views::usage_modal::{UsageInfoContext, UsageInfoModalState};
+
     let ActiveView::Agent(id) = app.active_view else {
         return vec![];
     };
+    let usage_visible = app.usage_visible;
+    let redirect_url = app.usage_billing_redirect_url.clone();
+    let tier = app.subscription_tier.clone();
+    let show_resolved_model = app.show_resolved_model;
     let Some(agent) = app.agents.get_mut(&id) else {
         return vec![];
     };
-    let Some(session_id) = agent.session.session_id.clone() else {
-        // No active session — error should have been caught by slash command,
-        // but guard here just in case.
-        return vec![];
-    };
+    let session_id = agent.session.session_id.clone();
 
-    vec![Effect::ShareSession {
-        agent_id: id,
-        session_id,
-    }]
+    if let Some(state) = usage_modal_state_mut(agent) {
+        state.set_tab(tab);
+        return vec![];
+    }
+
+    let billing_reachable = usage_visible && !agent.chat_kind && redirect_url.is_none();
+    let nonce = next_usage_fetch_nonce();
+    let mut state = UsageInfoModalState::new(
+        tab,
+        UsageInfoContext {
+            session_id: session_id.as_ref().map(|s| s.0.to_string()),
+            usage_visible,
+            chat_kind: agent.chat_kind,
+            billing_redirect_url: redirect_url,
+            subscription_tier: tier,
+        },
+    );
+    state.fetch_nonce = nonce;
+
+    let mut effects = Vec::new();
+    if let Some(session_id) = session_id {
+        effects.push(Effect::ShowContextInfo {
+            agent_id: id,
+            session_id: session_id.clone(),
+            nonce,
+        });
+        effects.push(Effect::ShowSessionInfo {
+            agent_id: id,
+            session_id: session_id.clone(),
+            show_resolved_model,
+            nonce,
+        });
+        effects.push(Effect::FetchSessionUsage {
+            agent_id: id,
+            session_id,
+            nonce,
+        });
+    }
+    // Silent refresh of the cached billing mirrors the modal renders from.
+    if billing_reachable {
+        state.billing_loading = true;
+        effects.push(Effect::FetchBilling {
+            agent_id: id,
+            silent: true,
+            nonce,
+        });
+    }
+    agent.active_modal = Some(ActiveModal::UsageInfo {
+        state: Box::new(state),
+    });
+    effects
 }
 
-/// Show session info: fetch via x.ai/session/info and display in scrollback.
-///
-/// Produces Effect::ShowSessionInfo which spawns an async ACP ext request.
-/// On completion, TaskResult::SessionInfoComplete shows the formatted info.
+/// `/session-info` — open the usage modal on its "Session info" tab, or
+/// fetch-and-show in scrollback in minimal mode.
 pub(super) fn dispatch_show_session_info(app: &mut AppView) -> Vec<Effect> {
+    if !app.screen_mode.is_minimal() {
+        return open_usage_info_modal(app, crate::views::usage_modal::UsageInfoTab::SessionInfo);
+    }
     let ActiveView::Agent(id) = app.active_view else {
         return vec![];
     };
@@ -63,40 +134,8 @@ pub(super) fn dispatch_show_session_info(app: &mut AppView) -> Vec<Effect> {
         agent_id: id,
         session_id,
         show_resolved_model: app.show_resolved_model,
+        nonce: 0,
     }]
-}
-
-/// Show privacy and data retention status as a system message in scrollback.
-///
-/// Three-state display: Enterprise ZDR, coding data sharing opted out,
-/// or opted in. Labels align with `CODING_DATA_SHARING_CHOICES` in
-/// `settings/defs.rs` and the `coding_data_sharing_toast` format.
-pub(super) fn dispatch_show_privacy_info(app: &mut AppView) -> Vec<Effect> {
-    let mut lines = Vec::new();
-
-    if app.is_zdr {
-        // Enterprise ZDR -- the team has disabled retention entirely.
-        lines.push("  Zero Data Retention: enabled");
-        lines.push("  Your data is not retained or used for training (ZDR enabled).");
-    } else if app.coding_data_retention_opt_out {
-        // Coding data sharing opted out -- matches desktop's "Privacy mode" state.
-        lines.push("  Privacy: privacy mode");
-        lines.push("  Your code data will not be trained on or used to improve the product.");
-        lines.push("");
-        lines.push("  Use /privacy opt-in to share data and help improve the product.");
-    } else {
-        // Coding data sharing opted in -- matches desktop's "Share data" state.
-        lines.push("  Privacy: share data");
-        lines.push("  Usage and code data may be used by SpaceXAI to improve the product.");
-        lines.push("");
-        lines.push("  Use /privacy opt-out to enable privacy mode.");
-    }
-
-    lines.push("");
-    lines.push("  Learn more: https://x.ai/legal");
-    let text = lines.join("\n");
-    push_system_to_any_agent(app, &text);
-    vec![]
 }
 
 /// State-only mutation for `coding_data_sharing`. SHELL-owned.
@@ -104,9 +143,64 @@ pub(super) fn set_coding_data_sharing_inner(app: &mut AppView, opted_in: bool) {
     app.coding_data_retention_opt_out = !opted_in;
 }
 
+/// Agent the coding-data ACP write is attributed to. Privacy is app-level,
+/// so the id only routes the result back; `AgentId(0)` is the synthetic
+/// stand-in for the welcome screen, where the banner is reachable before a
+/// session exists.
+fn coding_data_sharing_agent_id(app: &AppView) -> AgentId {
+    match app.active_view {
+        ActiveView::Agent(id) => id,
+        _ => app.agents.keys().next().copied().unwrap_or(AgentId(0)),
+    }
+}
+
+/// Claim the next write generation. Every `SetCodingDataSharing` must take
+/// one so its reply can be matched against the newest write.
+fn next_coding_data_write_seq(app: &mut AppView) -> u64 {
+    app.coding_data_write_seq += 1;
+    app.coding_data_write_seq
+}
+
+/// Is this reply from the newest write? Writes to this endpoint run
+/// concurrently and can land out of order, so an older reply must not touch
+/// state: its `rollback_to_opted_in` predates the newer write, and applying
+/// it would silently undo whatever the user did since.
+fn is_current_coding_data_write(app: &AppView, seq: u64, agent_id: AgentId) -> bool {
+    if seq == app.coding_data_write_seq {
+        return true;
+    }
+    tracing::debug!(
+        target: "settings",
+        key = "coding_data_sharing",
+        ?agent_id,
+        seq,
+        current = app.coding_data_write_seq,
+        "dropping superseded coding-data reply",
+    );
+    false
+}
+
+fn log_coding_data_consent_selected(
+    source: xai_grok_telemetry::events::CodingDataConsentSource,
+    opted_in: bool,
+    previous_opted_in: bool,
+) {
+    use xai_grok_telemetry::events::{CodingDataConsentChoice, CodingDataConsentSelected};
+    xai_grok_telemetry::session_ctx::log_event(CodingDataConsentSelected {
+        source,
+        choice: CodingDataConsentChoice::from_opted_in(opted_in),
+        previous_choice: CodingDataConsentChoice::from_opted_in(previous_opted_in),
+        changed: opted_in != previous_opted_in,
+    });
+}
+
 /// Set coding-data-sharing preference. SHELL-owned, auth-metadata-backed
 /// (persists via ACP ext-request, NOT `~/.grok/config.toml`).
-pub(super) fn set_coding_data_sharing(app: &mut AppView, opted_in: bool) -> Vec<Effect> {
+pub(super) fn set_coding_data_sharing(
+    app: &mut AppView,
+    opted_in: bool,
+    source: xai_grok_telemetry::events::CodingDataConsentSource,
+) -> Vec<Effect> {
     // ── Guard 1: Enterprise ZDR ──────────────────────────────────────
     if app.is_zdr {
         app.show_toast("\u{2717} Cannot change: Zero Data Retention enabled");
@@ -123,36 +217,28 @@ pub(super) fn set_coding_data_sharing(app: &mut AppView, opted_in: bool) -> Vec<
             return vec![];
         }
     }
-    // ── Guard 3: an agent must exist to thread the ACP call through ──
-    let agent_id = match app.active_view {
-        crate::app::app_view::ActiveView::Agent(id) => id,
-        _ => match app.agents.keys().next().copied() {
-            Some(id) => id,
-            None => {
-                tracing::warn!(
-                    target: "settings",
-                    key = "coding_data_sharing",
-                    opted_in,
-                    "set_coding_data_sharing called with no agents — unreachable in \
-                     practice; returning empty (no toast: app.show_toast would no-op)",
-                );
-                return vec![];
-            }
-        },
-    };
-
+    let agent_id = coding_data_sharing_agent_id(app);
     let prev = !app.coding_data_retention_opt_out;
+    log_coding_data_consent_selected(source, opted_in, prev);
 
-    // ── Idempotent path: toast but skip the ACP round-trip. ──────────
+    // Opt-out always acks now. Unchanged opt-in acks only when idle:
+    // an inflight write still owns that ack.
+    let mut effects = Vec::new();
+    if !opted_in || (prev == opted_in && !app.privacy_banner_opt_in_inflight) {
+        effects.extend(ack_privacy_banner(app));
+    }
     if prev == opted_in {
-        app.show_toast(&coding_data_sharing_toast(opted_in));
-        return vec![];
+        return effects;
     }
 
-    // ── Optimistic mutation: state, then UI feedback, then effect. ───
+    if opted_in {
+        app.privacy_banner_opt_in_inflight = true;
+    }
+
+    // Optimistic mutation. Success is silent; only the refusals above and
+    // the failure handler toast.
     set_coding_data_sharing_inner(app, opted_in);
     refresh_open_settings_modals(app);
-    app.show_toast(&coding_data_sharing_toast(opted_in));
 
     tracing::info!(
         target: "settings",
@@ -161,34 +247,13 @@ pub(super) fn set_coding_data_sharing(app: &mut AppView, opted_in: bool) -> Vec<
         "setting changed",
     );
 
-    vec![Effect::SetCodingDataSharing {
+    effects.push(Effect::SetCodingDataSharing {
         agent_id,
         opted_in,
         rollback_to_opted_in: prev,
-    }]
-}
-
-/// Format the `Coding data sharing` toast. Asymmetric: opt-in
-/// (privacy-degrading) uses ⚠ + consequence text; opt-out (safe
-/// default) uses ✓. Uses display names from the registry catalog.
-pub(super) fn coding_data_sharing_toast(opted_in: bool) -> String {
-    let display = display_for_coding_data_sharing_canonical(opted_in);
-    if opted_in {
-        // Privacy-degrading: warn glyph + spelled-out consequence.
-        format!(
-            "\u{26A0} Coding data sharing: {display} \u{2014} code samples may be retained \
-             for training"
-        )
-    } else {
-        // Safe default — uniform ✓ glyph.
-        format!("\u{2713} Coding data sharing: {display}")
-    }
-}
-
-/// Display string for the canonical bool. Keep aligned with
-/// `CODING_DATA_SHARING_CHOICES` in `settings/defs.rs`.
-fn display_for_coding_data_sharing_canonical(opted_in: bool) -> &'static str {
-    if opted_in { "Opt in" } else { "Opt out" }
+        seq: next_coding_data_write_seq(app),
+    });
+    effects
 }
 
 /// Scrub an untrusted error string for toast display. Substitutes a
@@ -208,26 +273,12 @@ pub(super) fn scrub_error_for_toast(error: &str) -> String {
     }
 }
 
-/// Push a system message to the active agent's scrollback, or to any available
-/// agent if on the welcome screen.
-fn push_system_to_any_agent(app: &mut AppView, msg: &str) {
-    let block = crate::scrollback::block::RenderBlock::system(msg.to_string());
-    if let ActiveView::Agent(id) = app.active_view
-        && let Some(agent) = app.agents.get_mut(&id)
-    {
-        agent.scrollback.push_block(block);
-        return;
-    }
-    if let Some(agent) = app.agents.values_mut().next() {
-        agent.scrollback.push_block(block);
-    }
-}
-
-/// Show context info: fetch via x.ai/session/info and display rich breakdown.
-///
-/// Produces Effect::ShowContextInfo which spawns an async ACP ext request.
-/// On completion, TaskResult::ContextInfoComplete shows the formatted info.
+/// `/context` and the context-bar click — open the usage modal on its
+/// "Context usage" tab, or fetch-and-show in scrollback in minimal mode.
 pub(super) fn dispatch_show_context_info(app: &mut AppView) -> Vec<Effect> {
+    if !app.screen_mode.is_minimal() {
+        return open_usage_info_modal(app, crate::views::usage_modal::UsageInfoTab::ContextUsage);
+    }
     let ActiveView::Agent(id) = app.active_view else {
         return vec![];
     };
@@ -241,21 +292,96 @@ pub(super) fn dispatch_show_context_info(app: &mut AppView) -> Vec<Effect> {
     vec![Effect::ShowContextInfo {
         agent_id: id,
         session_id,
+        nonce: 0,
     }]
 }
 
-/// Show credit usage: fetch billing data and display inline.
-///
-/// When the remote settings `grok_build_usage_redirect_url` flag is set (delivered via
-/// RemoteSettings, targeted at personal-team users), skip the backend fetch and
-/// just point the user at that URL instead. This is a kill switch for the
-/// personal-team billing path while it is unreliable.
+/// `/usage` — open the usage modal on its "Usage limit" tab. Minimal mode
+/// keeps the scrollback flow: session token/cost, then consumer credits.
 pub(super) fn dispatch_show_usage(app: &mut AppView) -> Vec<Effect> {
+    if !app.screen_mode.is_minimal() {
+        return open_usage_info_modal(app, crate::views::usage_modal::UsageInfoTab::UsageLimit);
+    }
     let ActiveView::Agent(id) = app.active_view else {
         return vec![];
     };
+    let session_id = {
+        let Some(agent) = app.agents.get_mut(&id) else {
+            return vec![];
+        };
+        agent.session.session_id.clone()
+    };
+    match session_id {
+        Some(session_id) => vec![Effect::FetchSessionUsage {
+            agent_id: id,
+            session_id,
+            nonce: 0,
+        }],
+        None => {
+            if let Some(agent) = app.agents.get_mut(&id) {
+                push_and_page_flip(
+                    &mut agent.scrollback,
+                    RenderBlock::system(
+                        "Session usage is unavailable until the session starts.".to_string(),
+                    ),
+                );
+            }
+            append_consumer_billing_surface(app, id)
+        }
+    }
+}
+
+/// Route a session-usage result (success or failure text) into the open
+/// usage modal, or into scrollback in minimal mode. Stale results are dropped.
+pub(super) fn handle_session_usage_result(
+    app: &mut AppView,
+    agent_id: AgentId,
+    session_id: &acp::SessionId,
+    text: String,
+    nonce: u64,
+) -> Vec<Effect> {
+    if !app.screen_mode.is_minimal() {
+        if let Some(agent) = app.agents.get_mut(&agent_id) {
+            if agent.session.session_id.as_ref() != Some(session_id) {
+                return vec![];
+            }
+            if let Some(state) = usage_modal_state_mut(agent)
+                && state.fetch_nonce == nonce
+            {
+                state.session_usage_text = Some(text);
+            }
+        }
+        return vec![];
+    }
+    commit_session_usage_block(app, agent_id, session_id, text)
+}
+
+/// Commit a session-usage block if still on `session_id`, then consumer credits.
+pub(super) fn commit_session_usage_block(
+    app: &mut AppView,
+    agent_id: AgentId,
+    session_id: &acp::SessionId,
+    text: String,
+) -> Vec<Effect> {
+    let Some(agent) = app.agents.get_mut(&agent_id) else {
+        return vec![];
+    };
+    if agent.session.session_id.as_ref() != Some(session_id) {
+        return vec![];
+    }
+    push_and_page_flip(&mut agent.scrollback, RenderBlock::system(text));
+    append_consumer_billing_surface(app, agent_id)
+}
+
+/// Consumer credit follow-up for `/usage` (redirect or non-silent billing fetch).
+pub(super) fn append_consumer_billing_surface(app: &mut AppView, agent_id: AgentId) -> Vec<Effect> {
+    if !app.usage_visible {
+        return vec![];
+    }
+    // Remote-settings kill switch (`grok_build_usage_redirect_url`): link out
+    // instead of fetching billing from the backend.
     if let Some(url) = app.usage_billing_redirect_url.clone() {
-        if let Some(agent) = app.agents.get_mut(&id) {
+        if let Some(agent) = app.agents.get_mut(&agent_id) {
             agent.scrollback.push_block(RenderBlock::System(
                 crate::scrollback::blocks::SystemMessageBlock::new(format!(
                     "Please check your usage on {url}"
@@ -264,12 +390,27 @@ pub(super) fn dispatch_show_usage(app: &mut AppView) -> Vec<Effect> {
         }
         return vec![];
     }
-    // Non-silent fetch: the effect also pulls the auto top-up rule so the
-    // summary can render usage, prepaid credits, and auto top-up together.
+    if !app.agents.contains_key(&agent_id) {
+        return vec![];
+    }
+    // Non-silent: the effect also pulls the auto top-up rule so the summary
+    // renders usage, prepaid credits, and auto top-up together.
     vec![Effect::FetchBilling {
-        agent_id: id,
+        agent_id,
         silent: false,
+        nonce: 0,
     }]
+}
+
+/// `/usage manage` — open consumer billing. No-op when the surface is hidden.
+pub(super) fn dispatch_manage_billing(app: &mut AppView) -> Vec<Effect> {
+    if !app.usage_visible {
+        return vec![];
+    }
+    super::router::dispatch(
+        crate::app::actions::Action::OpenUrl("https://grok.com/?_s=usage".to_string()),
+        app,
+    )
 }
 
 /// Commit a one-line "update available" notice into the active agent's
@@ -370,17 +511,16 @@ pub(super) fn handle_coding_data_sharing_updated(
     app: &mut AppView,
     agent_id: AgentId,
     opted_in: bool,
+    seq: u64,
 ) -> Vec<Effect> {
-    // Re-anchor mirror to server-confirmed value (defense-in-
-    // depth against server reshaping the boolean). `agent_id`
-    // discarded — privacy is app-level, not per-agent.
+    if !is_current_coding_data_write(app, seq, agent_id) {
+        return vec![];
+    }
+    // Re-anchor mirror to server-confirmed value (defense-in-depth against
+    // server reshaping the boolean). `agent_id` discarded — privacy is
+    // app-level, not per-agent.
     set_coding_data_sharing_inner(app, opted_in);
     refresh_open_settings_modals(app);
-    // Re-toast on confirmation. Without this, a slow ACP
-    // round-trip would leave the user with only the
-    // optimistic toast (already faded) and no
-    // server-confirmed feedback.
-    app.show_toast(&coding_data_sharing_toast(opted_in));
     tracing::info!(
         target: "settings",
         key = "coding_data_sharing",
@@ -388,7 +528,15 @@ pub(super) fn handle_coding_data_sharing_updated(
         opted_in,
         "ACP update confirmed; mirror re-anchored",
     );
-    vec![]
+    let mut effects = vec![];
+    // Defer opt-in ack until this write lands; a failed write must not dismiss.
+    if app.privacy_banner_opt_in_inflight {
+        app.privacy_banner_opt_in_inflight = false;
+        if opted_in {
+            effects.extend(ack_privacy_banner(app));
+        }
+    }
+    effects
 }
 
 pub(super) fn handle_coding_data_sharing_failed(
@@ -396,10 +544,17 @@ pub(super) fn handle_coding_data_sharing_failed(
     agent_id: AgentId,
     error: String,
     rollback_to_opted_in: bool,
+    seq: u64,
 ) -> Vec<Effect> {
-    // Revert optimistic mutation: inner → refresh → toast.
-    //
-    // `agent_id` discarded — privacy is global.
+    // A superseded failure must not revert: `rollback_to_opted_in` predates
+    // the newer write, so applying it would undo a change the user made
+    // after this one was sent. It must not toast either — nothing the user
+    // is looking at failed.
+    if !is_current_coding_data_write(app, seq, agent_id) {
+        return vec![];
+    }
+    // Revert optimistic mutation: inner → refresh → toast. `agent_id`
+    // discarded — privacy is global.
     set_coding_data_sharing_inner(app, rollback_to_opted_in);
     refresh_open_settings_modals(app);
     // Scrub long/unsafe error strings before toasting.
@@ -415,29 +570,83 @@ pub(super) fn handle_coding_data_sharing_failed(
         %error,
         "ACP update failed; reverted optimistic mutation",
     );
+    // Opt-in failure: no ack; clear inflight so the banner stays.
+    app.privacy_banner_opt_in_inflight = false;
     vec![]
+}
+
+/// Stamp `[privacy].privacy_banner_acked` (in-memory + disk).
+/// No-op when the notice is not rolled out: a Settings pick must not
+/// hide a notice the user has not been shown.
+pub(in crate::app::dispatch) fn ack_privacy_banner(app: &mut AppView) -> Vec<Effect> {
+    if !app.privacy_notice_rollout {
+        return vec![];
+    }
+    let acked_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    app.privacy_banner_acked = Some(acked_at.clone());
+    vec![Effect::PersistPrivacyBannerAcked { acked_at }]
+}
+
+/// `[Opt in]`: opt in via the settings path; ack only after ACP success, so
+/// a failed round trip leaves the banner up instead of recording a change
+/// that did not happen.
+pub(in crate::app::dispatch) fn dispatch_privacy_banner_opt_in(app: &mut AppView) -> Vec<Effect> {
+    if app.privacy_banner_opt_in_inflight || !app.privacy_banner_should_show() {
+        return vec![];
+    }
+    set_coding_data_sharing(
+        app,
+        true,
+        xai_grok_telemetry::events::CodingDataConsentSource::PrivacyBanner,
+    )
+}
+
+/// `[Opt out]`: ack now — waiting on ACP would re-ask a decline.
+pub(in crate::app::dispatch) fn dispatch_privacy_banner_opt_out(app: &mut AppView) -> Vec<Effect> {
+    if app.privacy_banner_opt_in_inflight || !app.privacy_banner_should_show() {
+        return vec![];
+    }
+    set_coding_data_sharing(
+        app,
+        false,
+        xai_grok_telemetry::events::CodingDataConsentSource::PrivacyBanner,
+    )
 }
 
 pub(super) fn handle_context_info_complete(
     app: &mut AppView,
     agent_id: AgentId,
+    session_id: &acp::SessionId,
     info: Box<xai_grok_shell::session::SessionInfoResponse>,
+    nonce: u64,
 ) -> Vec<Effect> {
+    let minimal = app.screen_mode.is_minimal();
     if let Some(agent) = app.agents.get_mut(&agent_id) {
+        if agent.session.session_id.as_ref() != Some(session_id) {
+            return vec![];
+        }
+        // A reply from a previous modal open must not touch anything — not
+        // even the agent's context mirrors, which a fresher reply already set.
+        if let Some(state) = usage_modal_state_mut(agent)
+            && state.fetch_nonce != nonce
+        {
+            return vec![];
+        }
         let model = info.data.model.as_deref().unwrap_or("unknown").to_string();
-        // Take ownership of the snapshot once, hand a clone to the
-        // agent's running counters, then move the original into the
-        // scrollback block (which keeps it for theme-reactive
-        // re-rendering). This still costs one clone but reads as
-        // "the agent needs a copy" rather than "the block needs a
-        // copy", which matches the lifetime story.
         let snapshot = info.data.context;
         agent.apply_full_context_info(snapshot.clone());
-        agent
-            .scrollback
-            .push_block(crate::scrollback::block::RenderBlock::context_info(
+        if let Some(state) = usage_modal_state_mut(agent) {
+            state.context = Some(crate::scrollback::blocks::ContextInfoBlock::new(
                 snapshot, model,
             ));
+            state.context_error = None;
+        } else if minimal {
+            push_and_page_flip(
+                &mut agent.scrollback,
+                crate::scrollback::block::RenderBlock::context_info(snapshot, model),
+            );
+        }
+        // Full mode with the modal closed: result arrived after dismissal — drop.
     }
     vec![]
 }
@@ -466,9 +675,26 @@ pub(super) fn dispatch_copy_session_id(app: &mut AppView, index: usize) -> Vec<E
                 .map(|e| e.id.clone())
         });
     if let Some(id) = id {
-        let r = crate::clipboard::copy_text(&id);
-        app.show_toast(r.message);
+        let delivery = crate::clipboard::copy_text_or_file(&id);
+        app.show_toast(delivery.toast_message().as_ref());
     }
+    vec![]
+}
+
+/// Open the onboarding tutorial overlay (top-level modal — works over both
+/// the welcome screen and an agent session). Toggles: dispatching while
+/// open closes instead of stacking.
+pub(super) fn dispatch_open_tutorial(app: &mut AppView) -> Vec<Effect> {
+    // Minimal mode has no modal host: the overlay would render nothing
+    // while the app-level intercept swallowed all input.
+    if app.screen_mode.is_minimal() {
+        return vec![];
+    }
+    if app.tutorial.is_some() {
+        app.tutorial = None;
+        return vec![];
+    }
+    app.tutorial = Some(crate::views::tutorial::TutorialState::new());
     vec![]
 }
 

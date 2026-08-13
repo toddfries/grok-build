@@ -37,13 +37,6 @@ impl ParsedPrompt {
             self.is_cursor,
         )
     }
-    /// Assemble context and query into the final message string.
-    ///
-    /// Legacy entry point — delegates to [`assemble_parts_with_skills`] with
-    /// no skill information.
-    pub fn assemble_parts(context: &str, query: &str, is_cursor: bool) -> String {
-        Self::assemble_parts_with_skills(context, query, "", is_cursor)
-    }
     /// Assemble context, query, and skill information into the final message string.
     ///
     /// Layout:
@@ -101,7 +94,7 @@ pub async fn parse_prompt(
 ///
 /// This is the full-featured entry point. `parse_prompt` delegates here with
 /// an empty `skill_information` string for backward compatibility.
-pub async fn parse_prompt_with_skills(
+pub(crate) async fn parse_prompt_with_skills(
     prompt: &[acp::ContentBlock],
     working_directory: PathBuf,
     _session_info: &crate::session::info::Info,
@@ -427,10 +420,11 @@ mod tests {
     }
     #[test]
     fn test_parse_editor_meta_focused_with_cursor() {
-        let link = make_link(Some(serde_json::json!(
-            { "source" : "editor", "fileState" : "focused", "cursor" : { "line" :
-            10, "column" : 3 } }
-        )));
+        let link = make_link(Some(serde_json::json!({
+            "source": "editor",
+            "fileState": "focused",
+            "cursor": { "line": 10, "column": 3 }
+        })));
         let meta = parse_editor_meta(&link).expect("should parse");
         assert!(matches!(
             meta.file_state,
@@ -444,24 +438,27 @@ mod tests {
     }
     #[test]
     fn test_parse_editor_meta_focused_without_cursor_fails() {
-        let link = make_link(Some(
-            serde_json::json!({ "source" : "editor", "fileState" : "focused" }),
-        ));
+        let link = make_link(Some(serde_json::json!({
+            "source": "editor",
+            "fileState": "focused"
+        })));
         assert!(parse_editor_meta(&link).is_none());
     }
     #[test]
     fn test_parse_editor_meta_open() {
-        let link = make_link(Some(
-            serde_json::json!({ "source" : "editor", "fileState" : "open" }),
-        ));
+        let link = make_link(Some(serde_json::json!({
+            "source": "editor",
+            "fileState": "open"
+        })));
         let meta = parse_editor_meta(&link).expect("should parse");
         assert!(matches!(meta.file_state, FileState::Open));
     }
     #[test]
     fn test_parse_editor_meta_non_editor_source_returns_none() {
-        let link = make_link(Some(serde_json::json!(
-            { "source" : "something_else", "fileState" : "focused" }
-        )));
+        let link = make_link(Some(serde_json::json!({
+            "source": "something_else",
+            "fileState": "focused"
+        })));
         assert!(parse_editor_meta(&link).is_none());
     }
     #[test]
@@ -471,9 +468,10 @@ mod tests {
     }
     #[test]
     fn test_parse_editor_meta_unknown_file_state_returns_none() {
-        let link = make_link(Some(
-            serde_json::json!({ "source" : "editor", "fileState" : "minimized" }),
-        ));
+        let link = make_link(Some(serde_json::json!({
+            "source": "editor",
+            "fileState": "minimized"
+        })));
         assert!(parse_editor_meta(&link).is_none());
     }
     #[test]

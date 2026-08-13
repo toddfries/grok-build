@@ -5,18 +5,17 @@ use super::common::*;
 /// Mid-turn: queue a follow-up with Enter, then bare Enter on the empty
 /// composer sends that top row now — cancel-and-send: the running turn is
 /// cancelled silently and the row runs as its own next turn, arriving on the
-/// wire as a standard `<user_query>` prompt with no interjection preamble.
+/// wire as a standard `<user_query>` prompt with the interjection preamble.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn empty_enter_force_sends_top_queued() {
     let content = ContentController::start().await.expect("start content");
-    // Gate turn 1's terminal event so the queue + empty-Enter provably land
-    // mid-turn regardless of suite load.
-    content.hold_agent_completions();
-    content.set_turns([
-        slow_turn_text("TURNONE"),
-        "TURNTWO reply to the promoted follow-up.".to_owned(),
-    ]);
+    let mut turn_one = content
+        .expect_agent_turn_blocked("running turn before send-now", slow_turn_text("TURNONE"));
+    let mut turn_two = content.expect_agent_turn(
+        "promoted queued follow-up",
+        "TURNTWO reply to the promoted follow-up.",
+    );
 
     let binary = pager_binary().expect("resolve pager binary");
     let mut harness =
@@ -32,6 +31,9 @@ async fn empty_enter_force_sends_top_queued() {
     harness
         .wait_for_text("TURNONE", Duration::from_secs(30))
         .expect("turn 1 streaming");
+    tokio::time::timeout(Duration::from_secs(10), turn_one.wait_blocked())
+        .await
+        .expect("turn 1 reached the completion barrier");
 
     harness
         .inject_keys(b"please also check the logs\r")
@@ -44,7 +46,7 @@ async fn empty_enter_force_sends_top_queued() {
     // shell cancels turn 1 (the abort beats the held completion) and promotes
     // the row to run as turn 2.
     harness.inject_keys(b"\r").expect("empty Enter send-now");
-    content.release_agent_completions();
+    turn_one.release();
     // The promoted row renders as a standard "❯ " prompt block via the
     // turn-start adoption (the arrow prefix distinguishes the committed block
     // from the prefix-less queue row).
@@ -58,6 +60,9 @@ async fn empty_enter_force_sends_top_queued() {
     harness
         .wait_for_text("TURNTWO", Duration::from_secs(40))
         .expect("promoted turn reply");
+    tokio::time::timeout(Duration::from_secs(10), turn_two.wait_satisfied())
+        .await
+        .expect("promoted turn expectation satisfied");
 
     // The send-now cancel is silent: no cancelled marker between the partial
     // turn-1 output and the promoted prompt.
@@ -73,12 +78,16 @@ async fn empty_enter_force_sends_top_queued() {
         .find(|u| u.contains("please also check the logs"))
         .unwrap_or_else(|| panic!("queued follow-up never reached the wire: {users:#?}"));
     assert!(
-        !promoted.contains(INTERJECTION_WIRE_PREFIX),
-        "send-now must not use the interjection preamble: {promoted}"
+        promoted.contains(INTERJECTION_WIRE_PREFIX),
+        "send-now must use the interjection preamble: {promoted}"
     );
     assert!(
         promoted.contains("<user_query>"),
-        "send-now must arrive as a standard user_query prompt: {promoted}"
+        "send-now must wrap the steered text in user_query: {promoted}"
+    );
+    assert!(
+        promoted.contains("Make sure to complete any unfinished tasks from previous turns."),
+        "send-now must keep the unfinished-task trailer: {promoted}"
     );
 
     assert!(

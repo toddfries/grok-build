@@ -11,38 +11,30 @@ pub(super) fn handle_models_update(notif: &acp::ExtNotification, app: &mut AppVi
             "models updated via x.ai/models/update"
         );
 
-        let shell_fallback_current = new_models.current.clone();
-
-        // Override app-level default with the active agent's model.
-        let mut app_models = new_models.clone();
-        if let ActiveView::Agent(id) = app.active_view
-            && let Some(agent) = app.agents.get(&id)
-            && let Some(ref agent_model) = agent.session.models.current
-            && app_models.available.contains_key(agent_model)
-        {
-            app_models.current = Some(agent_model.clone());
+        app.models.update_catalog(new_models.available.clone());
+        let stale = app
+            .models
+            .current
+            .as_ref()
+            .is_none_or(|id| !app.models.available.contains_key(id));
+        if stale && let Some(id) = new_models.current {
+            app.models.set_current(id, None);
         }
 
-        app.models = app_models;
-
         for agent in app.agents.values_mut() {
-            // Log when an update drops the agent's active model — this is the
-            // moment the status bar visibly "switches model mid-conversation"
-            // (the agent falls back to the shell's current model below).
             if let Some(ref current) = agent.session.models.current
                 && !new_models.available.contains_key(current)
             {
-                tracing::warn!(
+                tracing::debug!(
                     current_model = %current.0,
-                    fallback = ?shell_fallback_current.as_ref().map(|m| m.0.as_ref()),
                     available_count = new_models.available.len(),
-                    "models update removed this agent's current model; falling back"
+                    "models update dropped this session's model from the catalog; keeping it displayed"
                 );
             }
             agent
                 .session
                 .models
-                .update_catalog(new_models.available.clone(), shell_fallback_current.clone());
+                .update_catalog(new_models.available.clone());
         }
         true
     } else {
@@ -57,6 +49,20 @@ pub(super) fn handle_settings_update(notif: &acp::ExtNotification, app: &mut App
         tracing::warn!("Failed to parse x.ai/settings/update");
         return false;
     };
+
+    // Reseed this process's remote-campaign cache. In leader mode no in-process
+    // agent seeds the TUI process, and the bounded startup prefetch can miss —
+    // without this reseed a remote campaign stays invisible to
+    // `resolve_dismissable_campaigns`, so a `/model` pick never records its
+    // dismissal and the leader re-nudges every new session. Idempotent in
+    // embedded mode, where the in-process agent seeds the same cache.
+    if let Some(campaigns) = update.campaigns.clone() {
+        let rs = xai_grok_shell::util::config::RemoteSettings {
+            campaigns,
+            ..Default::default()
+        };
+        xai_grok_shell::util::config::set_remote_campaigns_from_settings(Some(&rs));
+    }
 
     if let Some(v) = update.auto_permission_mode_enabled {
         // Keep the pager's auto-permission-mode gate live with the remote settings
@@ -107,22 +113,40 @@ pub(super) fn handle_settings_update(notif: &acp::ExtNotification, app: &mut App
     if let Some(v) = update.show_resolved_model {
         app.show_resolved_model = v;
     }
-    if let Some(v) = update.sharing_enabled {
-        app.sharing_enabled = v;
-        // Propagate to existing agents so slash-command registries stay
-        // in sync (same fan-out pattern used when creating new agents).
+    // Temporary client kill switch: ignore remote `sharing_enabled` until
+    // session share links are restored. Presence is still observed so a
+    // later re-enable can go back to `app.sharing_enabled = v`.
+    if update.sharing_enabled.is_some() {
+        app.sharing_enabled = false;
         for agent in app.agents.values_mut() {
-            agent.set_sharing_enabled(v);
+            agent.set_sharing_enabled(false);
         }
+    }
+    // Env overrides win over live updates too, mirroring the startup
+    // resolution in event_loop — otherwise the proxy's explicit `false`
+    // (sent for kill-switch semantics) clobbers a local test override
+    // moments after launch.
+    if let Some(v) = update.privacy_notice_rollout {
+        app.privacy_notice_rollout =
+            xai_grok_config::env_bool("GROK_PRIVACY_NOTICE_ROLLOUT").unwrap_or(v);
+    }
+    if let Some(v) = update.privacy_banner_reshow_days {
+        app.privacy_banner_reshow_days = Some(
+            std::env::var("GROK_PRIVACY_BANNER_RESHOW_DAYS")
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(v),
+        );
     }
     // Tier before voice: same payload may set "API Key" and voice_mode_enabled=false.
     // Always recompute is_api_key_auth from the tier so a later Free/SuperGrok
-    // stamp does not leave API-key bypass / hidden `/usage` stuck.
+    // stamp does not leave API-key bypass / a hidden billing surface stuck.
     if let Some(v) = update.subscription_tier_display {
         let was_api_key = app.is_api_key_auth;
         let is_key = super::super::app_view::is_api_key_label(&v);
         app.is_api_key_auth = is_key;
-        app.usage_visible = !is_key && app.team_name.is_none();
+        app.usage_visible = !is_key && app.team_name.is_none() && !app.has_external_auth_provider;
+        app.sync_billing_surface_to_agents();
         app.subscription_tier = Some(v);
         app.apply_tier_restrictions();
         // Leaving API Key → free/X Basic without a voice field: drop force-on.
@@ -141,20 +165,11 @@ pub(super) fn handle_settings_update(notif: &acp::ExtNotification, app: &mut App
         }
     }
     if let Some(remote_v) = update.voice_mode_enabled {
-        // Same resolution as startup: env > remote > default on. API-key sessions
-        // keep voice on (billable STT) even when remote is a kill switch.
-        let v = crate::app::resolve_voice_mode_enabled(
-            xai_grok_config::env_bool("GROK_VOICE_MODE"),
-            Some(remote_v),
-        ) || app.is_api_key_auth;
-        // Kill-switch: tear down capture so a remote false doesn't leave the mic armed
-        // (skipped for API keys via the OR above).
+        let v = crate::app::resolve_voice_mode_live(Some(remote_v), app.is_api_key_auth);
         if !v {
             app.voice_reset();
             app.voice_ui_active = false;
         }
-        // Sync the flag into the execution gate + every slash surface so
-        // `/voice` shows/hides in lockstep with the gate.
         app.apply_voice_mode_enabled(v);
     } else {
         app.ensure_voice_for_api_key();
@@ -282,6 +297,13 @@ pub(super) fn handle_settings_update(notif: &acp::ExtNotification, app: &mut App
         }
     }
 
+    // `scheduler_background_loops` is deliberately absent from this handler,
+    // unlike the flags above. A live session's scheduled fires keep the mode
+    // the shell pinned when the session's actor spawned, so applying a pushed
+    // flip here would make `/loop` promise a runtime those fires never get.
+    // The per-session value arrives on the `session/new` / `session/load`
+    // response instead (`AgentView::scheduler_background_loops`).
+
     // Re-resolve tips from config layers + the updated remote tips.
     if let Some(remote_tips) = update.tips {
         use xai_grok_shell::util::config::resolve_tips;
@@ -298,6 +320,19 @@ pub(super) fn handle_settings_update(notif: &acp::ExtNotification, app: &mut App
         } else {
             app.tip = None;
         }
+    }
+
+    // Re-resolve dropdown tags only when the update carries the field. Some(None) =
+    // remote cleared (drop remote layer); Some(Some(map)) = set; outer None = field
+    // absent (older shell) → keep the tags resolved at startup. Env + local
+    // [slash_command_tags] always apply via resolve_slash_command_tags.
+    if let Some(remote_tags) = update.slash_command_tags.as_ref() {
+        use xai_grok_shell::util::config::resolve_slash_command_tags;
+        let effective_config = xai_grok_shell::config::load_effective_config().ok();
+        let empty_toml = toml::Value::Table(Default::default());
+        let tags_config = effective_config.as_ref().unwrap_or(&empty_toml);
+        *app.command_tags.borrow_mut() =
+            resolve_slash_command_tags(tags_config, remote_tags.as_ref());
     }
 
     tracing::info!("settings updated via x.ai/settings/update");
@@ -483,15 +518,30 @@ pub(super) struct PagerSettingsUpdate {
     #[serde(default)]
     sharing_enabled: Option<bool>,
     #[serde(default)]
+    privacy_notice_rollout: Option<bool>,
+    #[serde(default)]
+    privacy_banner_reshow_days: Option<u64>,
+    #[serde(default)]
     voice_mode_enabled: Option<bool>,
     #[serde(default)]
     session_picker_grouped: Option<bool>,
     #[serde(default)]
     tips: Option<Vec<String>>,
+    /// Free-form per-command slash-dropdown tags (canonical name → tag).
+    /// Presence-aware and tolerant: omit = no update (older shell), `null` =
+    /// remote cleared, map = set, malformed = warn + treat as absent so a
+    /// bad value never fails the whole `PagerSettingsUpdate` parse.
+    #[serde(default, deserialize_with = "deserialize_settings_update_tags")]
+    slash_command_tags: Option<Option<std::collections::BTreeMap<String, String>>>,
     // `announcements` is deliberately NOT consumed here: every shell writer of
     // remote_settings also emits gen-ordered `x.ai/announcements/update`
     // (emit_announcements_if_changed), and a gen-less apply on this path could
     // clobber a newer push. Single ingest path: handle_announcements_update.
+    /// Remote campaigns snapshot. `Some` whenever the shell has settings
+    /// (empty = campaigns withdrawn); `None`/omitted (settings-less push,
+    /// older shell) must leave this process's campaign cache untouched.
+    #[serde(default)]
+    campaigns: Option<Vec<xai_grok_shell::util::config::CampaignOverride>>,
     #[serde(default)]
     gate_message: Option<String>,
     #[serde(default)]
@@ -530,6 +580,33 @@ where
     Ok(Some(Option::<String>::deserialize(deserializer)?))
 }
 
+/// Presence-aware + tolerant tags map for live settings updates.
+/// Only invoked when the field is present (`#[serde(default)]` covers omit).
+/// - JSON null → `Some(None)` (explicit remote clear)
+/// - valid object → `Some(Some(map))`
+/// - malformed → warn + `Ok(None)` (leave tags alone; do not fail the struct)
+fn deserialize_settings_update_tags<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<std::collections::BTreeMap<String, String>>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::Null => Ok(Some(None)),
+        v => match serde_json::from_value::<std::collections::BTreeMap<String, String>>(v) {
+            Ok(m) => Ok(Some(Some(m))),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "malformed slash_command_tags in settings update; leaving tags unchanged"
+                );
+                Ok(None)
+            }
+        },
+    }
+}
+
 #[cfg(test)]
 mod presence_aware_dto_tests {
     use super::*;
@@ -566,6 +643,63 @@ mod presence_aware_dto_tests {
             some_v.permission_mode,
             Some(Some("always-approve".into())),
             "string must be Some(Some(_))"
+        );
+    }
+
+    #[test]
+    fn slash_command_tags_dto_absent_null_map_and_malformed() {
+        // 1. field absent → outer None (leave tags alone)
+        let absent: PagerSettingsUpdate = serde_json::from_value(serde_json::json!({
+            "tips": ["hello"],
+        }))
+        .expect("absent slash_command_tags must not fail parse");
+        assert_eq!(absent.slash_command_tags, None, "omit must be None");
+        assert_eq!(absent.tips.as_deref(), Some(&["hello".to_string()][..]));
+
+        // 2. explicit null → Some(None) (remote cleared)
+        let null_v: PagerSettingsUpdate = serde_json::from_value(serde_json::json!({
+            "slash_command_tags": null,
+        }))
+        .expect("null slash_command_tags must parse");
+        assert_eq!(
+            null_v.slash_command_tags,
+            Some(None),
+            "explicit null must be Some(None)"
+        );
+
+        // 3. valid map → Some(Some(map))
+        let map_v: PagerSettingsUpdate = serde_json::from_value(serde_json::json!({
+            "slash_command_tags": {"workflows": "new"},
+        }))
+        .expect("valid slash_command_tags map must parse");
+        let tags = map_v
+            .slash_command_tags
+            .as_ref()
+            .and_then(|inner| inner.as_ref())
+            .expect("expected Some(Some(map))");
+        assert_eq!(tags.get("workflows").map(String::as_str), Some("new"));
+        assert_eq!(tags.len(), 1);
+
+        // 4. malformed must NOT fail the whole struct; sibling fields still apply
+        let bad: PagerSettingsUpdate = serde_json::from_value(serde_json::json!({
+            "slash_command_tags": ["oops"],
+            "tips": ["still-applied"],
+            "permission_mode": "always-approve",
+        }))
+        .expect("malformed slash_command_tags must not fail PagerSettingsUpdate parse");
+        assert_eq!(
+            bad.slash_command_tags, None,
+            "malformed tags treated as absent"
+        );
+        assert_eq!(
+            bad.tips.as_deref(),
+            Some(&["still-applied".to_string()][..]),
+            "sibling tips must still parse"
+        );
+        assert_eq!(
+            bad.permission_mode,
+            Some(Some("always-approve".into())),
+            "sibling permission_mode must still parse"
         );
     }
 }

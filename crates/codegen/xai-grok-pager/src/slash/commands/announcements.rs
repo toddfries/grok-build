@@ -78,6 +78,8 @@ mod tests {
             session_id: None,
             bundle_state: &bundle,
             screen_mode: crate::app::ScreenMode::Inline,
+            billing_surface_visible: true,
+            usage_command_visible: true,
             pager_state: crate::settings::PagerLocalSnapshot::default(),
         };
         AnnouncementsCommand.run(&mut ctx, args)
@@ -120,7 +122,11 @@ mod tests {
             models: &models,
             cwd: std::path::Path::new("."),
             has_session_announcements: true,
+            billing_surface_visible: true,
+            usage_command_visible: true,
+            workflows_available: true,
             screen_mode: crate::app::ScreenMode::Fullscreen,
+            current_title: None,
         };
         let items = AnnouncementsCommand
             .suggest_args(&ctx, "")
@@ -139,13 +145,21 @@ mod tests {
             models: &models,
             cwd: std::path::Path::new("."),
             has_session_announcements: false,
+            billing_surface_visible: true,
+            usage_command_visible: true,
+            workflows_available: true,
             screen_mode: crate::app::ScreenMode::Fullscreen,
+            current_title: None,
         }));
         assert!(cmd.visible(&AppCtx {
             models: &models,
             cwd: std::path::Path::new("."),
             has_session_announcements: true,
+            billing_surface_visible: true,
+            usage_command_visible: true,
+            workflows_available: true,
             screen_mode: crate::app::ScreenMode::Fullscreen,
+            current_title: None,
         }));
     }
 

@@ -20,69 +20,77 @@ use crate::types::TaskSnapshot;
 use crate::types::output::ToolOutput;
 use crate::types::resources::{SharedResources, State, Terminal};
 use crate::types::tool::{Reminder, ToolKind};
-use crate::util::truncate::{PREVIEW_SIZE, truncate_with_preview};
-use std::collections::HashSet;
+use crate::util::truncate::{PREVIEW_SIZE, PartialOutput, truncate_with_preview};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use xai_tool_types::KillTaskOutput;
 use xai_tool_types::SubagentCompletedOutput;
 use xai_tool_types::TaskOutputOutput;
 /// Default tool name used in auto-wake completion messages.
 pub const DEFAULT_TASK_OUTPUT_TOOL: &str = "get_task_output";
+/// UI/Stop kill with no live waiter: tell the model not to relaunch the task.
+const USER_KILLED_NOTICE: &str = "This task was killed by the user — do not restart it.\n";
+fn user_killed_notice(task: &TaskSnapshot) -> &'static str {
+    if task.explicitly_killed && !task.kill_result_delivered {
+        USER_KILLED_NOTICE
+    } else {
+        ""
+    }
+}
 /// Inline preview cap applied ONLY to bash completion reminders that ship
 /// with a disk-pointer footer. Subagent completions (which have no
 /// disk-backed output file) are never truncated -- the inline branch is
 /// their only chance to see the output.
 const MAX_INLINE_COMPLETION_BYTES: usize = 4_000;
-/// Shared set of IDs that have already been delivered via auto-wake synthetic
-/// prompts. `TaskCompletionReminder` drains this set on each reminder pass
-/// and extends its suppress list, preventing duplicate reminders for
-/// completions that already triggered an auto-wake turn.
 #[derive(Clone, Debug, Default)]
-pub struct AutoWakeDeliveredIds(pub Arc<std::sync::Mutex<HashSet<String>>>);
-impl AutoWakeDeliveredIds {
-    /// Insert an ID into the delivered set.
-    pub fn insert(&self, id: String) {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).insert(id);
+pub struct TaskCompletionReservations(pub Arc<std::sync::Mutex<HashMap<String, usize>>>);
+impl TaskCompletionReservations {
+    pub fn reserve(&self, id: String) {
+        let mut ids = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        *ids.entry(id).or_default() += 1;
     }
-    /// Remove a single ID from the delivered set (e.g. when a synthetic
-    /// prompt is preempted or cancelled before being processed).
-    pub fn remove(&self, id: &str) {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+    pub fn release(&self, id: &str) {
+        let mut ids = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = ids.get_mut(id) {
+            if *count > 1 {
+                *count -= 1;
+            } else {
+                ids.remove(id);
+            }
+        }
     }
-    /// Return `true` if `id` is currently marked as delivered, without
-    /// draining the set. Preferred over [`snapshot`](Self::snapshot) for a
-    /// single-membership check on a hot path (e.g. per monitor stdout event):
-    /// it avoids cloning every ID into a `Vec`.
     pub fn contains(&self, id: &str) -> bool {
         self.0
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .contains(id)
+            .contains_key(id)
     }
-    /// Drain all IDs from the set, returning them.
-    pub fn drain(&self) -> Vec<String> {
-        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        guard.drain().collect()
-    }
-    /// Return a snapshot of the currently-marked IDs **without** draining them.
-    ///
-    /// Used by the between-turn completion drain in `xai-grok-shell` to
-    /// suppress completions already delivered via auto-wake synthetic prompts.
-    /// Unlike [`drain`](Self::drain) (the per-tool-call surface's consumption
-    /// point), this is read-only so the existing drain/un-mark lifecycle —
-    /// `TaskCompletionReminder` draining on each tool call and the
-    /// preempt/cancel paths un-marking dropped synthetic prompts — stays the
-    /// single source of truth for the set's contents.
     pub fn snapshot(&self) -> Vec<String> {
         self.0
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .iter()
+            .keys()
             .cloned()
             .collect()
     }
 }
-crate::register_resource!("grok_build", "AutoWakeDeliveredIds", AutoWakeDeliveredIds);
+crate::register_resource!(
+    "grok_build",
+    "TaskCompletionReservations",
+    TaskCompletionReservations
+);
+#[derive(Clone, Debug, Default)]
+pub struct TaskWakeSuppressed(pub Arc<std::sync::atomic::AtomicBool>);
+impl TaskWakeSuppressed {
+    pub fn set(&self, suppressed: bool) {
+        self.0
+            .store(suppressed, std::sync::atomic::Ordering::Release);
+    }
+    pub fn get(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+crate::register_resource!("grok_build", "TaskWakeSuppressed", TaskWakeSuppressed);
 /// Set of task IDs whose completion has already been surfaced as a
 /// `<system-reminder>`.  Persisted via `State<T>` so it survives across
 /// tool calls within a session.
@@ -128,9 +136,11 @@ pub fn format_bash_completion(
             format!("exit code: {exit_code_str}")
         }
     };
+    let notice = user_killed_notice(task);
     let mut msg = format!(
         "Background task \"{}\" completed ({}).\n\
-         Command: {} | Duration: {:.1}s\n",
+         Command: {} | Duration: {:.1}s\n\
+         {notice}",
         task.task_id, status_str, command, duration_secs,
     );
     if task.signal.is_some() && duration_secs < 1.0 {
@@ -152,7 +162,7 @@ pub fn format_bash_completion(
     render_completion_output_delivery(
         &mut msg,
         &task.task_id,
-        &task.output,
+        task.output_view(),
         task_output_name,
         disk_pointer_footer.as_deref(),
     );
@@ -179,12 +189,14 @@ pub fn format_monitor_completion(task: &TaskSnapshot, task_output_name: Option<&
         .and_then(|d| d.strip_prefix("[monitor] "))
         .unwrap_or("monitor");
     let tool = task_output_name.unwrap_or(DEFAULT_TASK_OUTPUT_TOOL);
+    let notice = user_killed_notice(task);
     format!(
         "Monitor \"{id}\" ended: [monitor ended: {reason}].\n\
          Description: {description}\n\
          Command: {cmd}\n\
          Duration: {dur:.1}s\n\
-         Use {tool}(\"{id}\") for full output.",
+         Use {tool}(\"{id}\") for full output.\n\
+         {notice}",
         id = task.task_id,
         cmd = task.command,
         dur = task.duration_secs(),
@@ -256,11 +268,11 @@ fn split_wrapped_monitor_event(event_text: &str) -> Option<(&str, &str)> {
 /// Buffered `event_text` arrives pre-wrapped (`wrap_monitor_event`); it is
 /// unwrapped via [`split_wrapped_monitor_event`] with verbatim fallback.
 pub fn format_monitor_events(
-    events: &[crate::implementations::grok_build::task::types::MonitorEventNotification],
+    events: &[crate::implementations::grok_build::monitor::types::MonitorEventNotification],
     task_output_name: Option<&str>,
 ) -> Option<String> {
     use std::fmt::Write as _;
-    let tool_hint = task_output_name.unwrap_or("get_command_or_subagent_output");
+    let tool_hint = task_output_name.unwrap_or("get_task_output");
     match events {
         [] => None,
         [event] => {
@@ -279,7 +291,8 @@ pub fn format_monitor_events(
             ))
         }
         _ => {
-            type Event = crate::implementations::grok_build::task::types::MonitorEventNotification;
+            type Event =
+                crate::implementations::grok_build::monitor::types::MonitorEventNotification;
             let mut groups: Vec<(&str, Vec<&Event>)> = Vec::new();
             for event in events {
                 match groups.iter_mut().find(|(id, _)| *id == event.task_id) {
@@ -357,7 +370,7 @@ pub(crate) fn task_owned_by_session(task: &TaskSnapshot, my_owner: Option<&str>)
 pub fn render_completion_output_delivery(
     buf: &mut String,
     subagent_id: &str,
-    output: &str,
+    output: PartialOutput<'_>,
     task_output_name: Option<&str>,
     disk_pointer_footer: Option<&str>,
 ) {
@@ -377,7 +390,7 @@ pub fn render_completion_output_delivery(
                 let _ = write!(buf, "response:\n{output}");
             }
             None => {
-                let _ = write!(buf, "response:\n{output}");
+                let _ = write!(buf, "response:\n{}", output.text());
             }
         },
     }
@@ -402,6 +415,10 @@ pub async fn resolve_read_tool_name(bridge: &ToolBridge) -> Option<String> {
 /// in the current agent's toolset. When `None`, the subagent's full
 /// `output` is inlined verbatim -- this notification is the only place
 /// the model will see it (no disk-backed output file exists for subagents).
+///
+/// KEEP IN SYNC: the exact wording of this message is a compatibility
+/// surface — downstream mirrors reproduce it verbatim (grep for
+/// `format_subagent_completion_reminder`). Update them when changing it.
 pub fn format_subagent_completion(
     c: &SubagentCompletionSummary,
     task_output_name: Option<&str>,
@@ -426,7 +443,13 @@ pub fn format_subagent_completion(
         Some(_) => "\n",
         None => "\n\n",
     });
-    render_completion_output_delivery(&mut out, &c.subagent_id, &c.output, task_output_name, None);
+    render_completion_output_delivery(
+        &mut out,
+        &c.subagent_id,
+        PartialOutput::whole(&c.output),
+        task_output_name,
+        None,
+    );
     out
 }
 /// Format buffered between-turn subagent completions into a system-reminder
@@ -459,7 +482,7 @@ pub fn format_between_turn_completions(
         render_completion_output_delivery(
             &mut buf,
             &c.subagent_id,
-            &c.output,
+            PartialOutput::whole(&c.output),
             task_output_name,
             None,
         );
@@ -597,6 +620,7 @@ pub fn consumed_completion_ids(output: &ToolOutput) -> Vec<&str> {
         | ToolOutput::SchedulerDelete(_)
         | ToolOutput::SchedulerList(_)
         | ToolOutput::UpdateGoal(_)
+        | ToolOutput::Workflow(_)
         | ToolOutput::ImageGen(_)
         | ToolOutput::ImageToVideo(_)
         | ToolOutput::ReferenceToVideo(_)
@@ -621,21 +645,35 @@ impl Reminder for TaskCompletionReminder {
         resources: SharedResources,
         tool_output: &ToolOutput,
     ) -> Vec<String> {
-        let mut suppress: Vec<String> = consumed_completion_ids(tool_output)
+        let consumed_ids: Vec<String> = consumed_completion_ids(tool_output)
             .into_iter()
             .map(str::to_string)
             .collect();
-        {
+        let reserved_ids = {
             let res = resources.lock().await;
-            if let Some(auto_wake) = res.get::<AutoWakeDeliveredIds>() {
-                suppress.extend(auto_wake.drain());
+            if res
+                .get::<TaskWakeSuppressed>()
+                .is_some_and(TaskWakeSuppressed::get)
+            {
+                tracing::debug!("task wake reminder suppressed");
+                return Vec::new();
             }
-        }
-        let (terminal, event_sender) = {
+            res.get::<TaskCompletionReservations>()
+                .map(TaskCompletionReservations::snapshot)
+                .unwrap_or_default()
+        };
+        let suppress_ids = consumed_ids
+            .iter()
+            .chain(&reserved_ids)
+            .cloned()
+            .collect::<Vec<_>>();
+        let (terminal, event_sender, parent_session_id) = {
             let res = resources.lock().await;
             (
                 res.get::<Terminal>().map(|t| t.0.clone()),
                 res.get::<SubagentEventSender>().cloned(),
+                res.get::<crate::types::resources::OwnerSessionId>()
+                    .map(|owner| owner.0.clone()),
             )
         };
         let mut reminders = Vec::new();
@@ -673,7 +711,7 @@ impl Reminder for TaskCompletionReminder {
                     .map(str::to_string)
             });
             let state = res.get_or_default::<State<ReportedTaskCompletions>>();
-            for id in &suppress {
+            for id in &consumed_ids {
                 state.reported.insert(id.clone());
             }
             if surface_reminders {
@@ -681,7 +719,9 @@ impl Reminder for TaskCompletionReminder {
                     tasks
                         .iter()
                         .filter(|task| {
-                            task.completed && state.reported.insert(task.task_id.clone())
+                            task.completed
+                                && !reserved_ids.contains(&task.task_id)
+                                && state.reported.insert(task.task_id.clone())
                         })
                         .map(|task| {
                             format_bash_completion(
@@ -693,7 +733,7 @@ impl Reminder for TaskCompletionReminder {
                 );
             } else {
                 for task in &tasks {
-                    if task.completed {
+                    if task.completed && !reserved_ids.contains(&task.task_id) {
                         state.reported.insert(task.task_id.clone());
                     }
                 }
@@ -716,7 +756,8 @@ impl Reminder for TaskCompletionReminder {
             if sender
                 .0
                 .send(SubagentEvent::Completions(SubagentCompletionsRequest {
-                    suppress_ids: suppress,
+                    parent_session_id,
+                    suppress_ids,
                     respond_to: tx,
                 }))
                 .is_err()
@@ -783,13 +824,57 @@ mod tests {
             kind: Default::default(),
             block_waited: false,
             explicitly_killed: false,
+            kill_result_delivered: false,
             owner_session_id: None,
+            description: None,
+            is_backgrounded: false,
+            output_total_bytes: 0,
         };
         let msg = format_bash_completion(&task, Some("get_command_or_subagent_output"), None);
         assert!(msg.contains("abc-123"));
         assert!(msg.contains("exit code: 0"));
         assert!(msg.contains("cargo test"));
         assert!(msg.contains("get_command_or_subagent_output(\"abc-123\")"));
+        assert!(
+            !msg.contains("killed by the user"),
+            "natural completion must not carry the UI-kill notice: {msg}"
+        );
+    }
+    #[test]
+    fn format_bash_completion_ui_kill_says_do_not_restart() {
+        let mut task = TaskSnapshot {
+            task_id: "ui-kill".into(),
+            command: "sleep 60".into(),
+            display_command: None,
+            cwd: String::new(),
+            start_time: std::time::SystemTime::now(),
+            end_time: Some(std::time::SystemTime::now()),
+            output: String::new(),
+            output_file: std::path::PathBuf::new(),
+            truncated: false,
+            exit_code: None,
+            signal: Some("SIGKILL".into()),
+            completed: true,
+            kind: Default::default(),
+            block_waited: false,
+            explicitly_killed: true,
+            kill_result_delivered: false,
+            owner_session_id: None,
+            description: None,
+            is_backgrounded: true,
+            output_total_bytes: 0,
+        };
+        let msg = format_bash_completion(&task, Some("get_command_or_subagent_output"), None);
+        assert!(
+            msg.contains("killed by the user — do not restart it"),
+            "UI-kill wake must include the do-not-restart line: {msg}"
+        );
+        task.kill_result_delivered = true;
+        let model_msg = format_bash_completion(&task, Some("get_command_or_subagent_output"), None);
+        assert!(
+            !model_msg.contains("killed by the user"),
+            "model-tool kill must not tell the model the user killed it: {model_msg}"
+        );
     }
     #[test]
     fn format_monitor_completion_exit_zero() {
@@ -809,7 +894,11 @@ mod tests {
             kind: crate::computer::types::TaskKind::Monitor,
             block_waited: false,
             explicitly_killed: false,
+            kill_result_delivered: false,
             owner_session_id: None,
+            description: None,
+            is_backgrounded: false,
+            output_total_bytes: 0,
         };
         let msg = format_monitor_completion(&task, Some("get_command_or_subagent_output"));
         assert!(
@@ -841,7 +930,11 @@ mod tests {
             kind: crate::computer::types::TaskKind::Monitor,
             block_waited: false,
             explicitly_killed: false,
+            kill_result_delivered: false,
             owner_session_id: None,
+            description: None,
+            is_backgrounded: false,
+            output_total_bytes: 0,
         };
         let msg = format_monitor_completion(&task, None);
         assert!(
@@ -849,6 +942,42 @@ mod tests {
             "expected signal wording: {msg}"
         );
         assert!(msg.contains("get_task_output(\"mon-sig\")"), "{msg}");
+    }
+    #[test]
+    fn format_monitor_completion_ui_kill_says_do_not_restart() {
+        let mut task = TaskSnapshot {
+            task_id: "mon-ui".into(),
+            command: "tail -f app.log".into(),
+            display_command: Some("[monitor] app".into()),
+            cwd: String::new(),
+            start_time: std::time::SystemTime::now(),
+            end_time: Some(std::time::SystemTime::now()),
+            output: String::new(),
+            output_file: std::path::PathBuf::new(),
+            truncated: false,
+            exit_code: None,
+            signal: Some("SIGKILL".into()),
+            completed: true,
+            kind: crate::computer::types::TaskKind::Monitor,
+            block_waited: false,
+            explicitly_killed: true,
+            kill_result_delivered: false,
+            owner_session_id: None,
+            description: None,
+            is_backgrounded: true,
+            output_total_bytes: 0,
+        };
+        let msg = format_monitor_completion(&task, None);
+        assert!(
+            msg.contains("\nThis task was killed by the user — do not restart it.\n"),
+            "UI-killed monitor notice must be on its own line: {msg}"
+        );
+        task.kill_result_delivered = true;
+        let model_msg = format_monitor_completion(&task, None);
+        assert!(
+            !model_msg.contains("killed by the user"),
+            "model-tool monitor kill must not carry the UI-kill notice: {model_msg}"
+        );
     }
     #[test]
     fn format_bash_completion_prefers_display_command() {
@@ -868,7 +997,11 @@ mod tests {
             kind: Default::default(),
             block_waited: false,
             explicitly_killed: false,
+            kill_result_delivered: false,
             owner_session_id: None,
+            description: None,
+            is_backgrounded: false,
+            output_total_bytes: 0,
         };
         let msg = format_bash_completion(&task, Some("get_command_or_subagent_output"), None);
         assert!(msg.contains("cargo test"));
@@ -892,7 +1025,11 @@ mod tests {
             kind: Default::default(),
             block_waited: false,
             explicitly_killed: false,
+            kill_result_delivered: false,
             owner_session_id: None,
+            description: None,
+            is_backgrounded: false,
+            output_total_bytes: 0,
         };
         let msg = format_bash_completion(&task, Some("get_command_or_subagent_output"), None);
         assert!(msg.contains("exit code: unknown"));
@@ -919,7 +1056,11 @@ mod tests {
             kind: Default::default(),
             block_waited: false,
             explicitly_killed: false,
+            kill_result_delivered: false,
             owner_session_id: None,
+            description: None,
+            is_backgrounded: false,
+            output_total_bytes: 0,
         };
         let msg = format_bash_completion(&task, Some("get_command_or_subagent_output"), None);
         assert!(
@@ -957,7 +1098,11 @@ mod tests {
             kind: Default::default(),
             block_waited: false,
             explicitly_killed: false,
+            kill_result_delivered: false,
             owner_session_id: None,
+            description: None,
+            is_backgrounded: false,
+            output_total_bytes: 0,
         };
         let msg = format_bash_completion(&task, Some("get_command_or_subagent_output"), None);
         assert!(
@@ -994,7 +1139,11 @@ mod tests {
             kind: Default::default(),
             block_waited: false,
             explicitly_killed: false,
+            kill_result_delivered: false,
             owner_session_id: None,
+            description: None,
+            is_backgrounded: false,
+            output_total_bytes: 0,
         };
         let msg = format_bash_completion(&task, Some("get_command_or_subagent_output"), None);
         assert!(msg.contains("exit code: 0"));
@@ -1154,8 +1303,37 @@ mod tests {
             kind: Default::default(),
             block_waited: false,
             explicitly_killed: false,
+            kill_result_delivered: false,
             owner_session_id: None,
+            description: None,
+            is_backgrounded: false,
+            output_total_bytes: 0,
         }
+    }
+    /// A log that cannot be read produces an empty snapshot with a
+    /// non-zero total. The completion must still say how big the output
+    /// is and where to read it.
+    #[test]
+    fn bash_completion_for_an_unreadable_log_still_points_at_the_file() {
+        let mut task = make_completed("bg-unreadable");
+        task.output = String::new();
+        task.truncated = true;
+        task.output_total_bytes = 123_456;
+        task.output_file = std::path::PathBuf::from("/tmp/bg-unreadable.log");
+        let msg = format_bash_completion(&task, None, Some("read_file"));
+        assert!(msg.contains("123456 bytes total"), "{msg}");
+        assert!(msg.contains("/tmp/bg-unreadable.log"), "{msg}");
+    }
+    /// The snapshot holds part of a large log. The footer the model reads must
+    /// state the task's real size, not the size of the part on hand.
+    #[test]
+    fn bash_completion_footer_states_the_real_log_size() {
+        let mut task = make_completed("bg-large");
+        task.output = "x".repeat(20_000);
+        task.output_total_bytes = 5_000_000;
+        task.output_file = std::path::PathBuf::from("/tmp/bg-large.log");
+        let msg = format_bash_completion(&task, None, Some("read_file"));
+        assert!(msg.contains("5000000 bytes total"), "{msg}");
     }
     fn make_running(id: &str) -> TaskSnapshot {
         TaskSnapshot {
@@ -1174,7 +1352,11 @@ mod tests {
             kind: Default::default(),
             block_waited: false,
             explicitly_killed: false,
+            kill_result_delivered: false,
             owner_session_id: None,
+            description: None,
+            is_backgrounded: false,
+            output_total_bytes: 0,
         }
     }
     fn make_bg_started(id: &str) -> crate::types::output::BackgroundTaskStarted {
@@ -1194,6 +1376,14 @@ mod tests {
         let mut res = Resources::new();
         let backend: Arc<dyn TerminalBackend> = Arc::new(MockTerminal { tasks });
         res.insert(Terminal(backend));
+        res.register_state::<ReportedTaskCompletions>();
+        res.into_shared()
+    }
+    fn shared_with_gate(tasks: Vec<TaskSnapshot>, gate: TaskWakeSuppressed) -> SharedResources {
+        let mut res = Resources::new();
+        let backend: Arc<dyn TerminalBackend> = Arc::new(MockTerminal { tasks });
+        res.insert(Terminal(backend));
+        res.insert(gate);
         res.register_state::<ReportedTaskCompletions>();
         res.into_shared()
     }
@@ -1301,11 +1491,46 @@ mod tests {
             truncation_hint: String::new(),
             raw_output_bytes: 4,
         }));
-        let r = reminder.collect_reminders(shared, &output).await;
+        let r = reminder.collect_reminders(shared.clone(), &output).await;
         assert!(
             r.is_empty(),
             "get_task_output(completed) should suppress reminder"
         );
+        assert!(
+            shared
+                .lock()
+                .await
+                .get::<State<ReportedTaskCompletions>>()
+                .expect("reported state")
+                .reported
+                .contains("t1")
+        );
+    }
+    #[tokio::test]
+    async fn ctrl_c_gate_suppresses_visible_completion_without_reporting_it() {
+        let gate = TaskWakeSuppressed::default();
+        gate.set(true);
+        let shared = shared_with_gate(vec![make_completed("visible")], gate.clone());
+        let output = ToolOutput::Dynamic(serde_json::Value::Null.into());
+        assert!(
+            TaskCompletionReminder
+                .collect_reminders(shared.clone(), &output)
+                .await
+                .is_empty()
+        );
+        assert!(
+            shared
+                .lock()
+                .await
+                .get::<State<ReportedTaskCompletions>>()
+                .is_none_or(|state| !state.reported.contains("visible"))
+        );
+        gate.set(false);
+        let reminders = TaskCompletionReminder
+            .collect_reminders(shared, &output)
+            .await;
+        assert_eq!(reminders.len(), 1);
+        assert!(reminders[0].contains("visible"));
     }
     #[tokio::test]
     async fn not_suppressed_for_unrelated_output() {
@@ -1608,56 +1833,99 @@ mod tests {
         );
     }
     #[test]
-    fn auto_wake_delivered_ids_insert_and_drain() {
-        let ids = AutoWakeDeliveredIds::default();
-        ids.insert("t1".into());
-        ids.insert("t2".into());
-        let drained = ids.drain();
-        assert_eq!(drained.len(), 2);
-        assert!(drained.contains(&"t1".to_string()));
-        assert!(drained.contains(&"t2".to_string()));
-        assert!(ids.drain().is_empty());
+    fn task_completion_reservations_are_reference_counted() {
+        let reservations = TaskCompletionReservations::default();
+        reservations.reserve("t1".into());
+        reservations.reserve("t1".into());
+        reservations.release("t1");
+        assert!(reservations.contains("t1"));
+        reservations.release("t1");
+        assert!(!reservations.contains("t1"));
     }
     #[test]
-    fn auto_wake_delivered_ids_dedup() {
-        let ids = AutoWakeDeliveredIds::default();
-        ids.insert("t1".into());
-        ids.insert("t1".into());
-        let drained = ids.drain();
-        assert_eq!(drained.len(), 1);
-    }
-    #[test]
-    fn auto_wake_delivered_ids_snapshot_is_non_destructive() {
-        let ids = AutoWakeDeliveredIds::default();
-        ids.insert("t1".into());
-        ids.insert("t2".into());
-        let snap = ids.snapshot();
-        assert_eq!(snap.len(), 2);
-        assert!(snap.contains(&"t1".to_string()));
-        assert!(snap.contains(&"t2".to_string()));
-        assert_eq!(ids.drain().len(), 2);
+    fn task_completion_reservations_snapshot_is_non_destructive() {
+        let reservations = TaskCompletionReservations::default();
+        reservations.reserve("t1".into());
+        reservations.reserve("t2".into());
+        let snapshot = reservations.snapshot();
+        assert_eq!(snapshot.len(), 2);
+        assert!(snapshot.contains(&"t1".to_string()));
+        assert!(snapshot.contains(&"t2".to_string()));
+        assert!(reservations.contains("t1"));
+        assert!(reservations.contains("t2"));
     }
     #[tokio::test]
-    async fn auto_wake_delivered_ids_suppress_reminders() {
+    async fn task_completion_reservations_suppress_reminders() {
         let mut res = Resources::new();
         let backend: Arc<dyn TerminalBackend> = Arc::new(MockTerminal {
             tasks: vec![make_completed("t1"), make_completed("t2")],
         });
         res.insert(Terminal(backend));
         res.register_state::<ReportedTaskCompletions>();
-        let auto_wake = AutoWakeDeliveredIds::default();
-        auto_wake.insert("t1".into());
-        res.insert(auto_wake);
+        let reservations = TaskCompletionReservations::default();
+        reservations.reserve("t1".into());
+        res.insert(reservations);
         let shared = res.into_shared();
         let reminder = TaskCompletionReminder;
         let output = ToolOutput::Dynamic(serde_json::Value::Null.into());
-        let r = reminder.collect_reminders(shared, &output).await;
-        assert_eq!(
-            r.len(),
-            1,
-            "auto-wake delivered ID should suppress reminder"
-        );
+        let r = reminder.collect_reminders(shared.clone(), &output).await;
+        assert_eq!(r.len(), 1, "reserved ID should suppress reminder");
         assert!(r[0].contains("t2"));
+        let res = shared.lock().await;
+        assert!(
+            res.get::<TaskCompletionReservations>()
+                .is_some_and(|ids| ids.contains("t1"))
+        );
+        assert!(
+            !res.get::<State<ReportedTaskCompletions>>()
+                .expect("reported state")
+                .reported
+                .contains("t1")
+        );
+    }
+    #[tokio::test]
+    async fn reserved_completion_surfaces_after_release() {
+        let mut res = Resources::new();
+        let backend: Arc<dyn TerminalBackend> = Arc::new(MockTerminal {
+            tasks: vec![make_completed("reserved")],
+        });
+        res.insert(Terminal(backend));
+        res.register_state::<ReportedTaskCompletions>();
+        let reservations = TaskCompletionReservations::default();
+        reservations.reserve("reserved".into());
+        res.insert(reservations.clone());
+        let shared = res.into_shared();
+        let reminder = TaskCompletionReminder;
+        let output = ToolOutput::Dynamic(serde_json::Value::Null.into());
+        assert!(
+            reminder
+                .collect_reminders(shared.clone(), &output)
+                .await
+                .is_empty()
+        );
+        assert!(reservations.contains("reserved"));
+        assert!(
+            !shared
+                .lock()
+                .await
+                .get::<State<ReportedTaskCompletions>>()
+                .expect("reported state")
+                .reported
+                .contains("reserved")
+        );
+        reservations.release("reserved");
+        let reminders = reminder.collect_reminders(shared.clone(), &output).await;
+        assert_eq!(reminders.len(), 1);
+        assert!(reminders[0].contains("reserved"));
+        assert!(
+            shared
+                .lock()
+                .await
+                .get::<State<ReportedTaskCompletions>>()
+                .expect("reported state")
+                .reported
+                .contains("reserved")
+        );
     }
     /// Regression: subagent inline output larger than the bash-completion
     /// inline cap MUST be preserved verbatim. The inline branch is the
@@ -1698,7 +1966,7 @@ mod tests {
     /// reintroduced.
     #[tokio::test]
     async fn reminder_pipeline_ignores_monitor_event_buffer() {
-        use crate::implementations::grok_build::task::types::{
+        use crate::implementations::grok_build::monitor::types::{
             MonitorEventBuffer, MonitorEventNotification,
         };
         use crate::types::resources::Resources;
@@ -1732,7 +2000,7 @@ mod tests {
     /// own + owner-less legacy events; foreign events stay buffered.
     #[test]
     fn drain_owned_partitions_by_session_owner() {
-        use crate::implementations::grok_build::task::types::{
+        use crate::implementations::grok_build::monitor::types::{
             MonitorEventBuffer, MonitorEventNotification, drain_owned,
         };
         let shared_buffer = MonitorEventBuffer::default();
@@ -1769,7 +2037,7 @@ mod tests {
     /// empty => `None`.
     #[test]
     fn format_monitor_events_single_vs_batched() {
-        use crate::implementations::grok_build::task::types::MonitorEventNotification;
+        use crate::implementations::grok_build::monitor::types::MonitorEventNotification;
         let event = |task: &str, desc: &str, text: &str| MonitorEventNotification {
             task_id: task.to_string(),
             event_text: format!(
@@ -1787,7 +2055,7 @@ mod tests {
             single, "<monitor-event task_id=\"task-0\">\n[alpha] line 0\n</monitor-event>",
             "single event must use the lean monitor-event form"
         );
-        let bare = crate::implementations::grok_build::task::types::MonitorEventNotification {
+        let bare = crate::implementations::grok_build::monitor::types::MonitorEventNotification {
             task_id: "task-9".into(),
             event_text: "bare text, no wrapper".into(),
             owner_session_id: None,
@@ -1810,13 +2078,14 @@ mod tests {
         assert!(
             batched.starts_with(
                 "3 monitor events from 2 monitors \
-                 (use get_command_or_subagent_output to identify each monitor):"
+                 (use get_task_output to identify each monitor):"
             ),
             "batch must lead with event + monitor counts and default tool hint: {batched}"
         );
         assert!(
-            batched
-            .contains("<monitor description=\"alpha\" task_id=\"task-0\">\n[1] a first\n[2] a second\n</monitor>"),
+            batched.contains(
+                "<monitor description=\"alpha\" task_id=\"task-0\">\n[1] a first\n[2] a second\n</monitor>"
+            ),
             "task-0 group: description once on the tag, ordinal tick labels: {batched}"
         );
         assert!(
@@ -1874,7 +2143,7 @@ mod tests {
     /// End-to-end multibyte safety through the formatter (single + batch).
     #[test]
     fn format_monitor_events_handles_multibyte_content() {
-        use crate::implementations::grok_build::task::types::MonitorEventNotification;
+        use crate::implementations::grok_build::monitor::types::MonitorEventNotification;
         let event = |task: &str, desc: &str, text: &str| MonitorEventNotification {
             task_id: task.to_string(),
             event_text: format!(

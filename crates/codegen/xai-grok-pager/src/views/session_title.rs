@@ -54,6 +54,32 @@ pub fn entry_title(agent: &AgentView) -> String {
     }
 }
 
+/// Real session title for rename prefill / `/rename` ghost-prefill.
+///
+/// Deliberately **not** [`entry_title`]: that chain falls back to the first
+/// prompt and `"session <id8>"`, which would Tab-accept a synthetic label
+/// (and a 60-char truncation). Same derivation as the dashboard `Ctrl+R`
+/// editor: non-blank `display_name`, else `generated_session_title`.
+pub fn rename_source_title(agent: &AgentView) -> Option<String> {
+    rename_source_title_raw(agent).map(|s| sanitize_display_text(s).into_owned())
+}
+
+pub(crate) fn rename_source_title_raw(agent: &AgentView) -> Option<&str> {
+    for name in [
+        agent.display_name.as_deref(),
+        agent.generated_session_title.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let trimmed = name.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed);
+        }
+    }
+    None
+}
+
 /// Take the first scrollback `UserPrompt` block's text, if any.
 ///
 /// Skips indices whose `entry()` returns `None` (defensive: the indexed
@@ -71,6 +97,60 @@ fn first_user_prompt_text(agent: &AgentView) -> Option<String> {
     None
 }
 
+/// First line of the most recent user prompt (`RenderBlock::UserPrompt`) in
+/// the agent's scrollback, ANSI-stripped + sanitised; `None` when the user
+/// hasn't sent any prompts yet.
+pub(crate) fn last_user_prompt_line(agent: &AgentView) -> Option<String> {
+    let len = agent.scrollback.len();
+    for idx in (0..len).rev() {
+        let entry = agent.scrollback.entry(idx)?;
+        if let RenderBlock::UserPrompt(b) = &entry.block {
+            let first = b.text.lines().next().unwrap_or("").trim();
+            if first.is_empty() {
+                continue;
+            }
+            let stripped = strip_ansi_escapes::strip_str(first);
+            let safe = sanitize_display_text(&stripped).into_owned();
+            return Some(safe.trim().to_string());
+        }
+    }
+    None
+}
+
+/// First renderable line of the newest agent message, ANSI-stripped +
+/// sanitised. Pairing guarantee: returns `None` when a `UserPrompt` is newer
+/// than every agent message (that prompt is unanswered — an older reply would
+/// misrepresent the latest exchange), or when the message has no renderable
+/// line (older messages are not scanned).
+pub(crate) fn last_agent_message_line(agent: &AgentView) -> Option<String> {
+    let len = agent.scrollback.len();
+    for idx in (0..len).rev() {
+        let entry = agent.scrollback.entry(idx)?;
+        match &entry.block {
+            RenderBlock::AgentMessage(msg) => {
+                let text = msg.text();
+                for line in text.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let stripped = strip_ansi_escapes::strip_str(trimmed);
+                    let safe = sanitize_display_text(&stripped).into_owned();
+                    let safe = safe.trim().to_string();
+                    if !safe.is_empty() {
+                        return Some(safe);
+                    }
+                }
+                return None;
+            }
+            // The user's latest prompt marks the turn boundary — no reply yet.
+            RenderBlock::UserPrompt(_) => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Take the first `MAX_TITLE_CHARS` chars and append an ellipsis when
 /// truncated. Char-based (not byte-based) so multi-byte codepoints
 /// don't get split.
@@ -82,19 +162,27 @@ fn truncate_title(text: &str) -> String {
     format!("{head}...")
 }
 
-/// Strip ASCII control characters (`0x00-0x1f` and `0x7f`) that could
-/// inject terminal escape sequences (CSI, OSC, BEL, etc.) into the
-/// rendered output. Replaces stripped chars with `U+FFFD` so the caller
-/// can still see something was there.
+/// Strip C0/C1 and bidi/format controls that could inject terminal escape
+/// sequences or spoof the title. Replaces them with `U+FFFD` so the caller
+/// can still see something was there. Same character class as
+/// [`xai_grok_shell::session::persistence::is_forbidden_title_char`]; persist
+/// drops, display replaces.
 ///
 /// Returns `Cow::Borrowed(s)` when no sanitization is needed, so the
 /// common per-render call on a clean cached display_name does not
 /// allocate.
 pub(crate) fn sanitize_display_text(s: &str) -> Cow<'_, str> {
-    if s.chars().any(|c| c.is_ascii_control()) {
+    use xai_grok_shell::session::persistence::is_forbidden_title_char;
+    if s.chars().any(is_forbidden_title_char) {
         Cow::Owned(
             s.chars()
-                .map(|c| if c.is_ascii_control() { '\u{FFFD}' } else { c })
+                .map(|c| {
+                    if is_forbidden_title_char(c) {
+                        '\u{FFFD}'
+                    } else {
+                        c
+                    }
+                })
                 .collect(),
         )
     } else {
@@ -103,7 +191,7 @@ pub(crate) fn sanitize_display_text(s: &str) -> Cow<'_, str> {
 }
 
 /// Format an elapsed duration as a compact relative label (`now`, `30s ago`,
-/// `5m ago`, `2h ago`, `3d ago`). Shared by the dashboard and project picker.
+/// `5m ago`, `2h ago`, `3d ago`).
 pub(crate) fn format_relative_time(elapsed: Duration) -> String {
     let secs = elapsed.as_secs();
     if secs < 1 {
@@ -154,7 +242,7 @@ mod tests {
         let out = sanitize_display_text(attack);
         assert!(matches!(out, Cow::Owned(_)));
         for c in out.chars() {
-            assert!(!c.is_ascii_control(), "leaked control char: {:?}", c);
+            assert!(!c.is_control(), "leaked control char: {:?}", c);
         }
         // Replacement chars should be present where escapes were.
         assert!(out.contains('\u{FFFD}'));
@@ -166,7 +254,7 @@ mod tests {
         let csi = "\x1b[31mred\x1b[0m";
         let out = sanitize_display_text(csi);
         for c in out.chars() {
-            assert!(!c.is_ascii_control());
+            assert!(!c.is_control());
         }
     }
 
@@ -175,6 +263,20 @@ mod tests {
         let s = "ring\x07the\x7fbell";
         let out = sanitize_display_text(s);
         assert_eq!(out.as_ref(), "ring\u{FFFD}the\u{FFFD}bell");
+    }
+
+    #[test]
+    fn sanitize_strips_c1_controls() {
+        let s = "ok\u{9b}[31m\u{9c}done";
+        let out = sanitize_display_text(s);
+        assert_eq!(out.as_ref(), "ok\u{FFFD}[31m\u{FFFD}done");
+    }
+
+    #[test]
+    fn sanitize_strips_bidi_overrides() {
+        let s = "deploy-prod\u{202e}gnp.hs";
+        let out = sanitize_display_text(s);
+        assert_eq!(out.as_ref(), "deploy-prod\u{FFFD}gnp.hs");
     }
 
     #[test]
@@ -191,6 +293,47 @@ mod tests {
         let out = sanitize_display_text("");
         assert_eq!(out.as_ref(), "");
         assert!(matches!(out, Cow::Borrowed(_)));
+    }
+
+    // ── rename_source_title ─────────────────────────────────────────
+
+    #[test]
+    fn rename_source_title_prefers_display_name() {
+        let mut agent =
+            crate::app::agent_view::test_agent_view(Some("test-session"), "/tmp".into());
+        agent.display_name = Some("  Manual  ".into());
+        agent.generated_session_title = Some("Generated".into());
+        agent
+            .scrollback
+            .push_block(RenderBlock::user_prompt("first prompt text"));
+        assert_eq!(rename_source_title(&agent).as_deref(), Some("Manual"));
+    }
+
+    #[test]
+    fn rename_source_title_falls_through_blank_display_name() {
+        let mut agent =
+            crate::app::agent_view::test_agent_view(Some("test-session"), "/tmp".into());
+        agent.display_name = Some("   ".into());
+        agent.generated_session_title = Some("Generated".into());
+        assert_eq!(rename_source_title(&agent).as_deref(), Some("Generated"));
+    }
+
+    #[test]
+    fn rename_source_title_none_without_real_title() {
+        let mut agent =
+            crate::app::agent_view::test_agent_view(Some("test-session"), "/tmp".into());
+        agent.scrollback.push_block(RenderBlock::user_prompt(
+            "first prompt that entry_title would use",
+        ));
+        assert!(
+            rename_source_title(&agent).is_none(),
+            "must not prefill first-prompt or session-id fallbacks"
+        );
+        let shown = entry_title(&agent);
+        assert!(
+            shown.starts_with("first prompt") || shown.starts_with("session "),
+            "entry_title still has synthetic fallbacks: {shown}"
+        );
     }
 
     // ── truncate_title ──────────────────────────────────────────────

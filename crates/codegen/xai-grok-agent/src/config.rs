@@ -280,6 +280,7 @@ fn default_grok_build_toolset() -> ToolServerConfig {
             (&search_tool::SearchTool).into(),
             (&use_tool::UseTool).into(),
             (&grok_build::UpdateGoalTool).into(),
+            (&grok_build::WorkflowTool).into(),
         ],
         behavior_preset: None,
     }
@@ -300,6 +301,7 @@ fn grok_build_concise_toolset() -> ToolServerConfig {
             (&grok_build::SchedulerListTool).into(),
             (&grok_build::MonitorTool).into(),
             (&grok_build::UpdateGoalTool).into(),
+            (&grok_build::WorkflowTool).into(),
         ],
         behavior_preset: None,
     }
@@ -329,6 +331,7 @@ pub fn grok_build_hashline_toolset(
         (&search_tool::SearchTool).into(),
         (&use_tool::UseTool).into(),
         (&grok_build::UpdateGoalTool).into(),
+        (&grok_build::WorkflowTool).into(),
     ]);
     ToolServerConfig {
         tools,
@@ -380,7 +383,9 @@ fn plan_toolset() -> ToolServerConfig {
             (&grok_build::ReadFileTool).into(),
             (&grok_build::ListDirTool).into(),
             (&grok_build::GrepTool).into(),
+            // (&grok_build::SkillTool).into(),
             (&grok_build::TodoWriteTool).into(),
+            // search_replace + run_terminal_command intentionally omitted (read-only)
         ],
         behavior_preset: None,
     }
@@ -394,6 +399,7 @@ fn plan_toolset() -> ToolServerConfig {
 fn grok_build_plan_toolset() -> ToolServerConfig {
     ToolServerConfig {
         tools: vec![
+            // Standard grok-build tools
             bash_tool_config(),
             (&grok_build::ReadFileTool).into(),
             (&grok_build::SearchReplaceTool).into(),
@@ -410,6 +416,8 @@ fn grok_build_plan_toolset() -> ToolServerConfig {
             (&search_tool::SearchTool).into(),
             (&use_tool::UseTool).into(),
             (&grok_build::UpdateGoalTool).into(),
+            (&grok_build::WorkflowTool).into(),
+            // Plan mode tools
             (&grok_build::EnterPlanModeTool).into(),
             (&grok_build::ExitPlanModeTool).into(),
             (&grok_build::AskUserQuestionTool).into(),
@@ -426,32 +434,44 @@ fn grok_build_plan_toolset() -> ToolServerConfig {
 fn orchestrator_toolset() -> ToolServerConfig {
     ToolServerConfig {
         tools: vec![
+            // Research tools
             bash_tool_config(),
             (&grok_build::ReadFileTool).into(),
             (&grok_build::ListDirTool).into(),
             (&grok_build::GrepTool).into(),
+            // Subagent orchestration
             task_tool_config(),
             task_output_tool_config(),
             wait_tasks_tool_config(),
             kill_task_tool_config(),
+            // Skills and MCP
             (&search_tool::SearchTool).into(),
             (&use_tool::UseTool).into(),
+            // Planning and user interaction
             (&grok_build::TodoWriteTool).into(),
             (&grok_build::EnterPlanModeTool).into(),
             (&grok_build::ExitPlanModeTool).into(),
             (&grok_build::AskUserQuestionTool).into(),
             (&grok_build::UpdateGoalTool).into(),
+            (&grok_build::WorkflowTool).into(),
+            // Scheduling and monitoring
             (&grok_build::SchedulerCreateTool).into(),
             (&grok_build::SchedulerDeleteTool).into(),
             (&grok_build::SchedulerListTool).into(),
             (&grok_build::MonitorTool).into(),
+            // Web tools
             (&grok_build::WebSearchTool).into(),
             (&grok_build::WebFetchTool).into(),
+            // Imagine
             (&grok_build::ImageGenTool).into(),
             (&grok_build::ImageToVideoTool).into(),
             (&grok_build::ReferenceToVideoTool).into(),
+            // Memory
             (&memory::MemorySearchImpl).into(),
             (&memory::MemoryGetImpl).into(),
+            // Intentionally excluded:
+            // - SearchReplaceTool (no file editing — delegate to subagents)
+            // - OpenCodeWriteTool (no file writing — delegate to subagents)
         ],
         behavior_preset: None,
     }
@@ -464,6 +484,8 @@ fn orchestrator_toolset() -> ToolServerConfig {
 fn grok_build_plan_no_subagents_toolset() -> ToolServerConfig {
     ToolServerConfig {
         tools: vec![
+            // Standard grok-build tools (minus TaskTool only — KillTaskTool and
+            // TaskOutputTool are kept because BashTool's background mode requires them)
             bash_tool_config(),
             (&grok_build::ReadFileTool).into(),
             (&grok_build::SearchReplaceTool).into(),
@@ -479,6 +501,8 @@ fn grok_build_plan_no_subagents_toolset() -> ToolServerConfig {
             (&search_tool::SearchTool).into(),
             (&use_tool::UseTool).into(),
             (&grok_build::UpdateGoalTool).into(),
+            (&grok_build::WorkflowTool).into(),
+            // Plan mode tools
             (&grok_build::EnterPlanModeTool).into(),
             (&grok_build::ExitPlanModeTool).into(),
             (&grok_build::AskUserQuestionTool).into(),
@@ -510,6 +534,8 @@ fn grok_build_ask_user_toolset() -> ToolServerConfig {
             (&search_tool::SearchTool).into(),
             (&use_tool::UseTool).into(),
             (&grok_build::UpdateGoalTool).into(),
+            (&grok_build::WorkflowTool).into(),
+            // Ask user tool (without plan mode)
             (&grok_build::AskUserQuestionTool).into(),
         ],
         behavior_preset: None,
@@ -717,6 +743,9 @@ pub struct AgentDefinition {
     /// Plugin namespace for plugin-backed agents only.
     #[serde(skip)]
     pub plugin_name: Option<String>,
+    /// Prevents external definitions from opting into built-in-only policy by name.
+    #[serde(skip)]
+    pub(crate) builtin_name: Option<BuiltinAgentName>,
     #[serde(default = "default_prompt_mode")]
     pub prompt_mode: PromptMode,
     #[serde(default = "default_grok_build_toolset")]
@@ -767,7 +796,7 @@ pub struct AgentDefinition {
     pub isolation: Option<IsolationMode>,
     #[serde(default)]
     pub background: Option<bool>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_agent_color")]
     pub color: Option<AgentColor>,
     #[serde(default)]
     pub initial_prompt: Option<String>,
@@ -785,6 +814,8 @@ pub struct AgentDefinition {
     /// specific tool before the turn ends.
     #[serde(default)]
     pub completion_requirement: Option<CompletionRequirement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_overrides: Option<xai_grok_sampling_types::ToolOverrides>,
     /// Subagent types this agent can spawn (derived by builder from `tools`).
     /// `None` = unrestricted, `Some([t1])` = restricted, `Some([])` = blocked.
     #[serde(skip)]
@@ -1032,11 +1063,13 @@ const _: () =
     Eq,
     Deserialize,
     serde::Serialize,
+    AsRefStr,
+    EnumString,
     IntoStaticStr,
     strum::EnumCount,
 )]
 #[serde(rename_all = "lowercase")]
-#[strum(serialize_all = "lowercase")]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
 pub enum AgentColor {
     Red,
     Blue,
@@ -1053,6 +1086,35 @@ impl AgentColor {
     ];
 }
 const _: () = assert!(AgentColor::VALID_VALUES.len() == <AgentColor as strum::EnumCount>::COUNT);
+/// Never fails: `color` is decorative, but a rejected value fails the whole
+/// frontmatter parse, and discovery skips agents that fail to parse — so a
+/// typo'd or hex color would silently make the agent unspawnable.
+///
+/// Frontmatter is only ever decoded by `serde_yaml`, so the intermediate value
+/// is captured as `serde_yaml::Value` (total for YAML — tagged scalars and
+/// maps with non-string keys included, which have no `serde_json::Value`
+/// form). Unrecognized values are dropped to `None` with a warning rather
+/// than mapped to a stand-in color the author never wrote.
+fn deserialize_agent_color<'de, D>(deserializer: D) -> Result<Option<AgentColor>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use std::str::FromStr;
+    let Some(value) = Option::<serde_yaml::Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    let parsed = value
+        .as_str()
+        .and_then(|name| AgentColor::from_str(name.trim()).ok());
+    if parsed.is_none() {
+        tracing::warn!(
+            color = ?value,
+            valid = ?AgentColor::VALID_VALUES,
+            "unrecognized agent color, ignoring"
+        );
+    }
+    Ok(parsed)
+}
 /// Agent memory scope. Distinct from `storage::MemoryScope` (global-vs-workspace write target).
 #[derive(
     Debug,
@@ -1373,6 +1435,12 @@ impl AgentDefinition {
     ) -> bool {
         false
     }
+    pub fn include_browser_verification(&self) -> bool {
+        matches!(
+            self.builtin_name,
+            Some(BuiltinAgentName::GrokBuildPlan | BuiltinAgentName::GrokBuildPlanNoSubagents)
+        )
+    }
     /// True iff this agent's wire format is non-interchangeable with the
     /// stock harness, so a client-supplied `_meta.agentProfile` must NOT
     /// override it. Strict iff any of: bespoke `system_prompt` template,
@@ -1417,7 +1485,10 @@ impl AgentDefinition {
     }
     /// Shared defaults for built-in constructors.
     fn base(name: BuiltinAgentName, description: &str) -> Self {
-        Self::builtin_defaults(name.as_ref(), description)
+        Self {
+            builtin_name: Some(name),
+            ..Self::builtin_defaults(name.as_ref(), description)
+        }
     }
     /// Shared defaults for out-of-tree built-in agent registrations.
     pub fn builtin_defaults(name: &str, description: &str) -> Self {
@@ -1425,6 +1496,7 @@ impl AgentDefinition {
             name: name.to_owned(),
             description: description.to_string(),
             plugin_name: None,
+            builtin_name: None,
             prompt_mode: PromptMode::Extend,
             tool_config: default_grok_build_toolset(),
             capability_mode: None,
@@ -1451,6 +1523,7 @@ impl AgentDefinition {
             session_tools_denylist: None,
             model: ModelOverride::Inherit,
             completion_requirement: None,
+            tool_overrides: None,
             prompt_body: None,
             system_prompt: TemplateOverride::None,
             source_path: None,
@@ -1634,6 +1707,14 @@ impl AgentDefinition {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Pins the `spawn_subagent` rename to the shared predicate.
+    #[test]
+    fn task_tool_rename_matches_task_tool_id_predicate() {
+        let name = task_tool_config()
+            .name_override
+            .expect("task tool is renamed");
+        assert!(xai_grok_tools::is_task_tool_id(&name));
+    }
     /// Native presets only.
     #[test]
     fn toolset_for_preset_resolves_known_names() {
@@ -2019,20 +2100,16 @@ description: Minimal agent
         let v: McpServerRef = serde_json::from_value(serde_json::json!("slack")).unwrap();
         assert_eq!(v, McpServerRef::Named("slack".to_string()));
         let v: McpServerRef =
-            serde_json::from_value(serde_json::json!({ "s" : { "type" : "stdio" } })).unwrap();
+            serde_json::from_value(serde_json::json!({"s": {"type": "stdio"}})).unwrap();
         assert!(matches!(v, McpServerRef::Inline { ref name, .. } if name == "s"));
         let v: McpServerRef =
-            serde_json::from_value(serde_json::json!({ "name" : "s", "type" : "stdio" })).unwrap();
+            serde_json::from_value(serde_json::json!({"name": "s", "type": "stdio"})).unwrap();
         assert!(matches!(v, McpServerRef::Inline { ref name, .. } if name == "s"));
         assert!(
-            serde_json::from_value::<McpServerRef>(serde_json::json!({ "type" :
-            "stdio" }))
-            .is_err()
+            serde_json::from_value::<McpServerRef>(serde_json::json!({"type": "stdio"})).is_err()
         );
         assert!(serde_json::from_value::<McpServerRef>(serde_json::json!(42)).is_err());
-        assert!(
-            serde_json::from_value::<McpServerRef>(serde_json::json!({ "s" : "bad" })).is_err()
-        );
+        assert!(serde_json::from_value::<McpServerRef>(serde_json::json!({"s": "bad"})).is_err());
     }
     #[test]
     fn memory_scope_resolve_dir() {
@@ -2071,8 +2148,10 @@ description: Minimal agent
         }
         for color in AgentColor::VALID_VALUES {
             let c = format!("---\nname: t\ndescription: t\ncolor: {color}\n---\n");
-            assert!(
-                AgentDefinition::parse(&c).unwrap().color.is_some(),
+            let parsed = AgentDefinition::parse(&c).unwrap().color;
+            assert_eq!(
+                parsed.map(<&'static str>::from),
+                Some(*color),
                 "color: {color}"
             );
         }
@@ -2083,6 +2162,33 @@ description: Minimal agent
                 "memory: {memory}"
             );
         }
+    }
+    #[test]
+    fn unparseable_color_is_dropped_instead_of_dropping_the_agent() {
+        for (declared, expected) in [
+            ("Purple", Some(AgentColor::Purple)),
+            ("  CYAN  ", Some(AgentColor::Cyan)),
+            ("teal", None),
+            ("\"#ff0000\"", None),
+            ("chartreuse", None),
+            ("42", None),
+            ("[red, blue]", None),
+            ("!custom x", None),
+            ("{1: 2}", None),
+        ] {
+            let c = format!("---\nname: t\ndescription: t\ncolor: {declared}\n---\n");
+            let def = AgentDefinition::parse(&c)
+                .unwrap_or_else(|e| panic!("color {declared} must not fail the parse: {e}"));
+            assert_eq!(def.color, expected, "color: {declared}");
+            assert_eq!(def.name, "t");
+        }
+    }
+    #[test]
+    fn absent_or_null_color_stays_none() {
+        let def = AgentDefinition::parse("---\nname: t\ndescription: t\n---\n").unwrap();
+        assert!(def.color.is_none());
+        let def = AgentDefinition::parse("---\nname: t\ndescription: t\ncolor:\n---\n").unwrap();
+        assert!(def.color.is_none());
     }
     #[test]
     fn test_parse_missing_name() {
@@ -2248,9 +2354,10 @@ description: Test default tool config
     }
     #[test]
     fn test_from_json_minimal() {
-        let json = serde_json::json!(
-            { "name" : "acp-agent", "description" : "An agent from ACP" }
-        );
+        let json = serde_json::json!({
+            "name": "acp-agent",
+            "description": "An agent from ACP"
+        });
         let def = AgentDefinition::from_json(&json).unwrap();
         assert_eq!(def.name, "acp-agent");
         assert_eq!(def.description, "An agent from ACP");
@@ -2260,12 +2367,26 @@ description: Test default tool config
         assert_eq!(def.scope, AgentScope::BuiltIn);
     }
     #[test]
+    fn same_name_acp_definition_does_not_enable_browser_verification() {
+        let def = AgentDefinition::from_json(&serde_json::json!({
+            "name": "grok-build-plan",
+            "description": "Custom plan agent"
+        }))
+        .unwrap();
+        assert!(!def.include_browser_verification());
+        assert!(AgentDefinition::grok_build_plan().include_browser_verification());
+        assert!(AgentDefinition::grok_build_plan_no_subagents().include_browser_verification());
+    }
+    #[test]
     fn test_from_json_has_default_toolset_with_task_tool() {
-        let json = serde_json::json!(
-            { "name" : "grok-build", "description" : "Multi-surface coding agent.",
-            "promptMode" : "extend", "permissionMode" : "dontAsk", "agentsMd" : true,
-            "promptBody" : "You are a coding assistant." }
-        );
+        let json = serde_json::json!({
+            "name": "grok-build",
+            "description": "Multi-surface coding agent.",
+            "promptMode": "extend",
+            "permissionMode": "dontAsk",
+            "agentsMd": true,
+            "promptBody": "You are a coding assistant."
+        });
         let def = AgentDefinition::from_json(&json).unwrap();
         let task_tool_id = "GrokBuild:task";
         assert!(
@@ -2281,10 +2402,11 @@ description: Test default tool config
     }
     #[test]
     fn test_from_json_with_prompt_body() {
-        let json = serde_json::json!(
-            { "name" : "custom-agent", "description" : "Agent with prompt body",
-            "promptBody" : "You are a specialized coding assistant.\n\nFocus on Rust." }
-        );
+        let json = serde_json::json!({
+            "name": "custom-agent",
+            "description": "Agent with prompt body",
+            "promptBody": "You are a specialized coding assistant.\n\nFocus on Rust."
+        });
         let def = AgentDefinition::from_json(&json).unwrap();
         assert_eq!(def.name, "custom-agent");
         assert_eq!(
@@ -2294,20 +2416,23 @@ description: Test default tool config
     }
     #[test]
     fn test_from_json_with_permission_mode() {
-        let json = serde_json::json!(
-            { "name" : "auto-accept-agent", "description" :
-            "Agent with dontAsk permission mode", "permissionMode" : "dontAsk",
-            "promptBody" : "## Auto-accept Mode" }
-        );
+        let json = serde_json::json!({
+            "name": "auto-accept-agent",
+            "description": "Agent with dontAsk permission mode",
+            "permissionMode": "dontAsk",
+            "promptBody": "## Auto-accept Mode"
+        });
         let def = AgentDefinition::from_json(&json).unwrap();
         assert_eq!(def.permission_mode, PermissionMode::DontAsk);
         assert_eq!(def.prompt_body.as_deref(), Some("## Auto-accept Mode"));
     }
     #[test]
     fn test_from_json_empty_prompt_body_is_none() {
-        let json = serde_json::json!(
-            { "name" : "test", "description" : "Test", "promptBody" : "   " }
-        );
+        let json = serde_json::json!({
+            "name": "test",
+            "description": "Test",
+            "promptBody": "   "
+        });
         let def = AgentDefinition::from_json(&json).unwrap();
         assert!(
             def.prompt_body.is_none(),
@@ -2316,16 +2441,20 @@ description: Test default tool config
     }
     #[test]
     fn test_from_json_missing_required_fields() {
-        let json = serde_json::json!({ "description" : "Missing name" });
+        let json = serde_json::json!({
+            "description": "Missing name"
+        });
         let result = AgentDefinition::from_json(&json);
         assert!(result.is_err());
     }
     #[test]
     fn test_from_json_ignores_unknown_fields() {
-        let json = serde_json::json!(
-            { "name" : "test", "description" : "Test", "unknownField" : "value",
-            "futureFeature" : true }
-        );
+        let json = serde_json::json!({
+            "name": "test",
+            "description": "Test",
+            "unknownField": "value",
+            "futureFeature": true
+        });
         let def = AgentDefinition::from_json(&json).unwrap();
         assert_eq!(def.name, "test");
     }
@@ -2403,9 +2532,11 @@ description: Test default tool config
     }
     #[test]
     fn test_model_override_in_json() {
-        let json = serde_json::json!(
-            { "name" : "test", "description" : "Test", "model" : "grok-code-fast-1" }
-        );
+        let json = serde_json::json!({
+            "name": "test",
+            "description": "Test",
+            "model": "grok-code-fast-1"
+        });
         let def = AgentDefinition::from_json(&json).unwrap();
         assert_eq!(
             def.model,
@@ -2511,10 +2642,11 @@ description: Test default tool config
     }
     #[test]
     fn mcp_inheritance_round_trips_via_json() {
-        let json = serde_json::json!(
-            { "name" : "t", "description" : "t", "mcpInheritance" : { "named" : ["a",
-            "b"] } }
-        );
+        let json = serde_json::json!({
+            "name": "t",
+            "description": "t",
+            "mcpInheritance": {"named": ["a", "b"]}
+        });
         let def = AgentDefinition::from_json(&json).unwrap();
         assert_eq!(
             def.mcp_inheritance,

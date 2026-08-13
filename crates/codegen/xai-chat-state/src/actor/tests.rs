@@ -6,6 +6,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use xai_grok_sampling_types::{ConversationItem, SamplingConfig};
 
+use crate::StrictAppendAck;
 use crate::actor::ChatStateActor;
 use crate::events::ChatStateEvent;
 use crate::persistence::{MockChatPersistence, MockPersistenceReceiver, PersistenceRecord};
@@ -24,6 +25,8 @@ fn test_config_with_window(context_window: u64) -> SamplingConfig {
         top_p: None,
         api_backend: Default::default(),
         extra_headers: Default::default(),
+        query_params: Default::default(),
+        env_http_headers: Default::default(),
         context_window: NonZeroU64::new(context_window)
             .expect("test context_window must be non-zero"),
         reasoning_effort: None,
@@ -54,11 +57,23 @@ impl TestHarness {
 
     fn with_config(items: Vec<ConversationItem>, config: SamplingConfig) -> Self {
         let (mock, persistence_rx) = MockChatPersistence::new();
+        Self::with_persistence(items, config, mock, persistence_rx)
+    }
+
+    fn with_manual_persistence_ack(items: Vec<ConversationItem>) -> Self {
+        let (mock, persistence_rx) = MockChatPersistence::new_with_manual_persistence_ack();
+        Self::with_persistence(items, test_config(), mock, persistence_rx)
+    }
+
+    fn with_persistence(
+        items: Vec<ConversationItem>,
+        config: SamplingConfig,
+        mock: MockChatPersistence,
+        persistence_rx: MockPersistenceReceiver,
+    ) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let token = tokio_util::sync::CancellationToken::new();
-
         let handle = ChatStateActor::spawn(items, config, Box::new(mock), event_tx, token.clone());
-
         Self {
             handle,
             event_rx,
@@ -156,6 +171,249 @@ async fn push_user_message_and_ack_waits_for_actor_acceptance() {
 }
 
 #[tokio::test]
+async fn strict_switch_append_preserves_prefix_and_deduplicates_generation() {
+    let prefix = vec![
+        ConversationItem::system("sys"),
+        ConversationItem::assistant("assistant"),
+        ConversationItem::tool_result("dangling", "must remain"),
+    ];
+    let prefix_json: Vec<Vec<u8>> = prefix
+        .iter()
+        .map(|item| serde_json::to_vec(item).unwrap())
+        .collect();
+    let mut h = TestHarness::with_conversation(prefix);
+    let reminder = ConversationItem::working_directory_switch("moved", 3);
+
+    assert!(matches!(
+        h.handle
+            .append_working_directory_switch_and_ack(
+                "moved".into(),
+                std::num::NonZeroU64::new(3).unwrap(),
+            )
+            .await
+            .unwrap(),
+        StrictAppendAck::Appended
+    ));
+    let conversation = h.handle.get_conversation().await;
+    assert_eq!(conversation.len(), 4);
+    for (actual, expected) in conversation.iter().zip(&prefix_json) {
+        assert_eq!(serde_json::to_vec(actual).unwrap(), *expected);
+    }
+    assert_eq!(
+        serde_json::to_vec(&conversation[3]).unwrap(),
+        serde_json::to_vec(&reminder).unwrap()
+    );
+    assert!(matches!(
+        h.drain_persistence().as_slice(),
+        [PersistenceRecord::AcknowledgedMessage(_)]
+    ));
+
+    assert!(matches!(
+        h.handle
+            .append_working_directory_switch_and_ack(
+                "different text".into(),
+                std::num::NonZeroU64::new(3).unwrap(),
+            )
+            .await
+            .unwrap(),
+        StrictAppendAck::AlreadyPresent(_)
+    ));
+    assert_eq!(h.handle.get_conversation().await.len(), 4);
+    assert!(matches!(
+        h.drain_persistence().as_slice(),
+        [PersistenceRecord::AcknowledgedMessage(_)]
+    ));
+
+    assert!(matches!(
+        h.handle
+            .append_working_directory_switch_and_ack(
+                "next move".into(),
+                std::num::NonZeroU64::new(4).unwrap(),
+            )
+            .await
+            .unwrap(),
+        StrictAppendAck::Appended
+    ));
+    assert_eq!(h.handle.get_conversation().await.len(), 5);
+}
+
+#[tokio::test]
+async fn strict_switch_append_ack_waits_for_persistence() {
+    let mut h = TestHarness::with_manual_persistence_ack(vec![]);
+    let handle = h.handle.clone();
+    let task = tokio::spawn(async move {
+        handle
+            .append_working_directory_switch_and_ack(
+                "moved".into(),
+                std::num::NonZeroU64::new(1).unwrap(),
+            )
+            .await
+    });
+    let persistence_ack = h
+        .persistence_rx
+        .next_persistence_ack()
+        .await
+        .expect("acknowledged append requested");
+    assert!(matches!(
+        h.drain_persistence().as_slice(),
+        [PersistenceRecord::AcknowledgedMessage(_)]
+    ));
+    assert!(!task.is_finished(), "actor ack must wait for persistence");
+    persistence_ack.send(Ok(StrictAppendAck::Appended)).unwrap();
+    assert!(matches!(
+        task.await.unwrap().unwrap(),
+        StrictAppendAck::Appended
+    ));
+}
+
+#[tokio::test]
+async fn committed_storage_result_converges_actor_memory() {
+    let mut h = TestHarness::with_manual_persistence_ack(vec![]);
+    let handle = h.handle.clone();
+    let task = tokio::spawn(async move {
+        handle
+            .append_working_directory_switch_and_ack(
+                "moved".into(),
+                std::num::NonZeroU64::new(2).unwrap(),
+            )
+            .await
+    });
+    let persistence_ack = h.persistence_rx.next_persistence_ack().await.unwrap();
+    persistence_ack
+        .send(Err(crate::StrictAppendError::Committed {
+            acknowledgement: StrictAppendAck::Appended,
+            source: std::io::Error::other("summary failed"),
+        }))
+        .unwrap();
+    let result = task.await.unwrap();
+    assert!(matches!(
+        result,
+        Err(crate::StrictAppendError::Committed {
+            acknowledgement: StrictAppendAck::Appended,
+            ..
+        })
+    ));
+    let conversation = h.handle.get_conversation().await;
+    assert_eq!(conversation.len(), 1);
+    assert_eq!(
+        conversation[0].working_directory_switch_generation(),
+        Some(2)
+    );
+}
+
+#[tokio::test]
+async fn already_present_replaces_stale_switch_in_actor_memory() {
+    let generation = NonZeroU64::new(3).unwrap();
+    let mut h =
+        TestHarness::with_manual_persistence_ack(vec![ConversationItem::working_directory_switch(
+            "stale",
+            generation.get(),
+        )]);
+    let handle = h.handle.clone();
+    let task = tokio::spawn(async move {
+        handle
+            .append_working_directory_switch_and_ack("candidate".into(), generation)
+            .await
+    });
+    h.persistence_rx
+        .next_persistence_ack()
+        .await
+        .unwrap()
+        .send(Ok(StrictAppendAck::AlreadyPresent(
+            ConversationItem::working_directory_switch("authoritative", generation.get()),
+        )))
+        .unwrap();
+
+    assert!(matches!(
+        task.await.unwrap().unwrap(),
+        StrictAppendAck::AlreadyPresent(item) if item.text_content() == "authoritative"
+    ));
+    let conversation = h.handle.get_conversation().await;
+    assert_eq!(conversation.len(), 1);
+    assert_eq!(conversation[0].text_content(), "authoritative");
+}
+
+#[tokio::test]
+async fn committed_already_present_replaces_retry_candidate_in_actor_memory() {
+    let generation = NonZeroU64::new(4).unwrap();
+    let mut h =
+        TestHarness::with_manual_persistence_ack(vec![ConversationItem::working_directory_switch(
+            "retry candidate",
+            generation.get(),
+        )]);
+    let handle = h.handle.clone();
+    let task = tokio::spawn(async move {
+        handle
+            .append_working_directory_switch_and_ack("another retry".into(), generation)
+            .await
+    });
+    h.persistence_rx
+        .next_persistence_ack()
+        .await
+        .unwrap()
+        .send(Err(crate::StrictAppendError::Committed {
+            acknowledgement: StrictAppendAck::AlreadyPresent(
+                ConversationItem::working_directory_switch("authoritative", generation.get()),
+            ),
+            source: std::io::Error::other("summary failed"),
+        }))
+        .unwrap();
+
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(crate::StrictAppendError::Committed {
+            acknowledgement: StrictAppendAck::AlreadyPresent(item),
+            ..
+        }) if item.text_content() == "authoritative"
+    ));
+    let conversation = h.handle.get_conversation().await;
+    assert_eq!(conversation.len(), 1);
+    assert_eq!(conversation[0].text_content(), "authoritative");
+}
+
+#[tokio::test]
+async fn dropped_storage_reply_is_indeterminate_and_leaves_memory_unchanged() {
+    let mut h = TestHarness::with_manual_persistence_ack(vec![]);
+    let handle = h.handle.clone();
+    let task = tokio::spawn(async move {
+        handle
+            .append_working_directory_switch_and_ack(
+                "moved".into(),
+                std::num::NonZeroU64::new(2).unwrap(),
+            )
+            .await
+    });
+    drop(h.persistence_rx.next_persistence_ack().await.unwrap());
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(crate::StrictAppendError::Indeterminate(_))
+    ));
+    assert!(h.handle.get_conversation().await.is_empty());
+}
+
+#[tokio::test]
+async fn uncommitted_storage_error_leaves_actor_memory_unchanged() {
+    let mut h = TestHarness::with_manual_persistence_ack(vec![]);
+    let handle = h.handle.clone();
+    let task = tokio::spawn(async move {
+        handle
+            .append_working_directory_switch_and_ack(
+                "moved".into(),
+                std::num::NonZeroU64::new(2).unwrap(),
+            )
+            .await
+    });
+    let persistence_ack = h.persistence_rx.next_persistence_ack().await.unwrap();
+    persistence_ack
+        .send(Err(crate::StrictAppendError::NotCommitted(
+            std::io::Error::other("append failed"),
+        )))
+        .unwrap();
+    assert!(task.await.unwrap().is_err());
+    assert!(h.handle.get_conversation().await.is_empty());
+}
+
+#[tokio::test]
 async fn push_assistant_response_appends_and_persists() {
     let mut h = TestHarness::new();
     h.handle
@@ -210,6 +468,7 @@ async fn record_last_turn_usage_round_trip() {
         total_tokens: 1290,
         reasoning_tokens: 0,
         cached_prompt_tokens: 800,
+        cache_creation_prompt_tokens: 0,
     };
     h.handle.record_last_turn_usage(usage.clone());
 
@@ -225,6 +484,7 @@ async fn record_last_turn_usage_round_trip() {
         total_tokens: 10000,
         reasoning_tokens: 0,
         cached_prompt_tokens: 0,
+        cache_creation_prompt_tokens: 0,
     };
     h.handle.record_last_turn_usage(next);
     let got2 = h
@@ -246,6 +506,7 @@ async fn prompt_usage_ledger_via_handle_resets_and_clears() {
         total_tokens: 12,
         reasoning_tokens: 0,
         cached_prompt_tokens: 0,
+        cache_creation_prompt_tokens: 0,
     };
 
     let h = TestHarness::new();
@@ -462,6 +723,162 @@ async fn replace_conversation_persists_and_emits_reset() {
     let records = h.drain_persistence();
     assert_eq!(records.len(), 1);
     assert!(matches!(&records[0], PersistenceRecord::ReplaceHistory(_)));
+}
+
+#[tokio::test]
+async fn strip_conversation_images_replaces_only_listed_urls_and_persists() {
+    let mut user = match ConversationItem::user("look at this") {
+        ConversationItem::User(u) => u,
+        _ => unreachable!(),
+    };
+    user.add_image("data:image/png;base64,AAAA");
+    let mut later = match ConversationItem::user("and this one") {
+        ConversationItem::User(u) => u,
+        _ => unreachable!(),
+    };
+    later.add_image("data:image/png;base64,BBBB");
+    let mut h = TestHarness::with_conversation(vec![
+        ConversationItem::User(user),
+        ConversationItem::User(later),
+    ]);
+
+    let outcome = h
+        .handle
+        .strip_conversation_images(vec!["data:image/png;base64,AAAA".into()])
+        .await;
+    assert_eq!(
+        outcome,
+        crate::StripOutcome::Applied { stripped: 1 },
+        "ack must carry the disk-applied count"
+    );
+
+    let conv = h.handle.get_conversation().await; // sync point
+    assert_eq!(
+        conv.len(),
+        2,
+        "in-place strip must not add or remove conversation items"
+    );
+    let ConversationItem::User(u) = &conv[0] else {
+        panic!("expected user item");
+    };
+    assert!(
+        u.content
+            .iter()
+            .all(|p| !matches!(p, xai_grok_sampling_types::ContentPart::Image { .. })),
+        "listed image part must be replaced"
+    );
+    let ConversationItem::User(survivor) = &conv[1] else {
+        panic!("expected user item");
+    };
+    assert!(
+        survivor
+            .content
+            .iter()
+            .any(|p| matches!(p, xai_grok_sampling_types::ContentPart::Image { .. })),
+        "unlisted image must survive the scoped strip"
+    );
+
+    let records = h.drain_persistence();
+    // The recoverability contract: strip rewrites go through the single
+    // backup-gated flavor, never the plain, unguarded ReplaceHistory.
+    assert!(
+        records
+            .iter()
+            .any(|r| matches!(r, PersistenceRecord::ReplaceHistoryForStrip(_))),
+        "strip must persist via the backup-gated flavor, got {records:?}"
+    );
+    assert!(
+        !records
+            .iter()
+            .any(|r| matches!(r, PersistenceRecord::ReplaceHistory(_))),
+        "strip must not use the unguarded replace, got {records:?}"
+    );
+}
+
+#[tokio::test]
+async fn strip_conversation_images_does_not_reseed_provider_tokens() {
+    let mut user = match ConversationItem::user("look at this") {
+        ConversationItem::User(u) => u,
+        _ => unreachable!(),
+    };
+    user.add_image("data:image/png;base64,AAAA");
+    let mut h = TestHarness::with_conversation(vec![ConversationItem::User(user)]);
+    h.handle.record_token_usage(100_000);
+    let _ = h.handle.get_total_tokens().await;
+    h.drain_events();
+
+    let outcome = h
+        .handle
+        .strip_conversation_images(vec!["data:image/png;base64,AAAA".into()])
+        .await;
+    assert_eq!(
+        outcome,
+        crate::StripOutcome::Applied { stripped: 1 },
+        "ack must carry the disk-applied count"
+    );
+
+    assert_eq!(
+        h.handle.get_total_tokens().await,
+        100_000,
+        "provider total must survive a surgical strip"
+    );
+    assert!(
+        !h.drain_events()
+            .iter()
+            .any(|e| matches!(e, ChatStateEvent::ConversationReset { .. })),
+        "strip must not emit ConversationReset"
+    );
+}
+
+/// The honest-failure half of the contract: a failed disk write must
+/// surface as WriteFailed (never as Applied), so nobody tells the user a
+/// still-poisoned file was cleaned.
+#[tokio::test]
+async fn strip_conversation_images_reports_write_failure() {
+    let mut user = match ConversationItem::user("look at this") {
+        ConversationItem::User(u) => u,
+        _ => unreachable!(),
+    };
+    user.add_image("data:image/png;base64,AAAA");
+    let (mock, persistence_rx) = MockChatPersistence::new_failing_strip_writes();
+    let h = TestHarness::with_persistence(
+        vec![ConversationItem::User(user)],
+        test_config(),
+        mock,
+        persistence_rx,
+    );
+
+    let outcome = h
+        .handle
+        .strip_conversation_images(vec!["data:image/png;base64,AAAA".into()])
+        .await;
+    assert_eq!(
+        outcome,
+        crate::StripOutcome::WriteFailed { stripped: 1 },
+        "a failed disk write must never read as Applied"
+    );
+}
+
+#[tokio::test]
+async fn strip_conversation_images_is_a_noop_without_images() {
+    let mut h = TestHarness::with_conversation(vec![ConversationItem::user("plain text")]);
+
+    let outcome = h
+        .handle
+        .strip_conversation_images(vec!["data:image/png;base64,AAAA".into()])
+        .await;
+    assert_eq!(
+        outcome,
+        crate::StripOutcome::NoMatch,
+        "no match must be typed, not a fake success"
+    );
+
+    let conv = h.handle.get_conversation().await; // sync point
+    assert_eq!(conv.len(), 1);
+    assert!(
+        h.drain_persistence().is_empty(),
+        "no images stripped must mean no persistence write"
+    );
 }
 
 #[tokio::test]
@@ -914,6 +1331,8 @@ async fn update_sampling_config_is_queryable() {
         top_p: None,
         api_backend: Default::default(),
         extra_headers: Default::default(),
+        query_params: Default::default(),
+        env_http_headers: Default::default(),
         context_window: NonZeroU64::new(200_000).unwrap(),
         reasoning_effort: None,
         stream_tool_calls: None,
@@ -1299,6 +1718,8 @@ async fn build_request_uses_sampling_config() {
         top_p: Some(0.9),
         api_backend: Default::default(),
         extra_headers: Default::default(),
+        query_params: Default::default(),
+        env_http_headers: Default::default(),
         context_window: NonZeroU64::new(128_000).unwrap(),
         reasoning_effort: None,
         stream_tool_calls: None,
@@ -2717,6 +3138,43 @@ async fn get_last_assistant_text_skips_whitespace_only() {
 }
 
 #[tokio::test]
+async fn get_last_assistant_text_in_turn_stops_at_boundary() {
+    let h = TestHarness::new();
+    h.handle.push_user_message(ConversationItem::user("q1"));
+    h.handle
+        .push_assistant_response(ConversationItem::assistant("previous turn answer"));
+    h.handle.push_user_message(ConversationItem::user("q2"));
+
+    assert!(h.handle.get_last_assistant_text_in_turn().await.is_none());
+    assert_eq!(
+        h.handle.get_last_assistant_text().await.as_deref(),
+        Some("previous turn answer"),
+        "the unbounded sibling still sees prior turns"
+    );
+}
+
+#[tokio::test]
+async fn get_last_assistant_text_in_turn_walks_past_synthetic_injections() {
+    let h = TestHarness::new();
+    h.handle.push_user_message(ConversationItem::user("q"));
+    h.handle
+        .push_assistant_response(ConversationItem::assistant("turn answer"));
+    h.handle
+        .push_user_message(ConversationItem::stop_hook_feedback("keep working"));
+
+    assert_eq!(
+        h.handle.get_last_assistant_text_in_turn().await.as_deref(),
+        Some("turn answer"),
+        "synthetic mid-turn items must not act as turn boundaries"
+    );
+
+    // A turn-starting synthetic item (auto-wake) IS a boundary.
+    h.handle
+        .push_user_message(ConversationItem::task_completed("task done"));
+    assert!(h.handle.get_last_assistant_text_in_turn().await.is_none());
+}
+
+#[tokio::test]
 async fn get_last_assistant_text_no_assistant_messages() {
     let h = TestHarness::new();
     h.handle.push_user_message(ConversationItem::user("hi"));
@@ -3403,6 +3861,8 @@ async fn sampling_config_survives_compaction_replacement() {
         top_p: Some(0.95),
         api_backend: ApiBackend::Responses,
         extra_headers: Default::default(),
+        query_params: Default::default(),
+        env_http_headers: Default::default(),
         context_window: NonZeroU64::new(500_000).unwrap(),
         reasoning_effort: None,
         stream_tool_calls: None,
@@ -3486,6 +3946,8 @@ async fn model_metadata_lost_after_compaction_then_recovered_on_next_turn() {
         top_p: Some(0.95),
         api_backend: Default::default(),
         extra_headers: Default::default(),
+        query_params: Default::default(),
+        env_http_headers: Default::default(),
         context_window: NonZeroU64::new(500_000).unwrap(),
         reasoning_effort: None,
         stream_tool_calls: None,
@@ -3574,6 +4036,8 @@ async fn context_window_downgrade_triggers_auto_compact() {
         top_p: Some(0.95),
         api_backend: ApiBackend::Responses,
         extra_headers: Default::default(),
+        query_params: Default::default(),
+        env_http_headers: Default::default(),
         context_window: NonZeroU64::new(500_000).unwrap(),
         reasoning_effort: None,
         stream_tool_calls: None,
@@ -3998,7 +4462,7 @@ async fn prefix_stable_after_image_pruning() {
     // Large enough that the serialized body crosses the compaction trigger.
     let big_image_url = format!(
         "data:image/png;base64,{}",
-        "A".repeat(crate::actor::request_builder::IMAGE_COMPACT_TRIGGER_BYTES)
+        "A".repeat(crate::image_budget::IMAGE_COMPACT_TRIGGER_BYTES)
     );
 
     let h = TestHarness::with_conversation(vec![
@@ -4135,6 +4599,75 @@ async fn build_request_preserves_small_old_images() {
         image_retained,
         "a small old image must be preserved, not stripped to a placeholder"
     );
+}
+
+#[tokio::test]
+async fn build_request_budgets_tool_images_on_request_copy_only() {
+    use xai_grok_sampling_types::{ContentPart, ToolCall};
+
+    let image_url = format!(
+        "data:image/png;base64,{}",
+        "A".repeat(crate::image_budget::IMAGE_COMPACT_TRIGGER_BYTES)
+    );
+    let source = vec![
+        ConversationItem::assistant_tool_calls(vec![ToolCall {
+            id: "call-1".into(),
+            name: "read_file".into(),
+            arguments: r#"{"target_file":"image.png"}"#.into(),
+        }]),
+        ConversationItem::tool_result_with_images(
+            "call-1",
+            "tool text",
+            vec![ContentPart::Image {
+                url: image_url.into(),
+            }],
+        ),
+    ];
+    let source_bytes = serde_json::to_vec(&source).unwrap().len();
+    let mut h = TestHarness::with_conversation(source);
+    let request = h
+        .handle
+        .build_request(vec![], None, false, None, "c".into(), "r".into())
+        .await
+        .unwrap();
+    let event = h.next_event().await;
+    let canonical = h.handle.get_conversation().await;
+
+    let ChatStateEvent::ImageBudget {
+        body_bytes,
+        body_bytes_after,
+        inline_images,
+        needs_image_compaction,
+        evicted,
+        ..
+    } = event
+    else {
+        panic!("expected image budget event");
+    };
+    assert_eq!(body_bytes, source_bytes);
+    assert_eq!(
+        body_bytes_after,
+        serde_json::to_vec(&request.items).unwrap().len()
+    );
+    assert_eq!(inline_images, 1);
+    assert!(needs_image_compaction);
+    assert_eq!(evicted, 1);
+    let ConversationItem::ToolResult(request_result) = &request.items[1] else {
+        panic!("expected request tool result");
+    };
+    assert!(request_result.images.is_empty());
+    assert_eq!(request_result.tool_call_id, "call-1");
+    assert!(request_result.content.starts_with("tool text\n\n"));
+    assert!(
+        request_result
+            .content
+            .contains("images from this tool result were removed")
+    );
+    let ConversationItem::ToolResult(canonical_result) = &canonical[1] else {
+        panic!("expected canonical tool result");
+    };
+    assert_eq!(canonical_result.images.len(), 1);
+    assert_eq!(canonical_result.content.as_ref(), "tool text");
 }
 
 /// Prefix stability after tool result pruning. When context utilization

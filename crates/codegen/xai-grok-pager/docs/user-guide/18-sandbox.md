@@ -45,6 +45,18 @@ To block specific files (e.g. `.env` or credential paths) on top of a profile, d
 
 **strict** -- The most restrictive profile, for reviewing untrusted code. The agent can only read files within the current working directory and essential system paths. Writes are limited to CWD, `~/.grok/`, and temp directories. Child-process network access is blocked on Linux (no-op on macOS).
 
+### Direct global hook write protection
+
+Under `workspace`, `read-only`, and `strict` (and custom profiles that extend those bases), the Grok state directory remains writable for session/runtime files, but the kernel **write-denies** the Grok-owned direct disk paths used as user-global hook sources (they stay readable):
+
+- `~/.grok/hooks/` (hook directory)
+- `~/.grok/hooks-paths` (registry file; not loaded as hook JSON — only its absolute targets are)
+- Absolute targets listed in `hooks-paths` (relative lines are ignored; missing targets refuse sandbox start)
+
+On first launch under these profiles, Grok creates a real empty `hooks/` directory and empty `hooks-paths` file when they are missing (never symlinks or wrong types). Claude/Cursor global settings are **not** covered by this write-deny; discovery of those vendors remains separately gated by compatibility settings.
+
+A symlinked `$GROK_HOME` or a `hooks-paths` entry with a symlink component is refused at sandbox start (prevents retargeting). Existing parent directories of protected paths are pinned so they cannot be renamed out from under the deny (siblings remain writable). On Linux, nested user namespaces are disabled inside bubblewrap so mount binds cannot be rearranged. Project hooks remain gated by folder trust. The `devbox` profile does not apply this protection (disposable VMs). Profiles that require it refuse to start if the kernel policy cannot be applied (including Linux without verified read-only mounts).
+
 ---
 
 ## Custom Profiles
@@ -75,7 +87,7 @@ grok --sandbox project
 
 A custom profile can't reuse a built-in name. `--sandbox devbox` always runs the built-in `devbox` profile, shadowing any `[profiles.devbox]` you define.
 
-When the global and per-project files define the same custom profile name, the user-level definition takes precedence and the project definition is ignored. If those two definitions differ, Grok warns about the conflict at startup — on the welcome screen in the TUI, and on stderr for headless runs. Identical duplicate definitions do not produce a warning.
+If the user and project files define the same custom profile differently, Grok uses the user profile and shows a startup warning. Run `/doctor` to see both file locations and how to resolve the conflict. Identical definitions do not produce a warning.
 
 ### Custom Profile Fields
 
@@ -86,6 +98,16 @@ When the global and per-project files define the same custom profile name, the u
 | `read_only`        | String[] | Additional read-only paths                           |
 | `read_write`       | String[] | Additional read-write paths                          |
 | `deny`             | String[] | Paths or globs to kernel-deny (read + write/rename; see notes). An entry with `*`, `?`, or `[` is a glob |
+
+> **Note on `read_only` / `read_write`:** These are **literal directory grants**,
+> not globs. A trailing `/**` (or `/*`) is treated as the parent directory, so
+> `…/cache/**` grants `…/cache` (and a bare `/**` grants `/`). Any entry that
+> still contains `*`, `?`, or `[` after that (e.g. `/home/**/cache`, or a
+> directory literally named `dir[1]`) is skipped with a warning — list the
+> concrete directories you need, or put globs under `deny`. Entries with
+> leading or trailing whitespace are also skipped with a warning: whitespace
+> is significant in literal paths, so fix the entry rather than relying on
+> trimming.
 
 > **Note on `deny`:** A non-empty `deny` list is **kernel-enforced**. Denied paths
 > are **read-denied and write/rename-denied** via Seatbelt on macOS and a bwrap
@@ -109,25 +131,34 @@ When the global and per-project files define the same custom profile name, the u
 > - `[abc]` / `[a-z]` — character classes; a leading `!` **or** `^` negates
 >   (`[!a]` and `[^a]` both mean "not `a`")
 >
-> Brace alternation (`{a,b}`), backslash-escapes, and the unusual class forms
-> `[]…]` (literal `]` first) and POSIX `[[:…:]]` are **not** supported, so the two
-> platforms can never interpret a glob differently. A glob using an unsupported
+> Brace alternation (`{a,b}`), backslash-escapes, empty path segments (a
+> doubled `//` or a trailing `/`), `.` or `..` segments, and the unusual class
+> forms `[]…]` (literal `]` first) and POSIX `[[:…:]]` are **not** supported,
+> so the two platforms
+> can never interpret a glob differently. A glob using an unsupported
 > metacharacter, or one that is malformed, makes Grok **refuse to start** (fail
 > closed) on **both** platforms — write `*.pem` and `*.key` as separate entries
 > rather than `*.{pem,key}`.
 >
 > Relative globs are anchored at the workspace; absolute globs (e.g.
 > `/home/**/.ssh`) at their literal prefix. Non-glob entries keep exact-path
-> matching. Enforcement otherwise differs by platform:
+> matching. A relative glob matches **only inside the workspace**. To deny
+> files elsewhere, write the entry as an absolute path. Enforcement otherwise
+> differs by platform:
 >
 > - **macOS is airtight:** each glob becomes a Seatbelt regex applied at runtime,
 >   so matching files are denied **even if created after Grok starts**.
 > - **Linux is best-effort:** a mount namespace can't glob at runtime, so each
 >   glob is expanded to the files that **exist at launch** and those are bound
 >   over. Files created **later** that match a glob are **not** covered — name
->   exact paths for anything that must be airtight on Linux. A glob that matches
->   too many files, or whose tree is too deep/broad to walk, makes Grok **refuse
->   to start** rather than under-enforce.
+>   exact paths for anything that must be airtight on Linux. A matched symlink
+>   is masked together with its resolved target. A glob that matches too many
+>   files, or whose tree is too deep or broad to scan, makes Grok **refuse to
+>   start** rather than under-enforce; the error names the globs and the
+>   directory where the scan stopped. The launch scan starts at each glob's
+>   literal prefix and includes gitignored and hidden files, so on very large
+>   workspaces prefer anchored globs (`certs/**/*.pem` scans only `certs/`)
+>   over bare `**` patterns.
 
 ---
 
@@ -138,6 +169,14 @@ The sandbox is applied to the **entire grok process** at startup using kernel pr
 - `read_file`, `search_replace`, `list_dir` -- restricted by Landlock/Seatbelt in-process
 - `bash` commands, `grep` (rg) -- child processes inherit FS restrictions automatically
 - Network -- on Linux, child processes can be blocked via seccomp; on macOS this is a no-op
+
+When a non-`off` sandbox profile is **requested** (CLI, `GROK_SANDBOX`, config, or a managed requirement):
+
+- The agent runs **in-process**, not through the shared leader, so tool calls stay in this process when the profile is enforced. If leader mode would otherwise have been on, a one-line note at startup says so
+- If a built-in profile fails to apply, Grok warns and continues without enforcement (see [Platform Support](#platform-support)), but still refuses the leader so tools are not delegated elsewhere
+- `grok workspace start`, `restart`, and `resume` are unavailable; `pause`, `stop`, and `status` still work
+
+Disable the profile at the source that selected it to use the refused commands.
 
 The sandbox is **irreversible** once applied. The agent cannot relax restrictions at runtime.
 
@@ -188,6 +227,25 @@ In practice, on Linux this means:
 
 - `web_search`, `web_fetch`, and the LLM API always have network access
 - `bash` commands like `curl`, `wget`, and `npm install` are blocked when `restrict_network` is enabled
+
+---
+
+## Shell Environment Policy
+
+The sandbox controls which files and network a subprocess can reach. The top-level `[shell_environment_policy]` table controls which environment variables it inherits, so a tool command the model runs cannot read a secret that happens to sit in your shell environment.
+
+```toml
+[shell_environment_policy]
+inherit = "core"                 # all (default) | core | none
+ignore_default_excludes = false  # also drop *KEY* / *SECRET* / *TOKEN*
+exclude = ["ACME_*", "CI_*"]     # drop these names
+include_only = ["PATH", "HOME"]  # if set, keep only these names
+set = { MY_FLAG = "1" }          # force these values
+```
+
+Grok builds the child environment in order: it starts from `inherit` (`all` keeps everything, `core` keeps a small platform set such as `PATH` and `HOME`, `none` starts empty); drops the built-in secret patterns `*KEY*`, `*SECRET*`, and `*TOKEN*` unless `ignore_default_excludes = true`; drops any `exclude` matches; applies `set`; and, when `include_only` is non-empty, keeps only the matching names. Patterns are case-insensitive globs (`*`, `?`).
+
+The default (`inherit = "all"`, `ignore_default_excludes = true`) leaves the environment untouched, so nothing changes until you configure a policy. On the non-persistent backend the policy also filters variables captured from your login shell, so an `.rc` file export cannot slip a secret past `exclude` or `include_only`. The persistent shell is one exception: it applies the policy to its base environment, but variables that an `.rc` file exports during login are replayed from a snapshot and are not re-filtered, so keep secrets out of shell startup files there. Enforcement covers the bash tool and terminals on macOS, Linux, and Windows.
 
 ---
 
