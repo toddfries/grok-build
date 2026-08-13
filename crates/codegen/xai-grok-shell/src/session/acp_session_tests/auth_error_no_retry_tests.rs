@@ -57,6 +57,7 @@ fn auth_error() -> xai_grok_sampler::SamplingErrorInfo {
         is_retryable: false,
         retry_after_secs: None,
         should_retry: None,
+        error_code: None,
         model_metadata: None,
         empty_response_context: None,
         doom_loop_triggers: None,
@@ -534,6 +535,7 @@ fn model_not_found_error() -> xai_grok_sampler::SamplingErrorInfo {
             is_retryable: false,
             retry_after_secs: None,
             should_retry: None,
+            error_code: None,
             model_metadata: None,
             empty_response_context: None,
             doom_loop_triggers: None,
@@ -570,12 +572,22 @@ async fn legacy_auth_hint_on_404_model_not_found() {
                 "404 with WebLogin must include deprecation message, got: {msg}"
             );
             assert!(
+                msg.contains("grok update"),
+                "hint must mention `grok update` before re-login, got: {msg}"
+            );
+            assert!(
                 msg.contains("grok logout"),
                 "hint must mention `grok logout`, got: {msg}"
             );
             assert!(
                 msg.contains("grok login"),
                 "hint must mention `grok login`, got: {msg}"
+            );
+            let update_at = msg.find("grok update").expect("grok update");
+            let logout_at = msg.find("grok logout").expect("grok logout");
+            assert!(
+                update_at < logout_at,
+                "update must come before logout, got: {msg}"
             );
             assert!(
                 msg.contains("Version:"),
@@ -603,6 +615,7 @@ fn unauthorized_401_error() -> xai_grok_sampler::SamplingErrorInfo {
             is_retryable: false,
             retry_after_secs: None,
             should_retry: None,
+            error_code: None,
             model_metadata: None,
             empty_response_context: None,
             doom_loop_triggers: None,
@@ -641,12 +654,22 @@ async fn legacy_auth_hint_on_401_unauthorized() {
                 "401 with WebLogin must include deprecation message, got: {msg}"
             );
             assert!(
+                msg.contains("grok update"),
+                "hint must mention `grok update` before re-login, got: {msg}"
+            );
+            assert!(
                 msg.contains("grok logout"),
                 "hint must mention `grok logout`, got: {msg}"
             );
             assert!(
                 msg.contains("grok login"),
                 "hint must mention `grok login`, got: {msg}"
+            );
+            let update_at = msg.find("grok update").expect("grok update");
+            let logout_at = msg.find("grok logout").expect("grok logout");
+            assert!(
+                update_at < logout_at,
+                "update must come before logout, got: {msg}"
             );
         })
         .await;
@@ -1120,6 +1143,7 @@ async fn set_session_model_invalidates_byok_memo_for_same_model_id() {
                 api_backend: crate::sampling::ApiBackend::ChatCompletions,
                 auth_scheme: Default::default(),
                 extra_headers: Default::default(),
+                extra_response_includes: Vec::new(),
                 query_params: Default::default(),
                 env_http_headers: Default::default(),
                 context_window: 256_000,
@@ -1213,6 +1237,7 @@ async fn switch_to_first_party_model_drops_minted_provider_token() {
                 api_backend: crate::sampling::ApiBackend::ChatCompletions,
                 auth_scheme: Default::default(),
                 extra_headers: Default::default(),
+                extra_response_includes: Vec::new(),
                 query_params: Default::default(),
                 env_http_headers: Default::default(),
                 context_window: 256_000,

@@ -6,7 +6,9 @@
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Instant;
-use xai_grok_shell::session::storage::{ReplayEmission, stream_replay_updates_at};
+use xai_grok_shell::session::storage::{
+    ReplayEmission, ReplayLookupFallback, ReplayPathHint, stream_replay_updates_at_hinted,
+};
 /// Enriched subagent tracking info.
 ///
 /// Keyed by `child_session_id` in `AgentView::subagent_sessions`.
@@ -40,6 +42,9 @@ pub struct SubagentInfo {
     /// Initialised to `started_at` so that brand-new subagents with
     /// no progress notifications yet still sort correctly.
     pub last_progress_at: Instant,
+    /// Lifecycle dedup tombstone: a child emits one terminal transition, so
+    /// duplicate finishes must not re-finalize it and duplicate spawns must
+    /// never replace this terminal state.
     pub finished: bool,
     /// "completed", "failed", or "cancelled".
     pub status: Option<Arc<str>>,
@@ -172,23 +177,50 @@ fn enrich_from_meta_with_home(
     info.worktree_path = meta.worktree_path.map(Arc::from);
 }
 /// Best-effort replay of a child's inherited conversation, streamed one typed
-/// update at a time so a large inherited transcript is not materialized as a
-/// full `Vec` of typed structs (peak stays near the file size rather than
-/// several multiples of it). No-ops when the child session or file is missing.
+/// update at a time. No-ops when the child session or file is missing.
+///
+/// `child_cwd` is the worktree / custom cwd when known; lookup tries it before
+/// `parent_cwd` so children that persist under their own encoded cwd hit the
+/// fast path instead of a full RelocationView scan.
 pub(crate) fn replay_inherited_updates(
     child_view: &mut crate::app::agent_view::AgentView,
     child_session_id: &str,
+    parent_cwd: &std::path::Path,
+    child_cwd: Option<&std::path::Path>,
+) {
+    replay_inherited_updates_with_fallback(
+        child_view,
+        child_session_id,
+        parent_cwd,
+        child_cwd,
+        ReplayLookupFallback::Relocation,
+    );
+}
+pub(crate) fn replay_inherited_updates_with_fallback(
+    child_view: &mut crate::app::agent_view::AgentView,
+    child_session_id: &str,
+    parent_cwd: &std::path::Path,
+    child_cwd: Option<&std::path::Path>,
+    fallback: ReplayLookupFallback,
 ) {
     let home = effective_grok_home();
     let replay_meta = crate::acp::meta::NotificationMeta {
         is_replay: true,
         ..Default::default()
     };
-    let outcome = match stream_replay_updates_at(child_session_id, &home, |update| {
+    let hint = ReplayPathHint {
+        parent_cwd: Some(parent_cwd),
+        child_cwd,
+        fallback,
+    };
+    child_view.scrollback.begin_batch();
+    let outcome = stream_replay_updates_at_hinted(child_session_id, &home, hint, |update| {
         child_view
             .session
             .handle_update(update, &replay_meta, &mut child_view.scrollback);
-    }) {
+    });
+    child_view.scrollback.end_batch();
+    let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(e) => {
             tracing::warn!(session_id = %child_session_id, error = %e, "failed to read updates for replay");
@@ -277,8 +309,17 @@ pub(crate) fn ensure_subagent_child_replayed(
         .map(std::time::Duration::from_millis);
     let parent_turn_running =
         parent.session.state.is_turn_running() || parent.session.state.is_cancelling();
+    let child_cwd = parent
+        .subagent_sessions
+        .get(child_sid)
+        .and_then(|info| info.child_cwd.clone());
     if let Some(child_view) = parent.subagent_views.get_mut(child_sid) {
-        replay_inherited_updates(child_view, child_sid);
+        replay_inherited_updates(
+            child_view,
+            child_sid,
+            &parent.session.cwd,
+            child_cwd.as_deref().map(std::path::Path::new),
+        );
         if let Some(elapsed) = finished_elapsed {
             finalize_finished_child_view(child_view, elapsed);
         } else if !parent_turn_running {
@@ -291,6 +332,11 @@ pub(crate) fn ensure_subagent_child_replayed(
 }
 /// Finalize a finished child view: end the turn and append the `TurnCompleted`
 /// footer. Shared by the live `SubagentFinished` path and the deferred resume path.
+///
+/// Idempotent on the *trailing* footer: kill reconciliation or a late replay
+/// rebuild that re-finalizes an already-finished child must not append a second
+/// completed line. An earlier turn's `TurnCompleted` deeper in the transcript
+/// must not suppress a later turn's footer.
 pub(crate) fn finalize_finished_child_view(
     child_view: &mut crate::app::agent_view::AgentView,
     elapsed: std::time::Duration,
@@ -300,6 +346,19 @@ pub(crate) fn finalize_finished_child_view(
         .tracker
         .finish_turn(&mut child_view.scrollback);
     child_view.scrollback.finish_all_running();
+    let already_has_trailing_completed_footer = child_view.scrollback.last().is_some_and(|e| {
+        matches!(
+            &e.block,
+            crate::scrollback::block::RenderBlock::SessionEvent(seb)
+                if matches!(
+                    seb.event,
+                    crate::scrollback::blocks::SessionEvent::TurnCompleted { .. }
+                )
+        )
+    });
+    if already_has_trailing_completed_footer {
+        return;
+    }
     child_view
         .scrollback
         .push_block(crate::scrollback::block::RenderBlock::session_event(
@@ -367,7 +426,7 @@ pub(crate) fn format_context_badge(info: &SubagentInfo) -> &str {
 ///
 /// Returns `(Some(tag), rest_after_close_bracket)` if the description begins
 /// with `[<non-empty>]`, otherwise `(None, description)` unchanged.
-fn parse_tag_prefix(description: &str) -> (Option<&str>, &str) {
+pub(crate) fn parse_tag_prefix(description: &str) -> (Option<&str>, &str) {
     if let Some(rest) = description.strip_prefix('[')
         && let Some(close) = rest.find(']')
     {
@@ -483,6 +542,7 @@ pub(crate) fn format_activity_label(activity: &crate::acp::tracker::TurnActivity
         } => {
             format!("Retrying ({attempt}/{max_retries})")
         }
+        TurnActivity::WritingToolCall(writing) => writing.label(),
         TurnActivity::Waiting(reason) => reason.label(),
     }
 }
@@ -763,6 +823,111 @@ mod tests {
             "an empty replay (zero updates parsed) must not purge"
         );
         assert!(parent.subagent_sessions[empty_sid].child_updates_replayed);
+        set_replay_grok_home_for_tests(None);
+    }
+    #[test]
+    fn replay_inherited_updates_batches_and_collapses_tools() {
+        let home = tempfile::tempdir().unwrap();
+        let child_sid = "child-batch";
+        let session_dir = home
+            .path()
+            .join("sessions")
+            .join(urlencoding::encode("/tmp").as_ref())
+            .join(child_sid);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(session_dir.join("summary.json"), "{}").unwrap();
+        let user = format!(
+            r#"{{"method":"session/update","params":{{"sessionId":"{child_sid}","update":{{"sessionUpdate":"user_message_chunk","content":{{"type":"text","text":"go"}}}}}}}}"#
+        );
+        let tool = format!(
+            r#"{{"method":"session/update","params":{{"sessionId":"{child_sid}","update":{{"sessionUpdate":"tool_call","toolCallId":"t1","title":"bash","kind":"execute","status":"pending"}}}}}}"#
+        );
+        let ip = format!(
+            r#"{{"method":"session/update","params":{{"sessionId":"{child_sid}","update":{{"sessionUpdate":"tool_call_update","toolCallId":"t1","status":"in_progress","content":[{{"type":"text","text":"out"}}]}}}}}}"#
+        );
+        let done = format!(
+            r#"{{"method":"session/update","params":{{"sessionId":"{child_sid}","update":{{"sessionUpdate":"tool_call_update","toolCallId":"t1","status":"completed","content":[{{"type":"text","text":"out"}}]}}}}}}"#
+        );
+        let agent_msg = format!(
+            r#"{{"method":"session/update","params":{{"sessionId":"{child_sid}","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"ok"}}}}}}}}"#
+        );
+        std::fs::write(
+            session_dir.join("updates.jsonl"),
+            format!("{user}\n{tool}\n{ip}\n{done}\n{agent_msg}\n"),
+        )
+        .unwrap();
+        set_replay_grok_home_for_tests(Some(home.path().to_path_buf()));
+        let mut view = make_min_child_view();
+        replay_inherited_updates(&mut view, child_sid, std::path::Path::new("/tmp"), None);
+        assert!(
+            !view.scrollback.in_batch(),
+            "end_batch must run after streamed apply"
+        );
+        assert_eq!(
+            view.scrollback.turn_count(),
+            1,
+            "end_batch must rebuild turns once after the stream"
+        );
+        let tools = (0..view.scrollback.len())
+            .filter(|i| {
+                view.scrollback
+                    .entry(*i)
+                    .is_some_and(|e| matches!(e.block, RenderBlock::ToolCall(_)))
+            })
+            .count();
+        assert_eq!(tools, 1, "ToolCall+updates must collapse to one block");
+        set_replay_grok_home_for_tests(None);
+    }
+    #[test]
+    fn replay_inherited_updates_ends_batch_on_read_error() {
+        let home = tempfile::tempdir().unwrap();
+        let child_sid = "child-read-err";
+        let session_dir = home
+            .path()
+            .join("sessions")
+            .join(urlencoding::encode("/tmp").as_ref())
+            .join(child_sid);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(session_dir.join("summary.json"), "{}").unwrap();
+        std::fs::create_dir(session_dir.join("updates.jsonl")).unwrap();
+        set_replay_grok_home_for_tests(Some(home.path().to_path_buf()));
+        let mut view = make_min_child_view();
+        replay_inherited_updates(&mut view, child_sid, std::path::Path::new("/tmp"), None);
+        assert!(
+            !view.scrollback.in_batch(),
+            "end_batch must run after a read error"
+        );
+        set_replay_grok_home_for_tests(None);
+    }
+    #[test]
+    fn replay_inherited_updates_uses_child_cwd_hint() {
+        let home = tempfile::tempdir().unwrap();
+        let child_sid = "child-wt-hint";
+        let child_cwd = "/work/wt";
+        let session_dir = home
+            .path()
+            .join("sessions")
+            .join(xai_grok_config::encode_cwd_dirname(child_cwd))
+            .join(child_sid);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(session_dir.join("summary.json"), "{}").unwrap();
+        let user = format!(
+            r#"{{"method":"session/update","params":{{"sessionId":"{child_sid}","update":{{"sessionUpdate":"user_message_chunk","content":{{"type":"text","text":"from-wt"}}}}}}}}"#
+        );
+        std::fs::write(session_dir.join("updates.jsonl"), format!("{user}\n")).unwrap();
+        set_replay_grok_home_for_tests(Some(home.path().to_path_buf()));
+        let mut view = make_min_child_view();
+        replay_inherited_updates(
+            &mut view,
+            child_sid,
+            std::path::Path::new("/tmp"),
+            Some(std::path::Path::new(child_cwd)),
+        );
+        assert_ne!(
+            view.scrollback.len(),
+            0,
+            "child_cwd hint must locate the worktree transcript"
+        );
         set_replay_grok_home_for_tests(None);
     }
     #[test]
@@ -1062,7 +1227,7 @@ mod tests {
     fn activity_label_waiting_reasons() {
         use crate::acp::tracker::{TurnActivity, WaitingReason};
         assert_eq!(
-            format_activity_label(&TurnActivity::Waiting(WaitingReason::Subagent)),
+            format_activity_label(&TurnActivity::Waiting(WaitingReason::subagent())),
             "Waiting on subagent…",
         );
         assert_eq!(

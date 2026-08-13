@@ -34,7 +34,7 @@ use super::modes::{
     set_permission_mode, set_plan_mode, set_yolo_mode,
 };
 use super::notes::{
-    dispatch_enter_feedback_mode, dispatch_enter_remember_mode,
+    dispatch_enter_remember_mode, dispatch_open_feedback_pane,
     dispatch_save_remember_note_from_modal, dispatch_send_btw, dispatch_send_feedback,
     dispatch_send_recap, dispatch_send_remember_note,
 };
@@ -49,11 +49,9 @@ use super::prompt::{
 use super::queue;
 use super::queue::dispatch_drain_queue;
 use super::rewind::{
-    dispatch_inline_edit_submit, dispatch_rewind, dispatch_rewind_back_to_mode_select,
-    dispatch_rewind_cancel_offer, dispatch_rewind_confirm,
-    dispatch_rewind_conversation_only_confirm, dispatch_rewind_dismiss,
-    dispatch_rewind_dismiss_error, dispatch_rewind_picker_select, dispatch_rewind_select_mode,
-    dispatch_rewind_show_picker,
+    dispatch_inline_edit_submit, dispatch_rewind, dispatch_rewind_cancel_offer,
+    dispatch_rewind_confirm, dispatch_rewind_confirm_never_ask, dispatch_rewind_dismiss,
+    dispatch_rewind_dismiss_error, dispatch_rewind_picker_select, dispatch_rewind_show_picker,
 };
 use super::session::foreign::dispatch_fetch_session_list;
 use super::session::fork::{
@@ -73,22 +71,22 @@ use super::session::load::{
     dispatch_show_session_picker, dispatch_trigger_deep_search, session_picker_entry_matches,
     session_picker_external_filter_active,
 };
-use super::session::modal::dispatch_rename_session;
+use super::session::modal::{dispatch_rename_session, dispatch_reset_session_title};
 use super::settings::setters::{
     clear_default_model, clear_fork_secondary_model, preview_auto_dark_theme,
     preview_auto_light_theme, preview_theme, set_ask_user_question_timeout_enabled,
     set_auto_dark_theme, set_auto_light_theme, set_auto_update, set_collapsed_edit_blocks,
-    set_combine_queued_prompts, set_compact_mode, set_contextual_hint_image_input,
-    set_contextual_hint_plan_mode, set_contextual_hint_send_now, set_contextual_hint_small_screen,
-    set_contextual_hint_ssh_wrap, set_contextual_hint_undo, set_contextual_hint_word_select,
-    set_default_model, set_default_selected_permission, set_display_refresh_auto_cadence,
-    set_fork_secondary_model, set_group_tool_verbs, set_hunk_tracker_mode, set_invert_scroll,
-    set_keep_text_selection, set_max_thoughts_width, set_multiline_mode, set_page_flip_on_send,
-    set_prompt_suggestions, set_remember_tool_approvals, set_render_mermaid,
-    set_respect_manual_folds, set_screen_mode, set_scroll_lines, set_scroll_mode, set_scroll_speed,
-    set_show_thinking_blocks, set_show_tips, set_simple_mode, set_theme, set_timeline,
-    set_timestamps, set_vim_mode, set_voice_capture_mode, set_voice_keybind_enabled,
-    set_voice_stt_language,
+    set_combine_queued_prompts, set_compact_mode, set_confirm_before_rewind,
+    set_contextual_hint_image_input, set_contextual_hint_plan_mode, set_contextual_hint_send_now,
+    set_contextual_hint_small_screen, set_contextual_hint_ssh_wrap, set_contextual_hint_undo,
+    set_contextual_hint_word_select, set_default_model, set_default_selected_permission,
+    set_display_refresh_auto_cadence, set_follow_up_behavior, set_fork_secondary_model,
+    set_group_tool_verbs, set_hunk_tracker_mode, set_invert_scroll, set_keep_text_selection,
+    set_max_thoughts_width, set_multiline_mode, set_page_flip_on_send, set_prompt_suggestions,
+    set_remember_tool_approvals, set_render_mermaid, set_respect_manual_folds, set_screen_mode,
+    set_scroll_lines, set_scroll_mode, set_scroll_speed, set_show_thinking_blocks, set_show_tips,
+    set_simple_mode, set_theme, set_timeline, set_timestamps, set_vim_mode, set_voice_capture_mode,
+    set_voice_keybind_enabled, set_voice_stt_language,
 };
 use super::settings::ui::{
     dispatch_confirm_reset_setting, dispatch_open_command_palette, dispatch_open_howto_guides,
@@ -442,6 +440,11 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
             expected_version,
             new_text,
         } => queue::dispatch_queue_interject_shared(app, id, expected_version, new_text),
+        Action::RunEditedQueuedCommand {
+            local_id,
+            server,
+            text,
+        } => queue::dispatch_run_edited_queued_command(app, local_id, server, text),
         Action::FocusPrompt => {
             with_active_agent(app, |agent| {
                 agent.set_active_pane(ActivePane::Prompt, false);
@@ -1013,6 +1016,7 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         }
         Action::OpenTutorial => dispatch_open_tutorial(app),
         Action::RenameSession { title } => dispatch_rename_session(app, title),
+        Action::ResetSessionTitleToAuto => dispatch_reset_session_title(app),
         Action::ShowContextInfo => dispatch_show_context_info(app),
         Action::ShowUsage => dispatch_show_usage(app),
         Action::ManageBilling => dispatch_manage_billing(app),
@@ -1021,7 +1025,7 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::ShowPlan => dispatch_show_plan(app),
         Action::EnterPlanMode { description } => dispatch_enter_plan_mode(app, description),
         Action::SetPlanMode(kind) => set_plan_mode(app, kind),
-        Action::EnterFeedbackMode => dispatch_enter_feedback_mode(app),
+        Action::OpenFeedbackPane => dispatch_open_feedback_pane(app),
         Action::SendFeedback(text) => dispatch_send_feedback(app, text),
         Action::EnterRememberMode => dispatch_enter_remember_mode(app),
         Action::SendRememberNote(text) => dispatch_send_remember_note(app, text),
@@ -1067,7 +1071,9 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::SetTimestamps(v) => set_timestamps(app, v),
         Action::SetTimeline(v) => set_timeline(app, v),
         Action::SetPageFlipOnSend(v) => set_page_flip_on_send(app, v),
+        Action::SetConfirmBeforeRewind(v) => set_confirm_before_rewind(app, v),
         Action::SetCombineQueuedPrompts(v) => set_combine_queued_prompts(app, v),
+        Action::SetFollowUpBehavior(v) => set_follow_up_behavior(app, v),
         Action::SetSimpleMode(v) => set_simple_mode(app, v),
         Action::SetContextualHintUndo(v) => set_contextual_hint_undo(app, v),
         Action::SetContextualHintPlanMode(v) => set_contextual_hint_plan_mode(app, v),
@@ -1449,14 +1455,10 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::RewindPickerSelect(prompt_index) => {
             dispatch_rewind_picker_select(app, prompt_index)
         }
-        Action::RewindSelectMode(mode, target) => dispatch_rewind_select_mode(app, mode, target),
-        Action::RewindConfirm(target, mode) => dispatch_rewind_confirm(app, target, mode),
-        Action::RewindConversationOnlyConfirm(target) => {
-            dispatch_rewind_conversation_only_confirm(app, target)
-        }
+        Action::RewindConfirm(target) => dispatch_rewind_confirm(app, target),
+        Action::RewindConfirmNeverAsk(target) => dispatch_rewind_confirm_never_ask(app, target),
         Action::RewindCancelOffer => dispatch_rewind_cancel_offer(app),
         Action::RewindDismiss => dispatch_rewind_dismiss(app),
-        Action::RewindBackToModeSelect => dispatch_rewind_back_to_mode_select(app),
         Action::RewindDismissError => dispatch_rewind_dismiss_error(app),
         Action::InlineEditSubmit => dispatch_inline_edit_submit(app),
         Action::JumpShowPicker => dispatch_jump_show_picker(app),

@@ -230,20 +230,64 @@ fn viewer_finalize_stop_reason_to_marker_mapping() {
         Some(SessionEvent::TurnCancelled { .. })
     ));
 
-    // error (+agentResult) → Turn failed carrying the error text.
+    // error (+agentResult) → TurnFailed with formatted text.
     let mut agent = running_viewer("p1");
     let _ = finalize_turn_from_terminal(
         &mut agent,
         "s1",
         Some("p1"),
         Some("error"),
-        Some("boom"),
+        Some(r#"API error (status 500): {"error":"boom"}"#),
         None,
     );
     match last_session_event(&agent.scrollback) {
-        Some(SessionEvent::TurnFailed { error, .. }) => assert_eq!(error, "boom"),
+        Some(SessionEvent::TurnFailed { error, .. }) => {
+            assert_eq!(
+                error,
+                "Server error (500) \u{2014} Something went wrong on our side. Wait a minute and send again."
+            );
+        }
         other => panic!("expected TurnFailed, got {other:?}"),
     }
+
+    // error with a dedicated banner already in the trailing run → the
+    // banner explains the failure; no redundant TurnFailed marker.
+    let mut agent = running_viewer("p1");
+    agent
+        .scrollback
+        .push_block(RenderBlock::session_event(SessionEvent::RequestFailed {
+            status: Some(500),
+            headline: "Server error (500)".into(),
+            detail: String::new(),
+        }));
+    let _ = finalize_turn_from_terminal(&mut agent, "s1", Some("p1"), Some("error"), None, None);
+    assert!(
+        !matches!(
+            last_session_event(&agent.scrollback),
+            Some(SessionEvent::TurnFailed { .. })
+        ),
+        "a trailing RequestFailed banner must suppress the viewer's TurnFailed"
+    );
+
+    // …but a banner buried behind a substantive block is a previous turn's:
+    // the trailing-run scan stops and the marker is pushed.
+    let mut agent = running_viewer("p1");
+    agent
+        .scrollback
+        .push_block(RenderBlock::session_event(SessionEvent::RequestFailed {
+            status: Some(500),
+            headline: "Server error (500)".into(),
+            detail: String::new(),
+        }));
+    agent.scrollback.push_block(RenderBlock::user_prompt("hi"));
+    let _ = finalize_turn_from_terminal(&mut agent, "s1", Some("p1"), Some("error"), None, None);
+    assert!(
+        matches!(
+            last_session_event(&agent.scrollback),
+            Some(SessionEvent::TurnFailed { .. })
+        ),
+        "a banner behind a substantive block must not suppress the marker"
+    );
 
     // rate_limit → finished, but no marker (not actionable from a viewer).
     let mut agent = running_viewer("p1");
@@ -340,6 +384,50 @@ fn repro_terminal_without_prompt_id_arms_reconcile_for_lost_pr() {
     assert_eq!(
         agent.session.tracker.activity(),
         Some(crate::acp::tracker::TurnActivity::Responding)
+    );
+}
+
+/// Armed, the overdue reconcile would force-finish the live turn mid-write.
+#[test]
+fn driver_missing_prompt_id_ignored_during_tool_call_write() {
+    let mut agent = running_driver("p1");
+    assert!(
+        agent
+            .session
+            .tracker
+            .note_tool_call_arguments_delta(Some("spawn_subagent"), 0)
+    );
+    assert!(matches!(
+        agent.session.tracker.activity(),
+        Some(crate::acp::tracker::TurnActivity::WritingToolCall(_))
+    ));
+
+    let outcome = finalize_turn_from_terminal(&mut agent, "s1", None, Some("end_turn"), None, None);
+    assert!(matches!(outcome, TerminalApply::Ignored));
+    assert!(
+        agent.pending_turn_end_reconcile.is_none(),
+        "mid-write terminal must not arm the lost-PR reconcile"
+    );
+    assert!(matches!(agent.session.state, AgentState::TurnRunning));
+}
+
+/// A dead stream mid-write must not block lost-response recovery.
+#[test]
+fn driver_missing_prompt_id_arms_when_tool_call_write_is_stale() {
+    let mut agent = running_driver("p1");
+    agent
+        .session
+        .tracker
+        .note_tool_call_arguments_delta(Some("spawn_subagent"), 0);
+    agent.session.tracker.backdate_last_tool_call_delta(
+        crate::acp::tracker::WRITING_DELTA_STALE_AFTER + std::time::Duration::from_secs(1),
+    );
+
+    let outcome = finalize_turn_from_terminal(&mut agent, "s1", None, Some("end_turn"), None, None);
+    assert!(matches!(outcome, TerminalApply::ReconcileArmed));
+    assert_eq!(
+        agent.pending_turn_end_reconcile.as_ref().unwrap().prompt_id,
+        "p1"
     );
 }
 

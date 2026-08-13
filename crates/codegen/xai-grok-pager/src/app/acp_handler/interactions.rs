@@ -68,13 +68,10 @@ pub(crate) fn handle_ask_user_question(
                 .expect("Cancelled serialization should not fail");
             old_tx.send(Ok(acp::ExtResponse::new(raw.into()))).ok();
         }
-        // Restore the old stashed prompt before stashing the new one.
-        agent.prompt.restore(old_qv.stashed_prompt);
-        // Inverse-collision: the displaced question was a
-        // local one (e.g. /fork, /new) -- surface a system-block marker so
-        // the user understands why their modal vanished. The directive
-        // payload (if any) is dropped; the user can re-issue the command
-        // after answering the model's question.
+        agent.restore_card_prompt(old_qv.stashed_prompt);
+
+        // Local question displaced by an ACP ask, so surface why it vanished.
+        // Any directive it carried is dropped; the user re-issues the command after answering.
         if let Some(ref kind) = old_qv.local_kind {
             use crate::views::question_view::LocalQuestionKind;
             let cmd = match kind {
@@ -85,6 +82,7 @@ pub(crate) fn handle_ask_user_question(
                 LocalQuestionKind::AgentTypeMismatch { .. } => "model switch",
                 LocalQuestionKind::DoctorFix { .. } => "/doctor fix",
                 LocalQuestionKind::DeleteCurrentSession => "/delete",
+                LocalQuestionKind::Feedback => "/feedback",
             };
             let message = if matches!(kind, LocalQuestionKind::DoctorFix { .. }) {
                 "/doctor fix was cancelled because another question opened.".to_owned()
@@ -95,7 +93,7 @@ pub(crate) fn handle_ask_user_question(
         }
     }
 
-    // Stash the current prompt and create the question view.
+    // Stash the composer so it comes back when this question closes.
     agent.question_view = Some(QuestionViewState::with_response_tx(
         ext_req.tool_call_id,
         ext_req.questions,
@@ -129,8 +127,8 @@ pub(crate) fn handle_ask_user_question(
 ///
 /// Creates a `PlanApprovalViewState` overlay for interactive approval.
 ///
-/// Follows the `handle_ask_user_question` pattern: parse → guard → cancel old
-/// → stash prompt → create state → clear prompt → return true.
+/// Flow: parse → guard → cancel old → capture session draft → create state →
+/// prefill freeform when safe (not under an open permission) → return true.
 pub(super) fn handle_exit_plan_mode(
     ext: xai_acp_lib::AcpArgs<acp::ExtRequest>,
     app: &mut AppView,
@@ -206,8 +204,29 @@ pub(super) fn handle_exit_plan_mode(
         agent.prompt.restore(stashed);
     }
 
-    let stashed = agent.prompt.stash();
-    let state = PlanApprovalViewState::with_source(params, source, stashed, ext.response_tx);
+    // Permission open: session draft is `permission_stashed_prompt` (live is followup).
+    // Otherwise: live composer is the session draft.
+    let permission_still_open = !agent.permission_queue.is_empty();
+    let session_draft = if let Some(perm_draft) = agent.permission_stashed_prompt.take() {
+        let _permission_followup = agent.prompt.stash();
+        perm_draft
+    } else {
+        agent.prompt.stash()
+    };
+
+    let had_session_draft = !session_draft.is_effectively_empty();
+    // Never prefill freeform while permission owns the keyboard: followup would type
+    // into (and could send) the private session draft. Arm deferred prefill so
+    // restore_permission_stashes applies it only when the queue actually drains.
+    if had_session_draft && !permission_still_open {
+        agent.plan_freeform_prefill_deferred = false;
+        agent.prompt.restore(session_draft.clone_for_live_prefill());
+    } else {
+        agent.plan_freeform_prefill_deferred = permission_still_open;
+        agent.prompt.set_text("");
+    }
+
+    let state = PlanApprovalViewState::with_source(params, source, session_draft, ext.response_tx);
 
     agent.plan_comments.clear();
     agent.plan_next_comment_id = 0;
@@ -218,7 +237,6 @@ pub(super) fn handle_exit_plan_mode(
         agent.latest_inline_plan_content = None;
     }
     agent.plan_approval_view = Some(state);
-    agent.prompt.set_text("");
 
     agent.casual_commenting_range = None;
     agent.casual_editing_comment_id = None;
@@ -229,7 +247,13 @@ pub(super) fn handle_exit_plan_mode(
         if let Some(ref mut viewer) = agent.line_viewer {
             viewer.plan_mut().feedback_active = true;
         }
-    } else if let Some(ref mut pav) = agent.plan_approval_view {
+        if had_session_draft
+            && !permission_still_open
+            && let Some(ref mut pav) = agent.plan_approval_view
+        {
+            pav.focus = crate::views::plan_approval_view::PlanApprovalFocus::Prompt;
+        }
+    } else if !permission_still_open && let Some(ref mut pav) = agent.plan_approval_view {
         pav.focus = crate::views::plan_approval_view::PlanApprovalFocus::Prompt;
     }
 

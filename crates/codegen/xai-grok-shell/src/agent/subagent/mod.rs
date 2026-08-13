@@ -11,11 +11,11 @@
 //! - Child sessions share the parent's hunk tracker, filesystem, terminal, and env
 //!   so that edits, bash commands, and file reads go through the same backends.
 use crate::agent::config::{resolve_credentials, sampling_config_for_model};
+use crate::agent::models::resolve_catalog_key;
 use crate::extensions::notification::{SessionNotification, SessionUpdate};
 use crate::session::{
     self, SessionCommand, SessionHandle, SessionThread,
-    commands::{PromptCompletionKind, PromptTurnResult as SubagentPromptTurnResult},
-    fs_watch::FsWatchCapabilities,
+    commands::PromptTurnResult as SubagentPromptTurnResult, fs_watch::FsWatchCapabilities,
     info::Info as SessionInfo,
 };
 use crate::terminal::AsyncTerminalRunner;
@@ -32,19 +32,19 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use xai_acp_lib::AcpAgentGatewaySender as GatewaySender;
-use xai_file_utils::events::types::CancellationCategory;
 use xai_grok_agent::config::{McpInheritance, ModelOverride, PermissionMode};
 use xai_grok_sampling_types::conversation::ConversationItem;
+use xai_grok_session_events::types::CancellationCategory;
 use xai_grok_subagent_resolution::ResumeSourceData;
 use xai_grok_tools::implementations::grok_build::monitor::types::MonitorEventBuffer;
 use xai_grok_tools::implementations::grok_build::task::coordinator::{
-    ChildCompletion, ChildControl, ChildReporter, ChildRunOutput, LocalBoxFuture, StartedChild,
-    SubagentProgress,
+    ChildCompletion, ChildControl, ChildRunOutput, LocalBoxFuture, StartedChild, SubagentProgress,
 };
 use xai_grok_tools::implementations::grok_build::task::types::*;
 use xai_grok_tools::types::tool::ToolKind;
 use xai_grok_workspace::file_system::AsyncFileSystem;
 use xai_hunk_tracker::HunkTrackerHandle;
+mod attempt_runner;
 mod handle_request;
 pub(crate) use handle_request::run_shell_child;
 /// How the child session's initial context was bootstrapped.
@@ -81,7 +81,7 @@ impl AutoCompactThresholdTiers {
     /// Slice the parent's `Config` into the four tier inputs we'll resolve
     /// against later. Only fields relevant to the auto-compact threshold
     /// are captured; the parent's `Config` is not held by reference.
-    pub fn capture(cfg: &crate::agent::config::Config) -> Self {
+    pub(crate) fn capture(cfg: &crate::agent::config::Config) -> Self {
         let user_per_model = cfg
             .config_models
             .iter()
@@ -131,6 +131,7 @@ pub(crate) struct SubagentSpawnContext {
     pub subagent_event_tx: mpsc::UnboundedSender<SubagentEvent>,
     pub parent_depth: u32,
     pub subagents_max_depth: u32,
+    pub workflow_max_concurrent_agents: usize,
     /// Inference idle timeout (secs), resolved from the parent's model config at spawn-context creation time.
     pub inference_idle_timeout_secs: u64,
     /// Tier inputs for resolving `auto_compact_threshold_percent` at
@@ -194,6 +195,10 @@ pub(crate) struct SubagentSpawnContext {
     /// Whether the `ask_user_question` tool is exposed to this subagent,
     /// inherited from the parent session (see `build_subagent_spawn_context`).
     pub ask_user_question_enabled: bool,
+    /// Whether the parent session is non-interactive (headless `-p` / SDK),
+    /// copied onto the child's `StartupHints` so its ask_user_question also
+    /// returns no-operator text instead of pretending a user declined.
+    pub parent_non_interactive: bool,
     /// Parent session command channel. Carries lifecycle notifications the
     /// parent persists (`SubagentSpawned` / `SubagentFinished`) and — when
     /// goal mode is on — transient `SubagentProgress` ticks the parent
@@ -456,13 +461,18 @@ impl ChildControl for ShellChildRuntime {
         })
     }
     fn cancel(&self) {
-        let _ = self.child_handle.cmd_tx.send(SessionCommand::Cancel {
-            cancel_subagents: true,
-            kill_background_tasks: true,
-            rewind_if_pristine: false,
-            trigger: None,
-        });
-        let _ = self.child_handle.cmd_tx.send(SessionCommand::Shutdown);
+        let _ =
+            self.child_handle
+                .cmd_tx
+                .send(SessionCommand::Cancel(crate::session::CancelOptions {
+                    cancel_subagents: true,
+                    kill_background_tasks: true,
+                    trigger: Some(crate::session::CancelTrigger::Shutdown),
+                    ..Default::default()
+                }));
+        let _ = self.child_handle.cmd_tx.send(SessionCommand::Shutdown(
+            crate::session::ShutdownKind::Graceful,
+        ));
     }
 }
 #[derive(Default)]
@@ -750,6 +760,12 @@ fn inherited_bearer_resolver(
         .byok;
     session_bearer_resolver(ctx, byok, base_url)
 }
+fn parent_catalog_model_id(ctx: &SubagentSpawnContext, routing_model: &str) -> acp::ModelId {
+    let models = ctx.models_manager.models();
+    resolve_catalog_key(&models, &ctx.model_id)
+        .or_else(|| resolve_catalog_key(&models, &acp::ModelId::new(routing_model)))
+        .unwrap_or_else(|| ctx.model_id.clone())
+}
 /// Read the parent session's actual current sampling config.
 ///
 /// Prefers the live state from `ChatStateHandle` (authoritative). Falls back
@@ -773,6 +789,15 @@ async fn read_parent_sampling_config(
                 .unwrap_or_default();
             let inherited_base_url = cfg.base_url.clone();
             let strip_guard = ctx.would_strip_fallback_key(creds.api_key.as_deref());
+            let catalog_model_id = parent_catalog_model_id(ctx, &cfg.model);
+            let supports_backend_search = ctx
+                .models_manager
+                .model_supports_backend_search(catalog_model_id.0.as_ref());
+            let extra_response_includes = crate::agent::config::response_include_extensions(
+                supports_backend_search,
+                &cfg.api_backend,
+                &cfg.base_url,
+            );
             let inherited = xai_grok_sampler::SamplerConfig {
                 api_key: creds.api_key,
                 base_url: cfg.base_url,
@@ -783,6 +808,7 @@ async fn read_parent_sampling_config(
                 api_backend: cfg.api_backend,
                 auth_scheme,
                 extra_headers,
+                extra_response_includes,
                 query_params: cfg.query_params.clone(),
                 env_http_headers: cfg.env_http_headers.clone(),
                 context_window: cfg.context_window.get(),
@@ -802,15 +828,13 @@ async fn read_parent_sampling_config(
                 } else {
                     inherited_bearer_resolver(ctx, &cfg.model, &inherited_base_url)
                 },
-                supports_backend_search: ctx
-                    .models_manager
-                    .model_supports_backend_search(ctx.model_id.0.as_ref()),
+                supports_backend_search,
                 compactions_remaining: ctx
                     .models_manager
-                    .model_compactions_remaining(ctx.model_id.0.as_ref()),
+                    .model_compactions_remaining(catalog_model_id.0.as_ref()),
                 compaction_at_tokens: ctx
                     .models_manager
-                    .model_compaction_at_tokens(ctx.model_id.0.as_ref()),
+                    .model_compaction_at_tokens(catalog_model_id.0.as_ref()),
                 doom_loop_recovery: ctx.sampling_config.doom_loop_recovery,
                 header_injector: ctx.sampling_config.header_injector.clone(),
             };
@@ -852,15 +876,21 @@ async fn read_parent_sampling_config(
     } else {
         inherited_bearer_resolver(ctx, &fallback.model, &fallback.base_url)
     };
+    let catalog_model_id = parent_catalog_model_id(ctx, &fallback.model);
     fallback.supports_backend_search = ctx
         .models_manager
-        .model_supports_backend_search(ctx.model_id.0.as_ref());
+        .model_supports_backend_search(catalog_model_id.0.as_ref());
+    fallback.extra_response_includes = crate::agent::config::response_include_extensions(
+        fallback.supports_backend_search,
+        &fallback.api_backend,
+        &fallback.base_url,
+    );
     fallback.compactions_remaining = ctx
         .models_manager
-        .model_compactions_remaining(ctx.model_id.0.as_ref());
+        .model_compactions_remaining(catalog_model_id.0.as_ref());
     fallback.compaction_at_tokens = ctx
         .models_manager
-        .model_compaction_at_tokens(ctx.model_id.0.as_ref());
+        .model_compaction_at_tokens(catalog_model_id.0.as_ref());
     (fallback, ctx.model_id.clone())
 }
 /// `AuthType` for a subagent: BYOK ⇒ `ApiKey` (don't overwrite the BYOK
@@ -974,7 +1004,7 @@ fn resume_initial_context(
 fn forked_initial_context(
     mut items: Vec<xai_grok_sampling_types::conversation::ConversationItem>,
 ) -> InitialContext {
-    crate::session::storage::jsonl::fork_filter_chat(&mut items);
+    crate::sampling::fork_filter_chat(&mut items);
     if items.is_empty() {
         return InitialContext {
             source: InitialContextSource::New,
@@ -1065,7 +1095,7 @@ fn verbatim_or_normalize_fork(
         };
     }
     let mut filtered = items;
-    crate::session::storage::jsonl::fork_filter_chat(&mut filtered);
+    crate::sampling::fork_filter_chat(&mut filtered);
     if !filtered
         .iter()
         .any(|i| !matches!(i, ConversationItem::System(_)))
@@ -1103,11 +1133,13 @@ fn stamp_live_fork_session_metadata(
     inherited_prefix_len: Option<usize>,
     fork_context_source: &str,
 ) {
-    let dir = session::persistence::session_dir(child_session_info);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        tracing::warn!(error = %e, "live fork: could not create child session dir for metadata stamp");
-        return;
-    }
+    let dir = match session::persistence::ensure_owner_only_session_dir(child_session_info) {
+        Ok(dir) => dir,
+        Err(e) => {
+            tracing::warn!(error = %e, "live fork: could not create child session dir for metadata stamp");
+            return;
+        }
+    };
     let summary_path = dir.join("summary.json");
     let model = acp::ModelId::new(model_id);
     let mut summary = std::fs::read(&summary_path)
@@ -1175,11 +1207,11 @@ async fn bootstrap_initial_context(
             fork_filter: false,
             ..Default::default()
         };
-        return match storage.copy_session_data_sync(
-            &source_session_info,
-            child_session_info,
-            copy_options,
-        ) {
+        use crate::session::storage::StorageAdapter as _;
+        return match storage
+            .copy_session_data(&source_session_info, child_session_info, copy_options)
+            .await
+        {
             Ok(result) => {
                 let conversation = match storage.load_chat_history_from_dir(child_session_dir) {
                     Ok(items) if !items.is_empty() => items,
@@ -1286,7 +1318,11 @@ async fn bootstrap_initial_context(
             fork_filter: true,
             ..Default::default()
         };
-        return match storage.copy_session_data_sync(parent_info, child_session_info, copy_options) {
+        use crate::session::storage::StorageAdapter as _;
+        return match storage
+            .copy_session_data(parent_info, child_session_info, copy_options)
+            .await
+        {
             Ok(result) => {
                 tracing::info!(
                     subagent_id = %request.id,
@@ -1794,17 +1830,16 @@ async fn await_subagent_turn_or_cancellation(
         turn_result = prompt_rx => SubagentWaitOutcome::TurnResult(Box::new(turn_result)),
     }
 }
-/// Fallback for cancelled/errored paths where TurnDeltaSnapshot is unavailable.
 async fn signals_snapshot_counts(child_handle: &SessionHandle) -> (u32, u32) {
     child_handle
         .signals_handle
         .snapshot()
         .await
-        .map(|s| (s.tool_call_count, s.turn_count))
+        .map(|snapshot| (snapshot.tool_call_count, snapshot.turn_count))
         .unwrap_or((0, 0))
 }
 fn cancellation_error_message(
-    category: Option<xai_file_utils::events::types::CancellationCategory>,
+    category: Option<xai_grok_session_events::types::CancellationCategory>,
     context: Option<&crate::session::commands::CancellationContext>,
 ) -> String {
     let detail = context.and_then(|ctx| {
@@ -1953,6 +1988,17 @@ fn inject_subagent_completed_prompt(
         });
     }
 }
+fn telemetry_owner_kind(
+    request: &SubagentRequest,
+) -> xai_grok_telemetry::events::SubagentOwnerKind {
+    if request.owner.is_workflow() {
+        xai_grok_telemetry::events::SubagentOwnerKind::Workflow
+    } else if request.from_scheduler_loop() {
+        xai_grok_telemetry::events::SubagentOwnerKind::SchedulerLoop
+    } else {
+        xai_grok_telemetry::events::SubagentOwnerKind::Task
+    }
+}
 fn failure_result(request: &SubagentRequest, error: &str) -> SubagentResult {
     SubagentResult {
         success: false,
@@ -2014,7 +2060,9 @@ async fn cancel_pending_shell_child(
     duration_ms: u64,
     gcs_ctx: &GcsUploadContext,
 ) -> SubagentResult {
-    let _ = child_cmd_tx.send(SessionCommand::Shutdown);
+    let _ = child_cmd_tx.send(SessionCommand::Shutdown(
+        crate::session::ShutdownKind::Graceful,
+    ));
     if worktree_freshly_created
         && let Some(wt_path) = worktree_path
         && let Err(e) = crate::session::worktree::remove_subagent_worktree(wt_path).await
@@ -2327,7 +2375,7 @@ pub(crate) struct SubagentSessionMetadata {
 }
 impl SubagentSessionMetadata {
     /// Current schema version.
-    pub const SCHEMA_VERSION: u32 = 1;
+    pub(crate) const SCHEMA_VERSION: u32 = 1;
     /// Build from a `SubagentMeta` + additional runtime context.
     pub(crate) fn from_meta(
         meta: &SubagentMeta,
@@ -2523,18 +2571,20 @@ fn persist_subagent_completion(dir: &Path, result: &SubagentResult, gcs_ctx: &Gc
         }
     }
 }
-const ORPHAN_RECONCILE_REASON: &str = "interrupted by process restart";
+pub(crate) const ORPHAN_RECONCILE_REASON: &str = "interrupted by process restart";
+pub(crate) const LIVE_ORPHAN_RECONCILE_REASON: &str = "orphaned while parent session stayed live";
 /// `SubagentFinished` for a force-terminated orphan; interrupt counts are zeroed.
 fn cancelled_orphan_finish(
     subagent_id: String,
     child_session_id: String,
     duration_ms: u64,
+    reason: &str,
 ) -> SessionUpdate {
     SessionUpdate::SubagentFinished {
         subagent_id,
         child_session_id,
         status: "cancelled".to_string(),
-        error: Some(ORPHAN_RECONCILE_REASON.to_string()),
+        error: Some(reason.to_owned()),
         tool_calls: 0,
         turns: 0,
         duration_ms,
@@ -2550,7 +2600,11 @@ fn finalize_orphaned_subagent(
     mut meta: SubagentMeta,
     gateway: &GatewaySender,
     parent_cmd_tx: Option<&mpsc::UnboundedSender<SessionCommand>>,
+    reason: &str,
 ) -> bool {
+    if !is_on_disk_meta_running(subagent_meta_dir) {
+        return false;
+    }
     let completed_at = chrono::Utc::now();
     let duration_ms = (completed_at - meta.started_at).num_milliseconds().max(0) as u64;
     meta.status = "cancelled".to_string();
@@ -2558,17 +2612,52 @@ fn finalize_orphaned_subagent(
     meta.duration_ms = Some(duration_ms);
     meta.tool_calls = Some(0);
     meta.turns = Some(0);
-    meta.error = Some(ORPHAN_RECONCILE_REASON.to_string());
+    meta.error = Some(reason.to_owned());
     if !write_subagent_meta(subagent_meta_dir, &meta) {
         return false;
     }
     emit_subagent_notification(
         gateway,
         &meta.parent_session_id,
-        cancelled_orphan_finish(meta.subagent_id, meta.child_session_id, duration_ms),
+        cancelled_orphan_finish(meta.subagent_id, meta.child_session_id, duration_ms, reason),
         parent_cmd_tx,
     );
     true
+}
+/// Persist a coordinator-held terminal outcome over a stale `running` meta.
+/// Same write-then-emit durability as [`finalize_orphaned_subagent`].
+fn persist_running_meta_as_finish(
+    subagent_meta_dir: &Path,
+    mut meta: SubagentMeta,
+    finish: &SessionUpdate,
+) -> bool {
+    let SessionUpdate::SubagentFinished {
+        status,
+        error,
+        tool_calls,
+        turns,
+        duration_ms,
+        ..
+    } = finish
+    else {
+        return false;
+    };
+    if !is_on_disk_meta_running(subagent_meta_dir) {
+        return false;
+    }
+    meta.status = status.clone();
+    meta.completed_at = Some(chrono::Utc::now());
+    meta.duration_ms = Some(*duration_ms);
+    meta.tool_calls = Some(*tool_calls);
+    meta.turns = Some(*turns);
+    meta.error = error.clone();
+    write_subagent_meta(subagent_meta_dir, &meta)
+}
+fn is_on_disk_meta_running(subagent_meta_dir: &Path) -> bool {
+    let Ok(data) = std::fs::read_to_string(subagent_meta_dir.join("meta.json")) else {
+        return false;
+    };
+    serde_json::from_str::<SubagentMeta>(&data).is_ok_and(|meta| meta.status == "running")
 }
 /// Parse `meta_path` and return it only when it is a stale `running` orphan
 /// owned by `parent_session_id` and not tracked live. Malformed metas → `None`.
@@ -2619,7 +2708,10 @@ pub(crate) async fn reconcile_orphaned_subagents_with_backend(
     parent_session_id: &str,
     gateway: &GatewaySender,
     parent_cmd_tx: Option<&mpsc::UnboundedSender<SessionCommand>>,
+    orphan_reason: &str,
+    heal_lock: Arc<tokio::sync::Mutex<()>>,
 ) {
+    let _heal_guard = heal_lock.lock().await;
     let subagents_dir = session_dir.join("subagents");
     let mut candidates: std::collections::BTreeMap<String, Option<String>> =
         std::collections::BTreeMap::new();
@@ -2655,22 +2747,38 @@ pub(crate) async fn reconcile_orphaned_subagents_with_backend(
                     .as_ref()
                     .and_then(completed_finish_from_inspection)
                 {
-                    tracing::info!(
-                        subagent_id = %subagent_id,
-                        parent_session_id,
-                        "Re-emitting finish for completed subagent with a lost terminal meta write"
-                    );
-                    emit_subagent_notification(gateway, parent_session_id, finish, parent_cmd_tx);
+                    if persist_running_meta_as_finish(&subagent_dir, m, &finish) {
+                        tracing::info!(
+                            subagent_id = %subagent_id,
+                            parent_session_id,
+                            "Re-emitting finish for completed subagent with a lost terminal meta write"
+                        );
+                        emit_subagent_notification(
+                            gateway,
+                            parent_session_id,
+                            finish,
+                            parent_cmd_tx,
+                        );
+                    }
                 } else {
                     tracing::info!(
                         subagent_id = %m.subagent_id,
                         parent_session_id,
                         "Reconciling orphaned subagent left running by a previous process"
                     );
-                    finalize_orphaned_subagent(&subagent_dir, m, gateway, parent_cmd_tx);
+                    finalize_orphaned_subagent(
+                        &subagent_dir,
+                        m,
+                        gateway,
+                        parent_cmd_tx,
+                        orphan_reason,
+                    );
                 }
             }
             Some(m) => {
+                if spawn_child.is_none() {
+                    continue;
+                }
                 tracing::info!(
                     subagent_id = %subagent_id,
                     parent_session_id,
@@ -2707,12 +2815,37 @@ pub(crate) async fn reconcile_orphaned_subagents_with_backend(
                 emit_subagent_notification(
                     gateway,
                     parent_session_id,
-                    cancelled_orphan_finish(subagent_id, child_session_id, 0),
+                    cancelled_orphan_finish(subagent_id, child_session_id, 0, orphan_reason),
                     parent_cmd_tx,
                 );
             }
         }
     }
+    drop(_heal_guard);
+}
+/// Same heal as resume, for a parent that never restarts. `unfinished` is
+/// empty so only on-disk `running` metas are candidates. Persist-first plus
+/// the per-parent lock make a second tick, sequential or overlapping, a
+/// no-op.
+pub(crate) async fn reconcile_live_orphaned_subagents(
+    backend: &xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend,
+    session_dir: &Path,
+    parent_session_id: &str,
+    gateway: &GatewaySender,
+    parent_cmd_tx: Option<&mpsc::UnboundedSender<SessionCommand>>,
+    heal_lock: Arc<tokio::sync::Mutex<()>>,
+) {
+    reconcile_orphaned_subagents_with_backend(
+        &[],
+        backend,
+        session_dir,
+        parent_session_id,
+        gateway,
+        parent_cmd_tx,
+        LIVE_ORPHAN_RECONCILE_REASON,
+        heal_lock,
+    )
+    .await;
 }
 #[cfg(test)]
 mod tests;

@@ -1,6 +1,6 @@
 #![cfg_attr(rustfmt, rustfmt::skip)]
 use super::*;
-use super::handle_request::{
+use super::attempt_runner::{
     canonical_total_tokens, record_subagent_usage, usage_is_incomplete,
 };
 use crate::test_support::lsp_runtime::{
@@ -1703,7 +1703,7 @@ async fn cancel_pending_shell_child_presents_one_cancelled_finish() {
         .await;
     assert!(matches!(
             child_cmd_rx.try_recv(),
-            Ok(SessionCommand::Shutdown)
+            Ok(SessionCommand::Shutdown(_))
         ));
     assert!(result.cancelled);
     assert!(!result.success);
@@ -1771,7 +1771,7 @@ async fn run_promote_cancel_with_worktree(
         .await;
     assert!(matches!(
             child_cmd_rx.try_recv(),
-            Ok(SessionCommand::Shutdown)
+            Ok(SessionCommand::Shutdown(_))
         ));
     assert!(result.cancelled);
 }

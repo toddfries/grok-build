@@ -21,7 +21,9 @@ use reqwest::header::{
 };
 use serde::Serialize;
 
-use xai_grok_sampling_types::error::{try_parse_stream_error, user_facing_api_error_message};
+use xai_grok_sampling_types::error::{
+    parse_error_code, try_parse_stream_error, user_facing_api_error_message,
+};
 use xai_grok_sampling_types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ConversationRequest,
     ConversationResponse, CreateResponseWrapper, DOOM_LOOP_CHECK_HEADER, MessagesRequestWrapper,
@@ -29,9 +31,9 @@ use xai_grok_sampling_types::{
     is_check_event, messages, rs,
 };
 
-use crate::attribution::bearer_tail_fragment;
 use crate::config::{AuthScheme, OriginClientInfo, SamplerConfig};
 use crate::events::SamplingErrorInfo;
+use xai_grok_auth::bearer_suffix;
 
 // Re-export ApiBackend from the shared types crate for downstream callers.
 pub use xai_grok_sampling_types::ApiBackend;
@@ -206,6 +208,26 @@ fn record_stream_request_failure(err: &reqwest::Error) {
     span.record("error", err.to_string().as_str());
 }
 
+/// Splice the raw-JSON hosted-tool entries for `web_search` and `x_search` into a serialized
+/// Responses request body's `tools` array. `x_search` has no `rs::Tool` variant at all, and
+/// `web_search` has one whose typed filters cannot carry `excluded_domains`, so both travel as raw
+/// JSON and neither may also be emitted as a typed `rs::Tool` (the API rejects the duplicate).
+/// Shared by the streaming (`create_response_stream`) and non-streaming (`create_response`) paths
+/// so neither can silently drop these tools.
+fn splice_extra_tool_entries(
+    request_body: &mut serde_json::Value,
+    entries: Vec<serde_json::Value>,
+) {
+    if entries.is_empty() {
+        return;
+    }
+    if let Some(tools) = request_body.get_mut("tools").and_then(|v| v.as_array_mut()) {
+        tools.extend(entries);
+    } else {
+        request_body["tools"] = serde_json::Value::Array(entries);
+    }
+}
+
 fn extract_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     headers
         .get(reqwest::header::RETRY_AFTER)
@@ -273,6 +295,30 @@ struct StreamingChatRequest<'a> {
 #[derive(Serialize)]
 struct StreamOptions {
     include_usage: bool,
+}
+
+fn append_response_includes(body: &mut serde_json::Value, extra_includes: &[String]) {
+    if extra_includes.is_empty() {
+        return;
+    }
+    let Some(body) = body.as_object_mut() else {
+        return;
+    };
+    let include = body.entry("include").or_insert(serde_json::Value::Null);
+    if include.is_null() {
+        *include = serde_json::Value::Array(Vec::new());
+    }
+    let Some(include) = include.as_array_mut() else {
+        return;
+    };
+    for value in extra_includes {
+        if !include
+            .iter()
+            .any(|existing| existing.as_str() == Some(value.as_str()))
+        {
+            include.push(serde_json::Value::String(value.clone()));
+        }
+    }
 }
 
 /// Resolve `env_http_headers` (`header -> env var`) into `headers` via `getenv`, skipping unset/blank/invalid entries and trimming values.
@@ -349,6 +395,7 @@ struct ClientDefaults {
     api_backend: ApiBackend,
     auth_scheme: AuthScheme,
     stream_tool_calls: bool,
+    extra_response_includes: Vec<String>,
     doom_loop_recovery: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
 }
 
@@ -657,6 +704,7 @@ impl SamplingClient {
             api_backend: config.api_backend,
             auth_scheme: config.auth_scheme,
             stream_tool_calls: config.stream_tool_calls,
+            extra_response_includes: config.extra_response_includes,
             doom_loop_recovery: config.doom_loop_recovery,
         };
 
@@ -742,7 +790,7 @@ impl SamplingClient {
 
     /// Tail fragment of the credential in `headers` — `x-api-key`
     /// (Messages-API scheme) or `Authorization` — per
-    /// [`crate::attribution::SENT_BEARER_PREFIX_LEN`].
+    /// [`crate::attribution::BEARER_SUFFIX_LEN`].
     fn sent_fragment_from_headers(headers: &HeaderMap, scheme: &AuthScheme) -> Option<String> {
         let raw = match scheme {
             AuthScheme::XApiKey => headers
@@ -753,20 +801,20 @@ impl SamplingClient {
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.strip_prefix("Bearer ")),
         };
-        raw.map(|s| bearer_tail_fragment(s).to_string())
+        raw.map(|s| bearer_suffix(s).to_string())
     }
 
     /// Best-effort *build-time* view of what the next request would carry
     /// (resolver-authoritative). For request-start diagnostics
     /// ([`Self::auth_info`]) only — 401 attribution must use the fragment
     /// captured by [`Self::post`] instead, which cannot race a recovery.
-    fn current_sent_bearer_prefix(&self) -> Option<String> {
+    fn current_sent_bearer_suffix(&self) -> Option<String> {
         if self.bearer_resolver.is_some() {
             return self
                 .bearer_resolver
                 .as_ref()
                 .and_then(|r| r.current_bearer())
-                .map(|s| bearer_tail_fragment(&s).to_string());
+                .map(|s| bearer_suffix(&s).to_string());
         }
         Self::sent_fragment_from_headers(&self.default_headers, &self.defaults.auth_scheme)
     }
@@ -778,21 +826,21 @@ impl SamplingClient {
     /// that saw the status, so higher layers that react to a 401 must
     /// not emit a duplicate event.
     ///
-    /// `sent_prefix` is the fragment [`Self::post`] captured for the
+    /// `sent_suffix` is the fragment [`Self::post`] captured for the
     /// rejected request (already tail-truncated; the full bearer never
     /// crosses this boundary).
     fn record_401_attribution(
         &self,
         consumer: crate::attribution::SamplingConsumer,
-        sent_prefix: Option<&str>,
+        sent_suffix: Option<&str>,
     ) {
         if let Some(cb) = self.attribution_callback.as_ref() {
-            cb.record_401(consumer, sent_prefix);
+            cb.record_401(consumer, sent_suffix);
         }
     }
 
     pub fn auth_info(&self) -> crate::sampling_log::AuthInfo {
-        let auth_prefix = self.current_sent_bearer_prefix();
+        let auth_prefix = self.current_sent_bearer_suffix();
         let auth_type = match (&self.defaults.auth_scheme, &auth_prefix) {
             (AuthScheme::XApiKey, Some(_)) => "x-api-key",
             (AuthScheme::Bearer, Some(_)) => "bearer",
@@ -892,6 +940,7 @@ impl SamplingClient {
                 model_metadata,
                 retry_after_secs,
                 should_retry,
+                error_code: parse_error_code(bytes.as_ref()),
             });
         }
 
@@ -1062,6 +1111,7 @@ impl SamplingClient {
                 model_metadata,
                 retry_after_secs,
                 should_retry,
+                error_code: parse_error_code(bytes.as_ref()),
             });
         }
 
@@ -1206,10 +1256,13 @@ impl SamplingClient {
             deployment_id: request.x_grok_deployment_id.as_deref(),
             user_id: request.x_grok_user_id.as_deref(),
         };
+        let extra_tool_entries = std::mem::take(&mut request.extra_tool_entries);
         let mut request_body = serde_json::to_value(&request.inner).map_err(|e| {
             tracing::error!("Failed to serialize responses request: {}", e);
             SamplingError::Serialization(e)
         })?;
+        splice_extra_tool_entries(&mut request_body, extra_tool_entries);
+        append_response_includes(&mut request_body, &self.defaults.extra_response_includes);
         // async-openai's ReasoningTextContent struct omits the `type`
         // discriminator that the Responses API requires on input. Patch
         // it in post-serialize. This is the last surviving piece of the
@@ -1260,6 +1313,7 @@ impl SamplingClient {
                 model_metadata,
                 retry_after_secs,
                 should_retry,
+                error_code: parse_error_code(bytes.as_ref()),
             });
         }
 
@@ -1347,15 +1401,8 @@ impl SamplingClient {
         if self.defaults.stream_tool_calls {
             request_body["stream_tool_calls"] = serde_json::json!(true);
         }
-        // Inject xAI-specific tools (e.g., x_search) that can't be expressed
-        // via async_openai's rs::Tool enum.
-        if !extra_tool_entries.is_empty() {
-            if let Some(tools) = request_body.get_mut("tools").and_then(|v| v.as_array_mut()) {
-                tools.extend(extra_tool_entries);
-            } else {
-                request_body["tools"] = serde_json::Value::Array(extra_tool_entries);
-            }
-        }
+        splice_extra_tool_entries(&mut request_body, extra_tool_entries);
+        append_response_includes(&mut request_body, &self.defaults.extra_response_includes);
         xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
         // Fresh per attempt so signals never leak across retries; `None`
         // (check disabled) sends no header and does no peek work per event.
@@ -1370,9 +1417,9 @@ impl SamplingClient {
         let mut http_request = grok_headers
             .apply(builder)
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
-        if doom_loop.is_some() {
-            // Presence opts in; the server ignores the value.
-            http_request = http_request.header(DOOM_LOOP_CHECK_HEADER, "true");
+        if let Some(policy) = self.defaults.doom_loop_recovery {
+            http_request =
+                http_request.header(DOOM_LOOP_CHECK_HEADER, policy.window_tokens.to_string());
         }
         let http_request = http_request.json(&request_body);
 
@@ -1432,6 +1479,7 @@ impl SamplingClient {
                 model_metadata,
                 retry_after_secs,
                 should_retry,
+                error_code: parse_error_code(bytes.as_ref()),
             });
         }
 
@@ -1613,6 +1661,7 @@ impl SamplingClient {
                 model_metadata,
                 retry_after_secs,
                 should_retry,
+                error_code: parse_error_code(bytes.as_ref()),
             });
         }
 
@@ -1746,6 +1795,7 @@ impl SamplingClient {
                 model_metadata,
                 retry_after_secs,
                 should_retry,
+                error_code: parse_error_code(bytes.as_ref()),
             });
         }
 
@@ -1909,8 +1959,8 @@ impl SamplingClient {
         let x_grok_turn_idx = request.x_grok_turn_idx.clone();
         let x_grok_agent_id = request.x_grok_agent_id.clone();
 
-        // Collect xAI-specific tools that can't be expressed via rs::Tool
-        // (e.g., x_search). These are injected as raw JSON after serialization.
+        // The hosted tools travel as raw JSON, spliced in after serialization by
+        // `splice_extra_tool_entries`, whose doc explains why each one does.
         let extra_tools = xai_grok_sampling_types::extra_tool_entries(&request.hosted_tools);
 
         let responses_request: rs::CreateResponse = (&request).into();
@@ -1946,6 +1996,10 @@ impl SamplingClient {
         let x_grok_turn_idx = request.x_grok_turn_idx.clone();
         let x_grok_agent_id = request.x_grok_agent_id.clone();
 
+        // The hosted tools travel as raw JSON, spliced in by `create_response` through
+        // `splice_extra_tool_entries`, whose doc explains why each one does.
+        let extra_tools = xai_grok_sampling_types::extra_tool_entries(&request.hosted_tools);
+
         let responses_request: rs::CreateResponse = (&request).into();
 
         let mut wrapper = CreateResponseWrapper::new(responses_request);
@@ -1954,6 +2008,7 @@ impl SamplingClient {
         wrapper.x_grok_session_id = x_grok_session_id;
         wrapper.x_grok_turn_idx = x_grok_turn_idx;
         wrapper.x_grok_agent_id = x_grok_agent_id;
+        wrapper.extra_tool_entries = extra_tools;
 
         if let Some(trace) = trace {
             wrapper.trace = Some(trace);
@@ -2073,14 +2128,43 @@ fn stream_collect_error(info: SamplingErrorInfo) -> SamplingError {
         model_metadata: info.model_metadata,
         retry_after_secs: info.retry_after_secs,
         should_retry: info.should_retry,
+        error_code: info.error_code,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Router, body::Bytes, routing::post};
     use indexmap::IndexMap;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+    use xai_grok_sampling_types::ApiErrorCode;
     use xai_grok_sampling_types::types::ChatRequestMessage;
+
+    #[test]
+    fn splice_extra_tool_entries_extends_existing_tools_array() {
+        let mut body = serde_json::json!({ "tools": [{ "type": "function" }] });
+        splice_extra_tool_entries(&mut body, vec![serde_json::json!({ "type": "web_search" })]);
+        assert_eq!(
+            body["tools"],
+            serde_json::json!([{ "type": "function" }, { "type": "web_search" }])
+        );
+    }
+
+    #[test]
+    fn splice_extra_tool_entries_creates_tools_array_when_absent() {
+        let mut body = serde_json::json!({});
+        splice_extra_tool_entries(&mut body, vec![serde_json::json!({ "type": "web_search" })]);
+        assert_eq!(body["tools"], serde_json::json!([{ "type": "web_search" }]));
+    }
+
+    #[test]
+    fn splice_extra_tool_entries_noop_when_empty() {
+        let mut body = serde_json::json!({ "tools": [{ "type": "function" }] });
+        splice_extra_tool_entries(&mut body, vec![]);
+        assert_eq!(body["tools"], serde_json::json!([{ "type": "function" }]));
+    }
 
     #[test]
     fn stream_collect_error_preserves_should_retry() {
@@ -2091,6 +2175,7 @@ mod tests {
             is_retryable: true,
             retry_after_secs: Some(3),
             should_retry: Some(false),
+            error_code: Some(ApiErrorCode::InvalidImage),
             model_metadata: None,
             empty_response_context: None,
             doom_loop_triggers: None,
@@ -2105,6 +2190,7 @@ mod tests {
             model_metadata,
             retry_after_secs,
             should_retry,
+            error_code,
         } = stream_collect_error(info)
         else {
             panic!("expected Api");
@@ -2116,8 +2202,16 @@ mod tests {
                 model_metadata.is_none(),
                 retry_after_secs,
                 should_retry,
+                error_code,
             ),
-            (529, "Overloaded", true, Some(3), Some(false)),
+            (
+                529,
+                "Overloaded",
+                true,
+                Some(3),
+                Some(false),
+                Some(ApiErrorCode::InvalidImage)
+            ),
         );
     }
 
@@ -2132,6 +2226,7 @@ mod tests {
             api_backend: ApiBackend::ChatCompletions,
             auth_scheme: AuthScheme::Bearer,
             extra_headers: IndexMap::new(),
+            extra_response_includes: Vec::new(),
             query_params: IndexMap::new(),
             env_http_headers: IndexMap::new(),
             context_window: 8192,
@@ -2217,6 +2312,126 @@ mod tests {
 
         assert!(obj.get("max_tokens").is_none());
         assert!(obj.get("tools").is_none());
+    }
+
+    async fn capture_response_body(streaming: bool) -> serde_json::Value {
+        let (body_tx, body_rx) = oneshot::channel();
+        let body_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(body_tx)));
+        let app = Router::new().route(
+            "/v1/responses",
+            post(move |body: Bytes| {
+                let body_tx = body_tx.clone();
+                async move {
+                    let _ = body_tx.lock().unwrap().take().unwrap().send(body);
+                    if streaming {
+                        axum::response::Response::builder()
+                            .header("content-type", "text/event-stream")
+                            .body(axum::body::Body::from("data: [DONE]\n\n"))
+                            .unwrap()
+                    } else {
+                        axum::response::Response::builder()
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(r#"{"id":"resp","object":"response","created_at":0,"model":"test-model","status":"completed","output":[],"usage":{"input_tokens":0,"input_tokens_details":{"cached_tokens":0},"output_tokens":0,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":0}}"#))
+                            .unwrap()
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = SamplingClient::new(SamplerConfig {
+            base_url: format!("http://{addr}/v1"),
+            api_backend: ApiBackend::Responses,
+            extra_response_includes: vec!["no_inline_citations".to_owned()],
+            ..minimal_config()
+        })
+        .unwrap();
+        let mut request = rs::CreateResponse {
+            input: rs::InputParam::Text("hi".to_owned()),
+            include: Some(vec![rs::IncludeEnum::ReasoningEncryptedContent]),
+            tools: Some(vec![rs::Tool::WebSearch(rs::WebSearchTool::default())]),
+            ..Default::default()
+        };
+        let mut wrapper = CreateResponseWrapper::new(request.clone());
+        wrapper.extra_tool_entries = vec![serde_json::json!({"type": "x_search"})];
+        if streaming {
+            let (_stream, _model_metadata, _doom_loop_collector) = client
+                .create_response_stream(wrapper)
+                .await
+                .expect("streaming request should succeed");
+        } else {
+            request.tools = None;
+            client
+                .create_response(CreateResponseWrapper::new(request))
+                .await
+                .expect("unary request should succeed");
+        }
+        let body = body_rx.await.unwrap();
+        server.abort();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn response_call_sites_emit_final_includes_and_stream_fields() {
+        let unary = capture_response_body(false).await;
+        assert_eq!(
+            serde_json::json!(["reasoning.encrypted_content", "no_inline_citations"]),
+            unary["include"],
+        );
+
+        let stream = capture_response_body(true).await;
+        assert_eq!(
+            serde_json::json!(["reasoning.encrypted_content", "no_inline_citations"]),
+            stream["include"],
+        );
+        assert_eq!(Some(true), stream["stream"].as_bool());
+        assert!(
+            stream["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["type"] == "x_search")
+        );
+    }
+
+    #[test]
+    fn append_response_includes_preserves_typed_values_and_deduplicates() {
+        let typed = [
+            "reasoning.encrypted_content",
+            "web_search_call.action.sources",
+        ];
+        let mut body = serde_json::json!({ "include": typed });
+        append_response_includes(
+            &mut body,
+            &[
+                "no_inline_citations".to_owned(),
+                "no_inline_citations".to_owned(),
+            ],
+        );
+        assert_eq!(
+            serde_json::json!([
+                "reasoning.encrypted_content",
+                "web_search_call.action.sources",
+                "no_inline_citations",
+            ]),
+            body["include"],
+        );
+
+        let mut unchanged = serde_json::json!({ "include": typed });
+        let expected = unchanged.clone();
+        append_response_includes(&mut unchanged, &[]);
+        assert_eq!(expected, unchanged);
+
+        for mut body in [
+            serde_json::json!({}),
+            serde_json::json!({ "include": null }),
+        ] {
+            append_response_includes(&mut body, &["no_inline_citations".to_owned()]);
+            assert_eq!(serde_json::json!(["no_inline_citations"]), body["include"]);
+        }
     }
 
     #[test]
@@ -2487,7 +2702,7 @@ mod tests {
     }
 
     /// `post()` strips the `"Bearer "` scheme prefix off `Authorization`
-    /// and captures the tail fragment (see `SENT_BEARER_PREFIX_LEN`).
+    /// and captures the tail fragment (see `BEARER_SUFFIX_LEN`).
     #[test]
     fn post_captures_bearer_tail_for_openai_compat() {
         let cfg = SamplerConfig {
@@ -2503,7 +2718,7 @@ mod tests {
         assert_eq!(bearer.as_deref(), Some("r-1234567890"));
         assert_eq!(
             bearer.as_deref().map(str::len),
-            Some(crate::attribution::SENT_BEARER_PREFIX_LEN),
+            Some(crate::attribution::BEARER_SUFFIX_LEN),
         );
     }
 
@@ -2525,7 +2740,7 @@ mod tests {
         assert_eq!(bearer.as_deref(), Some("c-key-abc123"));
         assert_eq!(
             bearer.as_deref().map(str::len),
-            Some(crate::attribution::SENT_BEARER_PREFIX_LEN),
+            Some(crate::attribution::BEARER_SUFFIX_LEN),
         );
     }
 
@@ -2585,7 +2800,7 @@ mod tests {
         // A record-time re-read (the pre-fix behavior) would report the
         // rotated token instead:
         assert_eq!(
-            client.current_sent_bearer_prefix().as_deref(),
+            client.current_sent_bearer_suffix().as_deref(),
             Some("en-newtail99"),
             "sanity: the build-time capture and a live re-read now differ"
         );
@@ -2692,7 +2907,7 @@ mod tests {
         assert_eq!(calls[0].1.as_deref(), Some("0-extra-tail"));
         assert_eq!(
             calls[0].1.as_deref().map(str::len),
-            Some(crate::attribution::SENT_BEARER_PREFIX_LEN),
+            Some(crate::attribution::BEARER_SUFFIX_LEN),
         );
     }
 
@@ -2716,7 +2931,7 @@ mod tests {
         };
         let client = SamplingClient::new(cfg).expect("client should build");
         assert_eq!(
-            client.current_sent_bearer_prefix(),
+            client.current_sent_bearer_suffix(),
             None,
             "resolver None must not attribute a stripped default seed"
         );

@@ -227,6 +227,13 @@ pub struct SubagentsConfig {
     /// Raw `[subagents] max_depth` (i64 so out-of-range parses; clamped ≥1 at resolve).
     #[serde(default)]
     pub max_depth: Option<i64>,
+    #[serde(default)]
+    pub max_concurrent: Option<i64>,
+    /// `"queue"` or `"fail"`.
+    #[serde(default)]
+    pub limit_behavior: Option<String>,
+    #[serde(default)]
+    pub workflow_max_concurrent: Option<i64>,
     /// Per-subagent model ID overrides.
     /// Keys are agent names, values are model IDs that must exist in the
     /// available models registry. Parsed from `[subagents.models]` in config.toml.
@@ -485,6 +492,94 @@ impl SubagentsConfig {
         }
         Self::DEFAULT_MAX_DEPTH
     }
+    pub const ENV_MAX_CONCURRENT: &'static str = "GROK_MAX_CONCURRENT_SUBAGENTS";
+    pub const ENV_LIMIT_BEHAVIOR: &'static str = "GROK_SUBAGENT_LIMIT_BEHAVIOR";
+    pub const ENV_WORKFLOW_MAX_CONCURRENT: &'static str = "GROK_WORKFLOW_MAX_CONCURRENT_AGENTS";
+    /// Clamp to `1..`; a limit can be adjusted but never disabled.
+    fn clamp_count(value: i64, source: &str, name: &str) -> usize {
+        if value < 1 {
+            tracing::warn!(source, name, value, "subagent limit < 1; clamping to 1");
+            1
+        } else {
+            usize::try_from(value).unwrap_or(usize::MAX)
+        }
+    }
+    /// Precedence: env > TOML > remote > default; invalid layers warn and fall through.
+    fn resolve_count(
+        env_name: &str,
+        env: Option<&str>,
+        config: Option<i64>,
+        remote: Option<u32>,
+        default: usize,
+    ) -> usize {
+        if let Some(value) = env {
+            match xai_grok_tools::util::env::parse_positive(value.trim()) {
+                Some(parsed) => return usize::try_from(parsed).unwrap_or(usize::MAX),
+                None => {
+                    tracing::warn!(
+                        name = env_name,
+                        %value,
+                        "invalid env value (expected a positive whole number); ignoring"
+                    );
+                }
+            }
+        }
+        if let Some(v) = config {
+            return Self::clamp_count(v, "config", env_name);
+        }
+        if let Some(v) = remote {
+            return Self::clamp_count(i64::from(v), "remote", env_name);
+        }
+        default
+    }
+    pub(crate) fn resolve_max_concurrent(
+        env: Option<&str>,
+        config: Option<i64>,
+        remote: Option<u32>,
+    ) -> usize {
+        Self::resolve_count(
+            Self::ENV_MAX_CONCURRENT,
+            env,
+            config,
+            remote,
+            xai_grok_tools::implementations::grok_build::task::admission::DEFAULT_MAX_CONCURRENT,
+        )
+    }
+    pub(crate) fn resolve_workflow_max_concurrent(
+        env: Option<&str>,
+        config: Option<i64>,
+        remote: Option<u32>,
+    ) -> usize {
+        Self::resolve_count(
+            Self::ENV_WORKFLOW_MAX_CONCURRENT,
+            env,
+            config,
+            remote,
+            crate::session::workflow::host_service::DEFAULT_WORKFLOW_MAX_CONCURRENT_AGENTS,
+        )
+    }
+    pub(crate) fn resolve_limit_behavior(
+        env: Option<&str>,
+        config: Option<&str>,
+        remote: Option<&str>,
+    ) -> xai_grok_tools::implementations::grok_build::task::admission::LimitBehavior {
+        use xai_grok_tools::implementations::grok_build::task::admission::LimitBehavior;
+        for (source, value) in [("env", env), ("config", config), ("remote", remote)] {
+            let Some(value) = value else { continue };
+            if value.eq_ignore_ascii_case("fail") {
+                return LimitBehavior::Fail;
+            }
+            if value.eq_ignore_ascii_case("queue") {
+                return LimitBehavior::Queue;
+            }
+            tracing::warn!(
+                source,
+                %value,
+                "subagent limit_behavior is neither `queue` nor `fail`; ignoring"
+            );
+        }
+        LimitBehavior::Queue
+    }
     /// Resolve the final subagents config from all sources (in priority order):
     /// 1. CLI flag `--subagents` (absolute highest — always enables)
     /// 2. `GROK_SUBAGENTS` env var: `1`/`true` enables, `0`/`false` force-disables
@@ -686,7 +781,7 @@ impl ModelOverrideConfig {
     /// `prompt_suggestion` resolves to a [`PromptSuggestModelPin`] instead of
     /// a model string (no CLI flag; the default and the catalog guard live at
     /// the consumer, `handle_suggest_prompt`).
-    pub fn resolve(
+    pub(crate) fn resolve(
         cli_web_search_model: Option<&str>,
         cli_session_summary_model: Option<&str>,
         config: &toml::Value,
@@ -780,8 +875,10 @@ pub struct ToolsConfig {
     /// When `true`, all tools (including `read_file`) filter gitignored
     /// files. When `false` (default), each tool picks its own default.
     pub respect_gitignore: bool,
-    /// Drop tools whose xAI API requires server-side artifact storage
-    /// (currently just `video_gen`). Intended for ZDR-bound teams via
+    /// Restrict tools whose xAI API requires server-side artifact storage
+    /// (currently just the video tools): without a valid
+    /// `[tools.zdr_video_output_s3]` bucket they stay advertised but return
+    /// setup guidance at call time. Intended for ZDR-bound teams via
     /// `~/.grok/managed_config.toml`. Defaults to `false`.
     pub disable_zdr_incompatible_tools: bool,
     /// Optional S3 bucket config for ZDR video output. When present (and
@@ -1062,6 +1159,38 @@ fn apply_managed_settings_features_inner(
     }
     enforced
 }
+/// Display text naming the setting that turned session search off, or `None` while it is on.
+/// One source of truth: the latch records the setting that closed it, which a later resolve of a
+/// lower tier cannot change.
+pub fn session_search_turned_off_by() -> Option<&'static str> {
+    let source = crate::session::storage::search_gate::closed_by()?;
+    Some(crate::session::storage::search_gate::session_search_off_reason(source))
+}
+/// Resolve the session search setting and latch it for the process. Call after every rewrite of
+/// `remote_settings`, and before anything can reach the index.
+pub fn apply_session_search_gate(config: &crate::agent::config::Config) {
+    crate::session::storage::search_gate::apply_gate(&config.resolve_session_search());
+}
+/// Load the on-disk config for a one-shot command and clamp it with policy. Without the clamp a
+/// pinned value reads as an ordinary config value, which the environment outranks.
+pub fn load_agent_config_disk_only() -> Result<crate::agent::config::Config, String> {
+    let effective = load_effective_config_disk_only().map_err(|e| e.to_string())?;
+    let mut config = crate::agent::config::Config::new_from_toml_cfg(&effective)?;
+    apply_policy(&mut config);
+    Ok(config)
+}
+/// Clamp a config with managed settings and then requirements pins, logging each field a policy
+/// took over. Requirements run second so a pin wins a conflict.
+pub(crate) fn apply_policy(config: &mut crate::agent::config::Config) {
+    let managed = apply_managed_settings_features(config);
+    let pinned = apply_requirements(config);
+    for field in managed.iter().chain(&pinned) {
+        tracing::info!(
+            field = %field.path, value = %field.value, source = %field.source,
+            "policy override"
+        );
+    }
+}
 /// Clamp `AgentConfig` fields per `requirements.toml`. No-op if absent.
 /// System pins win over user pins on conflict.
 pub(crate) fn apply_requirements(config: &mut crate::agent::config::Config) -> Vec<EnforcedField> {
@@ -1156,6 +1285,7 @@ fn apply_requirements_inner(
     pin_feature!(video_gen);
     pin_feature!(write_file);
     pin_feature!(voice_mode);
+    pin_feature!(session_search);
     pin_requirement_only!(remote_fetch);
     if let Some(val) = req_bool(req, "telemetry", "trace_upload") {
         config.requirements.trace_upload.pin(val, source.clone());
@@ -1391,13 +1521,10 @@ pub fn apply_sandbox(
     let requires_bwrap = requires_read_deny || requires_hook_write_deny;
     #[cfg(target_os = "linux")]
     {
-        let refuse_unprotected = |detail: &str| {
+        let refuse_unprotected = |cause: &str| {
             eprintln!(
-                "error: this sandbox could not enforce its mount-namespace deny set \
-                 on Linux (bubblewrap missing/unusable, or a deny glob exceeded its \
-                 expansion limit — see any message above). Install bubblewrap with \
-                 `apt install -y bubblewrap` if needed. Refusing to start with denied \
-                 paths unprotected.{detail}"
+                "error: this sandbox could not enforce its deny list on Linux: \
+                 {cause} Refusing to start with denied paths unprotected."
             );
         };
         match xai_grok_sandbox::bwrap_reexec_for_profile(&sandbox_profile, &workspace) {
@@ -1405,7 +1532,10 @@ pub fn apply_sandbox(
                 use std::os::unix::process::CommandExt;
                 let err = cmd.exec();
                 if requires_bwrap {
-                    refuse_unprotected(&format!(" (bwrap exec failed: {err})"));
+                    refuse_unprotected(&format!(
+                        "bwrap exec failed: {err}. Install bubblewrap with \
+                         `apt install -y bubblewrap`."
+                    ));
                     std::process::exit(1);
                 }
                 eprintln!(
@@ -1427,7 +1557,10 @@ pub fn apply_sandbox(
                 }
             }
             None if requires_bwrap => {
-                refuse_unprotected("");
+                refuse_unprotected(
+                    "the deny list could not be prepared; see the error above \
+                     for the specific cause.",
+                );
                 std::process::exit(1);
             }
             None => {}
@@ -1455,8 +1588,9 @@ pub fn apply_sandbox(
                 && !xai_grok_sandbox::is_inside_bwrap();
             if unappliable {
                 eprintln!(
-                    "error: could not apply the '{}' sandbox profile (including \
-                     direct global-hook write protection); refusing to start.",
+                    "error: could not apply the '{}' sandbox profile; see the \
+                     warning above for the cause. Refusing to start with its \
+                     protections missing.",
                     sandbox.profile()
                 );
                 std::process::exit(1);

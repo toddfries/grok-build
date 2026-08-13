@@ -15,8 +15,8 @@ pub(super) use helpers::{
     parse_session_load_running_prompt_id, parse_session_scheduler_background_loops,
 };
 pub(crate) use helpers::{
-    EffectMeta, RestoreProgressMsg, SessionFlags, persist_permission_mode_and_notify,
-    persist_setting, sanitize_user_error,
+    EffectMeta, RestoreProgressMsg, SessionFlags, is_disk_full_error,
+    persist_permission_mode_and_notify, persist_setting, sanitize_user_error,
 };
 #[cfg(feature = "local-workspace")]
 pub(crate) use helpers::reject_non_fs_only_advertised_tools;
@@ -25,10 +25,12 @@ use std::path::{Path, PathBuf};
 use agent_client_protocol as acp;
 use tokio::task::JoinSet;
 use xai_acp_lib::{AcpAgentTx, acp_send};
+use xai_grok_telemetry::startup::{self, StartupPhase};
 use actions::{
     ClipboardPasteTarget, Effect, ProbedAttachment, SubagentKillOutcome,
     SwitchModelError, TaskResult,
 };
+use crate::views::usage_modal::SessionInfoField;
 #[cfg(test)]
 use actions::PermissionModePersist;
 #[cfg(test)]
@@ -49,7 +51,7 @@ pub(crate) fn execute(
     match effect {
         Effect::RegisterActiveSession { session_id, cwd } => {
             crate::app::signal_handler::set_current_session_id(Some(session_id.clone()));
-            if let Err(e) = xai_grok_shell::active_sessions::register(xai_grok_shell::active_sessions::ActiveSession {
+            if let Err(e) = xai_grok_active_sessions::register(xai_grok_active_sessions::ActiveSession {
                 session_id,
                 pid: std::process::id(),
                 cwd,
@@ -171,17 +173,19 @@ pub(crate) fn execute(
                             };
                         }
                     }
+                    let _phase = startup::phase_scope(StartupPhase::SessionCreate);
                     ulog::info(
                         "session.create.start",
                         None,
                         Some(serde_json::json!({"mcp_server_count": mcp_count})),
                     );
                     let create_start = std::time::Instant::now();
-                    let result = acp_send(
+                    let result = helpers::acp_send_bounded(
                             acp::NewSessionRequest::new(session_cwd.clone())
                                 .mcp_servers(mcp_servers)
                                 .meta(meta),
                             &tx,
+                            "Session creation",
                         )
                         .await;
                     let create_elapsed_ms = create_start.elapsed().as_millis() as u64;
@@ -290,7 +294,14 @@ pub(crate) fn execute(
                                 .expect("serialize resume params")
                                 .into(),
                         );
-                        let ext_resp = match acp_send(ext_req, &tx).await {
+                        let _phase = startup::phase_scope(StartupPhase::SessionCreate);
+                        let ext_resp = match helpers::acp_send_bounded(
+                                ext_req,
+                                &tx,
+                                "Worktree session resume",
+                            )
+                            .await
+                        {
                             Ok(resp) => {
                                 tracing::info!(
                                 session_id = %sid,
@@ -371,6 +382,7 @@ pub(crate) fn execute(
                             code_restored,
                             restore_summary,
                             restore_degree,
+                            resume_session_id: Some(sid),
                         };
                     }
                     let worktree_id = preferred_session_id
@@ -481,11 +493,13 @@ pub(crate) fn execute(
                         &session_cwd,
                         &xai_grok_tools::types::compat::CompatConfig::default(),
                     );
-                    let result = acp_send(
+                    let _phase = startup::phase_scope(StartupPhase::SessionCreate);
+                    let result = helpers::acp_send_bounded(
                             acp::NewSessionRequest::new(session_cwd.clone())
                                 .mcp_servers(mcp_servers)
                                 .meta(meta),
                             &tx,
+                            "Worktree session creation",
                         )
                         .await;
                     match result {
@@ -519,9 +533,9 @@ pub(crate) fn execute(
             let mut meta = session_flags.to_meta();
             let is_chat_path = chat_kind || session_flags.chat_mode;
             finalize_chat_session_meta(&mut meta, is_chat_path, session_flags);
-            if let Some(true) = session_flags.restore_code {
+            if let Some(rc) = session_flags.restore_code {
                 meta.get_or_insert_with(acp::Meta::new)
-                    .insert("x.ai/restore_code".into(), serde_json::Value::Bool(true));
+                    .insert("x.ai/restore_code".into(), serde_json::Value::Bool(rc));
             }
             let cwd = session_cwd.unwrap_or_else(|| cwd.to_path_buf());
             let mcp_started = std::time::Instant::now();
@@ -537,9 +551,10 @@ pub(crate) fn execute(
             let acp_session_id = acp::SessionId::new(session_id);
             tasks
                 .spawn(async move {
+                    let _phase = startup::phase_scope(StartupPhase::SessionCreate);
                     ulog::info("session.load.start", Some(&acp_session_id.0), None);
                     let load_started = std::time::Instant::now();
-                    let result = acp_send(
+                    let result = helpers::acp_send_bounded(
                             acp::LoadSessionRequest::new(
                                     acp_session_id.clone(),
                                     cwd.clone(),
@@ -547,6 +562,7 @@ pub(crate) fn execute(
                                 .mcp_servers(mcp_servers.clone())
                                 .meta(meta.clone()),
                             &tx,
+                            "Session loading",
                         )
                         .await;
                     let load_elapsed_ms = load_started.elapsed().as_millis() as u64;
@@ -635,7 +651,7 @@ pub(crate) fn execute(
                     }
                     let summaries = tokio::task::spawn_blocking(move || {
                             let _permit = permit;
-                            xai_grok_workspace::foreign_sessions::scan_foreign_sessions(
+                            xai_grok_foreign_sessions::scan_foreign_sessions(
                                 &cwd,
                                 enabled,
                             )
@@ -688,7 +704,7 @@ pub(crate) fn execute(
                             compat,
                             &grok_home,
                             |enabled| async move {
-                                tokio::task::spawn_blocking(move || xai_grok_workspace::foreign_sessions::most_recent_foreign_session(
+                                tokio::task::spawn_blocking(move || xai_grok_foreign_sessions::most_recent_foreign_session(
                                         &cwd_for_scan,
                                         enabled,
                                         crate::app::foreign_sessions::RESUME_HINT_WINDOW,
@@ -998,8 +1014,11 @@ pub(crate) fn execute(
                             &storage_client,
                             &session_id,
                             &cwd_str,
-                            None,
-                            progress,
+                            xai_grok_shell::session::restore::RestoreSessionOpts {
+                                turn_override: None,
+                                progress,
+                                restore_code: true,
+                            },
                         )
                         .await
                     {
@@ -1188,6 +1207,7 @@ pub(crate) fn execute(
         Effect::SendBashCommand { agent_id, session_id, command, prompt_id } => {
             let tx = acp_tx.clone();
             let screen_mode = session_flags.screen_mode_label;
+            let is_api_key_auth = session_flags.is_api_key_auth;
             tasks
                 .spawn(async move {
                     use xai_grok_shell::extensions::prompt_meta::PromptBlockMeta;
@@ -1239,7 +1259,8 @@ pub(crate) fn execute(
                         .and_then(http_status_from_error);
                     TaskResult::PromptResponse {
                         agent_id,
-                        result: result.map_err(|e| e.to_string()),
+                        result: result
+                            .map_err(|e| format_acp_error(&e, is_api_key_auth)),
                         http_status,
                         prompt_id: Some(prompt_id),
                     }
@@ -1249,7 +1270,7 @@ pub(crate) fn execute(
             session_id,
             cancel_subagents,
             trigger,
-            rewind_if_pristine,
+            rewind_if_no_output,
         } => {
             let tx = acp_tx.clone();
             let trigger_str = trigger.map(|t| t.as_wire_str());
@@ -1262,7 +1283,7 @@ pub(crate) fn execute(
                             serde_json::json!({
                         "cancel_subagents": cancel_subagents,
                         "trigger": trigger_str,
-                        "rewind_if_pristine": rewind_if_pristine,
+                        "rewind_if_no_output": rewind_if_no_output,
                     }),
                         ),
                     );
@@ -1271,7 +1292,8 @@ pub(crate) fn execute(
                     if let Some(t) = trigger_str {
                         meta["cancelTrigger"] = t.into();
                     }
-                    if rewind_if_pristine {
+                    if rewind_if_no_output {
+                        meta["rewindIfNoOutput"] = true.into();
                         meta["rewindIfPristine"] = true.into();
                     }
                     let req = acp::CancelNotification::new(session_id.clone())
@@ -1584,7 +1606,7 @@ pub(crate) fn execute(
                     }
                 });
         }
-        Effect::KillBgTask { session_id, task_id } => {
+        Effect::KillBgTask { session_id, task_id, source } => {
             let tx = acp_tx.clone();
             let sid = session_id.0.to_string();
             tasks
@@ -1592,6 +1614,7 @@ pub(crate) fn execute(
                     let params = xai_grok_shell::extensions::task::KillTaskRequest {
                         session_id: sid.clone(),
                         task_id: task_id.clone(),
+                        source,
                     };
                     let req = acp::ExtRequest::new(
                         "x.ai/task/kill",
@@ -3158,7 +3181,7 @@ pub(crate) fn execute(
                     }
                 });
         }
-        Effect::ShowSessionInfo { agent_id, session_id, show_resolved_model } => {
+        Effect::ShowSessionInfo { agent_id, session_id, show_resolved_model, nonce } => {
             let is_api_key_auth = session_flags.is_api_key_auth;
             let api_key_env_set = xai_grok_shell::agent::auth_method::has_xai_api_key_env();
             let tx = acp_tx.clone();
@@ -3174,14 +3197,54 @@ pub(crate) fn execute(
                                 is_api_key_auth,
                                 api_key_env_set,
                             );
+                            let fields = session_info_fields(
+                                &info,
+                                title.as_deref(),
+                                show_resolved_model,
+                            );
                             TaskResult::SessionInfoComplete {
                                 agent_id,
+                                session_id,
                                 info: Box::new(info),
                                 text,
+                                fields,
+                                nonce,
                             }
                         }
                         Err(error) => {
                             TaskResult::SessionInfoFailed {
+                                agent_id,
+                                session_id,
+                                error,
+                                nonce,
+                            }
+                        }
+                    }
+                });
+        }
+        Effect::RenameSession { agent_id, session_id, title, cwd, kind } => {
+            let tx = acp_tx.clone();
+            tasks
+                .spawn(async move {
+                    match session_rename_rpc(
+                            &tx,
+                            actions::RenameSessionRequest::for_rename(
+                                session_id.0.to_string(),
+                                title.clone(),
+                                cwd.to_string_lossy().to_string(),
+                                kind,
+                            ),
+                        )
+                        .await
+                    {
+                        Ok(()) => {
+                            TaskResult::RenameSessionComplete {
+                                agent_id,
+                                title,
+                            }
+                        }
+                        Err(error) => {
+                            TaskResult::RenameSessionFailed {
                                 agent_id,
                                 error,
                             }
@@ -3189,59 +3252,38 @@ pub(crate) fn execute(
                     }
                 });
         }
-        Effect::RenameSession { agent_id, session_id, title, cwd } => {
+        Effect::ResetSessionTitle {
+            agent_id,
+            session_id,
+            cwd,
+            kind,
+            previous_display_name,
+            previous_generated_title,
+        } => {
             let tx = acp_tx.clone();
             tasks
                 .spawn(async move {
-                    #[derive(serde::Serialize)]
-                    #[serde(rename_all = "camelCase")]
-                    struct RenameRequest {
-                        session_id: String,
-                        title: String,
-                        cwd: String,
-                    }
-                    let request = acp::ExtRequest::new(
-                        "x.ai/session/rename",
-                        serde_json::value::to_raw_value(
-                                &RenameRequest {
-                                    session_id: session_id.0.to_string(),
-                                    title: title.clone(),
-                                    cwd: cwd.to_string_lossy().to_string(),
-                                },
-                            )
-                            .expect("serialize rename params")
-                            .into(),
-                    );
-                    match acp_send(request, &tx).await {
-                        Ok(resp) => {
-                            let wrapper: serde_json::Value = serde_json::from_str(
-                                    resp.0.get(),
-                                )
-                                .unwrap_or_default();
-                            if let Some(err) = wrapper
-                                .get("error")
-                                .filter(|v| !v.is_null())
-                            {
-                                let msg = err
-                                    .as_str()
-                                    .map(String::from)
-                                    .unwrap_or_else(|| err.to_string());
-                                return TaskResult::RenameSessionFailed {
-                                    agent_id,
-                                    error: msg,
-                                };
-                            }
-                            TaskResult::RenameSessionComplete {
+                    match session_rename_rpc(
+                            &tx,
+                            actions::RenameSessionRequest::for_reset(
+                                session_id.0.to_string(),
+                                cwd.to_string_lossy().to_string(),
+                                kind,
+                            ),
+                        )
+                        .await
+                    {
+                        Ok(()) => {
+                            TaskResult::ResetSessionTitleComplete {
                                 agent_id,
-                                title,
                             }
                         }
-                        Err(e) => {
-                            TaskResult::RenameSessionFailed {
+                        Err(error) => {
+                            TaskResult::ResetSessionTitleFailed {
                                 agent_id,
-                                error: sanitize_user_error(
-                                    &format!("couldn't rename session: {e}"),
-                                ),
+                                error,
+                                previous_display_name,
+                                previous_generated_title,
                             }
                         }
                     }
@@ -3375,7 +3417,7 @@ pub(crate) fn execute(
                     }
                 });
         }
-        Effect::ShowContextInfo { agent_id, session_id } => {
+        Effect::ShowContextInfo { agent_id, session_id, nonce } => {
             let tx = acp_tx.clone();
             tasks
                 .spawn(async move {
@@ -3383,19 +3425,23 @@ pub(crate) fn execute(
                         Ok(info) => {
                             TaskResult::ContextInfoComplete {
                                 agent_id,
+                                session_id,
                                 info: Box::new(info),
+                                nonce,
                             }
                         }
                         Err(error) => {
                             TaskResult::ContextInfoFailed {
                                 agent_id,
+                                session_id,
                                 error,
+                                nonce,
                             }
                         }
                     }
                 });
         }
-        Effect::FetchSessionUsage { agent_id, session_id } => {
+        Effect::FetchSessionUsage { agent_id, session_id, nonce } => {
             let tx = acp_tx.clone();
             tasks
                 .spawn(async move {
@@ -3405,6 +3451,7 @@ pub(crate) fn execute(
                                 agent_id,
                                 session_id,
                                 usage: Box::new(usage),
+                                nonce,
                             }
                         }
                         Err(error) => {
@@ -3412,6 +3459,7 @@ pub(crate) fn execute(
                                 agent_id,
                                 session_id,
                                 error,
+                                nonce,
                             }
                         }
                     }
@@ -3431,7 +3479,7 @@ pub(crate) fn execute(
                         client_type: ClientType::Tui,
                         rating_type: None,
                         rating_value: None,
-                        feedback_text: Some(feedback_text),
+                        feedback_text: Some(feedback_text.clone()),
                         feedback_categories: vec![],
                         context_type: None,
                         turn_number: None,
@@ -3875,74 +3923,17 @@ pub(crate) fn execute(
                     }
                 });
         }
-        Effect::RewindPreview { agent_id, session_id, target_prompt_index, mode } => {
+        Effect::RewindExecute { agent_id, session_id, target_prompt_index } => {
             let tx = acp_tx.clone();
             tasks
                 .spawn(async move {
                     let request = acp::ExtRequest::new(
                         "x.ai/rewind/execute",
                         serde_json::value::to_raw_value(
-                                &serde_json::json!({
-                        "sessionId": session_id.0.to_string(),
-                        "targetPromptIndex": target_prompt_index,
-                        "force": false,
-                        "mode": mode.wire_value(),
-                    }),
-                            )
-                            .expect("serialize rewind/execute preview params")
-                            .into(),
-                    );
-                    match acp_send(request, &tx).await {
-                        Ok(resp) => {
-                            let wrapper: serde_json::Value = serde_json::from_str(
-                                    resp.0.get(),
-                                )
-                                .unwrap_or_default();
-                            let result_val = wrapper
-                                .get("result")
-                                .cloned()
-                                .unwrap_or(wrapper.clone());
-                            match serde_json::from_value::<
-                                crate::views::rewind::RewindResponse,
-                            >(result_val) {
-                                Ok(r) => {
-                                    TaskResult::RewindPreviewComplete {
-                                        agent_id,
-                                        response: r,
-                                        target_prompt_index,
-                                        mode,
-                                    }
-                                }
-                                Err(e) => {
-                                    TaskResult::RewindPreviewFailed {
-                                        agent_id,
-                                        error: format!("invalid response: {e}"),
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            TaskResult::RewindPreviewFailed {
-                                agent_id,
-                                error: sanitize_user_error(&e.to_string()),
-                            }
-                        }
-                    }
-                });
-        }
-        Effect::RewindExecute { agent_id, session_id, target_prompt_index, mode } => {
-            let tx = acp_tx.clone();
-            tasks
-                .spawn(async move {
-                    let request = acp::ExtRequest::new(
-                        "x.ai/rewind/execute",
-                        serde_json::value::to_raw_value(
-                                &serde_json::json!({
-                        "sessionId": session_id.0.to_string(),
-                        "targetPromptIndex": target_prompt_index,
-                        "force": true,
-                        "mode": mode.wire_value(),
-                    }),
+                                &rewind_execute_params(
+                                    session_id.0.as_ref(),
+                                    target_prompt_index,
+                                ),
                             )
                             .expect("serialize rewind/execute params")
                             .into(),
@@ -4107,6 +4098,7 @@ pub(crate) fn execute(
                                         agent_id,
                                         new_session_id: acp::SessionId::new(sid),
                                         cwd: parent_cwd,
+                                        parent_session_id,
                                     }
                                 }
                                 None => {
@@ -4126,7 +4118,12 @@ pub(crate) fn execute(
                     }
                 });
         }
-        Effect::HydrateSessionTitleFromDisk { agent_id, session_id, cwd } => {
+        Effect::HydrateSessionMetaFromDisk {
+            agent_id,
+            session_id,
+            cwd,
+            last_turn_summary_gen,
+        } => {
             tasks
                 .spawn(async move {
                     let info = xai_grok_shell::session::info::Info {
@@ -4135,8 +4132,9 @@ pub(crate) fn execute(
                     };
                     let path = xai_grok_shell::session::persistence::session_dir(&info)
                         .join("summary.json");
-                    let title = tokio::task::spawn_blocking(move || -> Option<
-                            (String, bool),
+                    type DiskTitle = (Option<(String, bool)>, Option<String>);
+                    let (title, last_turn_summary) = tokio::task::spawn_blocking(move || -> Option<
+                            DiskTitle,
                         > {
                             let raw = std::fs::read_to_string(path).ok()?;
                             let summary: xai_grok_shell::session::persistence::Summary = serde_json::from_str(
@@ -4145,19 +4143,24 @@ pub(crate) fn execute(
                                 .ok()?;
                             let manual = summary.manual_title_opt();
                             let is_manual = manual.is_some();
-                            let title = manual.or_else(|| summary.display_title_opt())?;
-                            Some((title, is_manual))
+                            let title = manual
+                                .or_else(|| summary.display_title_opt())
+                                .map(|t| (t, is_manual));
+                            Some((title, summary.last_turn_summary))
                         })
                         .await
                         .ok()
-                        .flatten();
-                    TaskResult::SessionTitleFromDisk {
+                        .flatten()
+                        .unwrap_or((None, None));
+                    TaskResult::SessionMetaFromDisk {
                         agent_id,
                         title,
+                        last_turn_summary,
+                        last_turn_summary_gen,
                     }
                 });
         }
-        Effect::FetchBilling { agent_id, silent } => {
+        Effect::FetchBilling { agent_id, silent, nonce } => {
             let tx = acp_tx.clone();
             tasks
                 .spawn(async move {
@@ -4184,6 +4187,7 @@ pub(crate) fn execute(
                                 agent_id,
                                 error: sanitize_user_error(&format!("{e}")),
                                 silent,
+                                nonce,
                             };
                         }
                     };
@@ -4194,6 +4198,7 @@ pub(crate) fn execute(
                                 agent_id,
                                 error: format!("Parse error: {e}"),
                                 silent,
+                                nonce,
                             };
                         }
                     };
@@ -4210,6 +4215,7 @@ pub(crate) fn execute(
                         silent,
                         subscription_tier,
                         autotopup,
+                        nonce,
                     }
                 });
         }
@@ -4321,7 +4327,7 @@ pub(crate) fn execute(
         Effect::DebouncePluginCta { agent_id, generation } => {
             tasks
                 .spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     TaskResult::PluginCtaDebounceExpired {
                         agent_id,
                         generation,
@@ -4487,6 +4493,38 @@ async fn fetch_session_usage(
         })?;
     Ok(parsed.usage)
 }
+/// Shared `x.ai/session/rename` RPC for rename and `/rename --auto`.
+async fn session_rename_rpc(
+    tx: &AcpAgentTx,
+    request: actions::RenameSessionRequest,
+) -> Result<(), String> {
+    let verb = if request.reset_to_auto {
+        "reset session title"
+    } else {
+        "rename session"
+    };
+    let ext = acp::ExtRequest::new(
+        "x.ai/session/rename",
+        serde_json::value::to_raw_value(&request)
+            .expect("serialize rename params")
+            .into(),
+    );
+    match acp_send(ext, tx).await {
+        Ok(resp) => {
+            let wrapper: serde_json::Value = serde_json::from_str(resp.0.get())
+                .unwrap_or_default();
+            if let Some(err) = wrapper.get("error").filter(|v| !v.is_null()) {
+                let msg = err
+                    .as_str()
+                    .map(String::from)
+                    .unwrap_or_else(|| err.to_string());
+                return Err(msg);
+            }
+            Ok(())
+        }
+        Err(e) => Err(sanitize_user_error(&format!("couldn't {verb}: {e}"))),
+    }
+}
 /// Look up the session title/summary from local persistence.
 async fn lookup_session_title(session_id: &acp::SessionId) -> Option<String> {
     let summaries = xai_grok_shell::session::persistence::list_summaries(None)
@@ -4500,15 +4538,38 @@ async fn lookup_session_title(session_id: &acp::SessionId) -> Option<String> {
 /// Format session info into a human-readable string.
 ///
 /// Mirrors the TUI's `render_session_info` for pager display.
-fn format_session_info(
+/// Structured `/session-info` rows — the single source of truth for both the
+/// formatted string ([`format_session_info`]) and the modal, so neither has to
+/// re-parse the other. Auth is not a field here; it is prose the string appends
+/// on its own. `compact` marks the dense model/runtime group the modal renders
+/// as `Label: value` on one line.
+fn session_info_fields(
     info: &SessionInfoResponse,
     title: Option<&str>,
     show_resolved_model: bool,
-    is_api_key_auth: bool,
-    api_key_env_set: bool,
-) -> String {
-    let session_id = &info.session_id;
-    let cwd = &info.cwd;
+) -> Vec<SessionInfoField> {
+    let mut fields = Vec::new();
+    let mut push = |label: &'static str, value: String, compact: bool| {
+        fields
+            .push(SessionInfoField {
+                label,
+                value,
+                compact,
+            });
+    };
+    if let Some(t) = title {
+        push("Title", t.to_string(), false);
+    }
+    push(
+        "Shell version",
+        xai_grok_version::display_version(xai_grok_update::channel_label()),
+        false,
+    );
+    push("Session ID", info.session_id.to_string(), false);
+    if let Some(id) = info.data.conversation_id.as_deref().filter(|id| !id.is_empty()) {
+        push("Conversation ID", id.to_string(), false);
+    }
+    push("Working directory", info.cwd.to_string(), false);
     let model = info.data.model.as_deref().unwrap_or("unknown");
     let model_display = xai_grok_shell::session::model_display_name(
         info.data.model_display_name.as_deref(),
@@ -4516,50 +4577,54 @@ fn format_session_info(
         info.data.resolved_model_id.as_deref(),
         show_resolved_model,
     );
-    let ctx = &info.data.context;
-    let used = ctx.used;
-    let total = ctx.total;
-    let pct = ctx.usage_pct;
-    let title_line = match title {
-        Some(t) => format!("  Title: {t}\n"),
-        None => String::new(),
-    };
-    let model_hash_line = if xai_grok_shell::session::should_show_model_fingerprint(
+    push("Model", model_display.to_string(), true);
+    if xai_grok_shell::session::should_show_model_fingerprint(
         info.data.show_model_fingerprint,
         model,
-    ) {
-        info.data
-            .model_fingerprint
-            .as_deref()
-            .map(|fp| format!("\n  Model Hash: {fp}"))
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
-    let backend_line = info
-        .data
-        .api_backend
-        .as_deref()
-        .map(|b| format!("\n  API Backend: {b}"))
-        .unwrap_or_default();
-    let sandbox_line = xai_grok_sandbox::profile_name()
-        .map(|profile| format!("\n  Sandbox: {profile}"))
-        .unwrap_or_default();
-    let turn_line = format!("\n  Turn: {}", info.data.turn_index);
-    let conversation_line = info
-        .data
-        .conversation_id
-        .as_deref()
-        .filter(|id| !id.is_empty())
-        .map(|id| format!("\n  Conversation ID: {id}"))
-        .unwrap_or_default();
-    let version_display = xai_grok_version::display_version(
-        xai_grok_update::channel_label(),
+    ) && let Some(fp) = info.data.model_fingerprint.as_deref()
+    {
+        push("Model Hash", fp.to_string(), true);
+    }
+    if let Some(b) = info.data.api_backend.as_deref() {
+        push("API Backend", b.to_string(), true);
+    }
+    if let Some(profile) = xai_grok_sandbox::profile_name() {
+        push("Sandbox", profile.to_string(), true);
+    }
+    push("Turn", info.data.turn_index.to_string(), true);
+    let ctx = &info.data.context;
+    push(
+        "Context",
+        format!("{} / {} tokens ({}%)", ctx.used, ctx.total, ctx.usage_pct),
+        true,
     );
+    fields
+}
+/// The `/session-info` block as a plain string for minimal-mode scrollback.
+/// Built from [`session_info_fields`] (one `  Label: value` line each) with the
+/// auth prose spliced in after the shell version, so it stays a single source
+/// of truth with the modal.
+fn format_session_info(
+    info: &SessionInfoResponse,
+    title: Option<&str>,
+    show_resolved_model: bool,
+    is_api_key_auth: bool,
+    api_key_env_set: bool,
+) -> String {
     let auth_lines = format_auth_lines(is_api_key_auth, api_key_env_set);
-    format!(
-        "{title_line}  Shell version: {version_display}\n{auth_lines}  Session ID: {session_id}{conversation_line}\n  Working directory: {cwd}\n  Model: {model_display}{model_hash_line}{backend_line}{sandbox_line}{turn_line}\n  Context: {used} / {total} tokens ({pct}%)"
-    )
+    let mut out = String::new();
+    for field in session_info_fields(info, title, show_resolved_model) {
+        out.push_str("  ");
+        out.push_str(field.label);
+        out.push_str(": ");
+        out.push_str(&field.value);
+        out.push('\n');
+        if field.label == "Shell version" {
+            out.push_str(&auth_lines);
+        }
+    }
+    out.truncate(out.trim_end_matches('\n').len());
+    out
 }
 /// Auth section for `/session-info` — active login method.
 ///
@@ -4625,6 +4690,18 @@ fn prompt_request_meta(
         map.insert("screenMode".into(), serde_json::Value::String(mode.into()));
     }
     serde_json::Value::Object(map)
+}
+pub(crate) const REWIND_MODE_WIRE: &str = "conversation_only";
+pub(crate) fn rewind_execute_params(
+    session_id: &str,
+    target_prompt_index: usize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "sessionId": session_id,
+        "targetPromptIndex": target_prompt_index,
+        "force": true,
+        "mode": REWIND_MODE_WIRE,
+    })
 }
 /// Build the `x.ai/interject` params. The optional structured `content`
 /// (text + images) is omitted ENTIRELY when `None` so the legacy wire

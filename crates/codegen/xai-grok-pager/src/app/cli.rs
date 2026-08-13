@@ -111,6 +111,14 @@ See ~/.grok/README.md for more information.
         /// Switch to the enterprise release channel.
         #[arg(long, conflicts_with_all = ["alpha", "stable"], hide = true)]
         enterprise: bool,
+        /// Internal: what spawned this `grok update` (`user_command`,
+        /// `auto_background`, `leader_converge`). Hidden.
+        #[arg(long, hide = true)]
+        trigger: Option<String>,
+        /// Internal compat alias for `--trigger=auto_background` (older
+        /// parents still spawn children with it).
+        #[arg(long, hide = true)]
+        auto: bool,
     },
     /// Print version information
     #[command(visible_alias = "v")]
@@ -127,6 +135,9 @@ See ~/.grok/README.md for more information.
     },
     /// Manage git worktrees
     Worktree(crate::worktree_cmd::WorktreeArgs),
+    /// Show what the grok home (~/.grok) uses on disk
+    #[command(name = "du", visible_alias = "disk-usage")]
+    DiskUsage(crate::disk_usage_cmd::DiskUsageArgs),
     /// Expose this workspace to the Computer Hub (via the leader).
     ///
     /// Disabled by default and enabled server-side per account; set
@@ -594,13 +605,18 @@ pub struct PagerArgs {
     #[arg(long = "fork-session")]
     pub fork_session: bool,
     /// Start the session in a new git worktree, optionally named.
+    /// With `--resume` of a remote session, pass `--restore-code` to apply
+    /// the snapshot codebase (conversation is restored either way).
+    /// Headless (`-p`) does not create a worktree from this flag.
     #[arg(short = 'w', long = "worktree", num_args = 0..= 1, default_missing_value = "")]
     pub worktree: Option<String>,
     /// Branch, tag, or commit to base the worktree on (with `--worktree`).
     /// Defaults to the current HEAD of the source checkout when omitted.
     #[arg(long = "worktree-ref", visible_alias = "ref", requires = "worktree")]
     pub worktree_ref: Option<String>,
-    /// Check out the original session's commit when resuming.
+    /// Restore the original session's repository snapshot when resuming.
+    /// Remote sessions require `--worktree` (never checks out into the current
+    /// directory). Without this flag, resume restores conversation only.
     #[arg(long = "restore-code", requires = "resume_session")]
     pub restore_code: bool,
     /// Disable plan mode.

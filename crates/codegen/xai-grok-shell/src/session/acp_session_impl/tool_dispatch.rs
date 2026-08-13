@@ -60,15 +60,15 @@ pub(super) fn lock_path_for_args(args: &serde_json::Value) -> Option<&str> {
 
 /// Pull the path a read/list tool targets and classify it against the store.
 /// Keys span harnesses: `read_file`=`target_file`, grep=`path`,
-/// `list_dir`=`target_directory`. Grammar lives in `xai_chat_state`.
+/// `list_dir`=`target_directory`. Grammar lives in `xai_compaction_transcript`.
 pub(super) fn compaction_artifact_read(
     args: &serde_json::Value,
-) -> Option<xai_chat_state::compaction_transcript::CompactionArtifact> {
+) -> Option<xai_compaction_transcript::CompactionArtifact> {
     let path = str_arg(
         args,
         &["target_file", "file_path", "path", "target_directory"],
     )?;
-    xai_chat_state::compaction_transcript::classify_compaction_path(path)
+    xai_compaction_transcript::classify_compaction_path(path)
 }
 
 /// Map a backend-hosted tool name to a user-facing title, ACP ToolKind,
@@ -206,6 +206,9 @@ impl SessionActor {
             .send(PersistenceMsg::ContentChunk(PersistenceContentChunk::new(
                 prompt_blocks.to_vec(),
             )));
+        // Bash turns bypass `handle_prompt`'s commit point; the command is now
+        // in the ordered persistence stream, so a send-now may cancel this turn.
+        self.mark_front_message_committed().await;
 
         // Run the bash command with streaming enabled
         let tool_call_id = acp::ToolCallId::from(format!("bash-mode-{}", uuid::Uuid::new_v4()));
@@ -356,7 +359,8 @@ impl SessionActor {
 
         self.chat_state_handle.flush();
 
-        self.flush_to_disk().await;
+        let flush_error = self.flush_to_disk().await.err();
+        self.disk_full_acp_error(flush_error.as_ref())?;
 
         let total_tokens = self.chat_state_handle.get_total_tokens().await;
         ok_end_turn(total_tokens, None)

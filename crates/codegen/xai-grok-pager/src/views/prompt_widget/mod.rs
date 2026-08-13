@@ -170,10 +170,11 @@ pub struct PromptStyle {
     /// When `Some((str, color))`, replaces the default `❯` prefix.
     /// Used for bash mode (`"! "` in yellow).
     pub prefix_override: Option<(&'static str, ratatui::style::Color)>,
-    /// Override the placeholder text shown when the textarea is empty.
+    /// Override the placeholder text shown when the textarea is empty (e.g. remember mode).
     /// When `Some(text)`, uses this instead of the default `"Build anything"`.
-    /// Used for feedback mode (`"Type your feedback..."`).
     pub placeholder_override: Option<&'static str>,
+    /// The main composer hides the empty-textarea placeholder on focus; the feedback box keeps it visible.
+    pub placeholder_when_focused: bool,
     /// Compact mode (currently unused for info_block sizing).
     pub compact: bool,
     /// Show the accent line (`┃`) on the left edge of the chrome.
@@ -234,6 +235,7 @@ impl Default for PromptStyle {
             accent_color_override: None,
             border_color_override: None,
             prefix_override: None,
+            placeholder_when_focused: false,
             placeholder_override: None,
             compact: false,
             show_accent_line: false,
@@ -268,6 +270,7 @@ impl PromptStyle {
             accent_color_override: None,
             border_color_override: None,
             prefix_override: None,
+            placeholder_when_focused: false,
             placeholder_override: None,
             compact: false,
             show_accent_line: false,
@@ -306,6 +309,9 @@ pub struct PromptFlag<'a> {
 }
 
 /// Optional info line rendered below the prompt text.
+///
+/// The default is blank: a caller that wants the bottom border without any info text passes it, and [`Self::is_blank`] then skips the text pass.
+#[derive(Default)]
 pub struct PromptInfo<'a> {
     /// Primary label to display on the info line (left side).
     pub model_name: &'a str,
@@ -318,6 +324,15 @@ pub struct PromptInfo<'a> {
     /// When true the warning uses the yellow warning color (<=5% left);
     /// when false it uses dim grey text (5-10% left).
     pub usage_warning_critical: bool,
+}
+
+impl PromptInfo<'_> {
+    pub fn is_blank(&self) -> bool {
+        self.model_name.is_empty()
+            && self.flags.is_empty()
+            && !self.multiline
+            && self.usage_warning.is_none()
+    }
 }
 
 /// Live voice-capture overlay for the prompt.
@@ -421,6 +436,32 @@ impl StashedPrompt {
         }
     }
 
+    /// Clone for freeform prefill while this stash remains the session draft.
+    /// Omits `staged_temp_path` so freeform Drop cannot delete session temps;
+    /// display/send still use `encoded_bytes` / `session_image_path`.
+    pub(crate) fn clone_for_live_prefill(&self) -> Self {
+        let strip_temp = |img: &PastedImage| {
+            let mut c = img.clone();
+            c.staged_temp_path = None;
+            c
+        };
+        Self {
+            text: self.text.clone(),
+            cursor: self.cursor,
+            images: self.images.iter().map(strip_temp).collect(),
+            chip_elements: self.chip_elements.clone(),
+            image_counter: self.image_counter,
+            image_undo_stash: self.image_undo_stash.iter().map(strip_temp).collect(),
+        }
+    }
+
+    pub(crate) fn is_effectively_empty(&self) -> bool {
+        self.text.trim().is_empty()
+            && self.images.is_empty()
+            && self.chip_elements.is_empty()
+            && self.image_undo_stash.is_empty()
+    }
+
     pub(crate) fn into_submission(
         mut self,
     ) -> (
@@ -518,9 +559,8 @@ pub struct PromptWidget {
 
     /// Predicted-next-prompt controller (tab autocomplete ghost text).
     pub(crate) prompt_suggestion: crate::views::prompt_suggestion::PromptSuggestionController,
-    /// Per-frame gate for the prompt-suggestion ghost, set by `AgentView`
-    /// before each draw/key dispatch: false while a turn is running, in
-    /// bash/remember/feedback input modes, or while editing a queued prompt.
+    /// Per-frame gate for the prompt-suggestion ghost, set by `AgentView` before each draw or key dispatch.
+    /// False while a turn is running, in bash/remember input modes, or while editing a queued prompt.
     pub(crate) prompt_suggestion_active: bool,
 
     // -- Image paste state ---------------------------------------------------
@@ -1039,9 +1079,19 @@ impl PromptWidget {
 
     // -- Slash command state sync -------------------------------------------
 
+    pub fn set_slash_current_title(&mut self, title: Option<String>) {
+        self.slash_controller.set_current_title(title);
+    }
+
+    pub fn slash_current_title(&self) -> Option<&str> {
+        self.slash_controller.current_title()
+    }
+
     /// Refresh the slash snapshot from current text + cursor.
     ///
-    /// Called by `AgentView` after every `PromptEvent::Edited`.
+    /// Called by `AgentView` after every `PromptEvent::Edited`, and when
+    /// `current_title` changes while the dropdown is already open (so the
+    /// `/rename` ghost is not left stale until the next keystroke).
     /// This is the only way to update the slash snapshot -- `AgentView`
     /// never touches `slash_controller` or `slash_state` directly.
     ///
@@ -3180,17 +3230,20 @@ impl PromptWidget {
             false
         };
 
-        // Placeholder text when empty and unfocused
+        // Placeholder text when empty (unfocused, or opted in while focused).
         if self.textarea.text().is_empty()
             && ta_area.width > 0
-            && !style.focused
+            && (!style.focused || style.placeholder_when_focused)
             && !voice_interim_shown
         {
             let placeholder = style.placeholder_override.unwrap_or("Build anything");
+            // `set_string` clips at the buffer edge, not at the textarea, so a placeholder longer than the box would paint over its border.
+            let truncated =
+                crate::render::line_utils::truncate_str(placeholder, ta_area.width as usize);
             buf.set_string(
                 ta_area.x,
                 ta_area.y,
-                placeholder,
+                &truncated,
                 Style::default().fg(theme.gray).bg(bg),
             );
         }
@@ -3234,7 +3287,8 @@ impl PromptWidget {
                     cell.set_style(div_style);
                 }
             }
-            if let Some(info) = info {
+            // A blank info line still writes its padding spaces, which would punch holes in the divider it sits on.
+            if let Some(info) = info.filter(|i| !i.is_blank()) {
                 let info_rect = Rect {
                     x: content_area.x,
                     y: div_y,

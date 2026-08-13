@@ -403,8 +403,8 @@ impl std::fmt::Display for KillReason {
 fn annotations(bash: &BashOutput) -> String {
     let mut s = String::new();
     if bash.truncated {
-        let shown = format_bytes(bash.output.len());
-        let total = format_bytes(bash.total_bytes);
+        let shown = format_bytes(bash.output.len() as u64);
+        let total = format_bytes(bash.total_bytes as u64);
         s.push_str(&format!(
             " [truncated: showing first/last {} of {} - full output at: {}]",
             shown, total, bash.output_file
@@ -436,8 +436,8 @@ pub(crate) fn format_default_prompt(bash: &BashOutput) -> String {
     let is_backgrounded = bash.signal.as_deref() == Some("backgrounded");
 
     if is_backgrounded {
-        let shown = format_bytes(bash.output.len());
-        let total = format_bytes(bash.total_bytes);
+        let shown = format_bytes(bash.output.len() as u64);
+        let total = format_bytes(bash.total_bytes as u64);
         format!(
             "[Command moved to background]\n\n\
              Partial output ({} of {} total):\n\n\
@@ -1378,7 +1378,7 @@ impl BashTool {
             .param_for_kind(ToolKind::BackgroundTaskAction, "task_ids")
             .unwrap_or("task_ids");
         Ok(format!(
-            "Use {get_task_name} tool with {task_ids_param}=[\"{task_id}\"] to retrieve the output."
+            "Use {get_task_name} with {task_ids_param}=[\"{task_id}\"] when you need the output."
         ))
     }
 
@@ -3394,8 +3394,9 @@ mod tests {
         match result {
             BashToolOutput::Background(bg) => {
                 assert!(
-                    bg.retrieval_hint
-                        .contains("Use get_task_output tool with task_ids=[\"t2\"]"),
+                    bg.retrieval_hint.contains(
+                        "Use get_task_output with task_ids=[\"t2\"] when you need the output."
+                    ),
                     "Hint should fall back to canonical names: {}",
                     bg.retrieval_hint
                 );

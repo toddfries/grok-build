@@ -12,7 +12,9 @@ use super::*;
 // Re-exported for `acp_session.rs` which does `pub(crate) use interjection::*;`
 // so retained code and co-located tests keep resolving by `acp_session::` path.
 #[allow(unused_imports)]
-pub(crate) use xai_interjection_core::{InterjectionBuffer, drain_formatted, format_interjection};
+pub(crate) use xai_interjection_core::{
+    INTERRUPT_NOTE, InterjectionBuffer, drain_formatted, format_interjection, frame_user_turn,
+};
 
 /// Shell instantiation of the shared entry type: images are ACP content.
 pub(crate) type PendingInterjection = xai_interjection_core::PendingInterjection<acp::ImageContent>;
@@ -23,6 +25,10 @@ pub(crate) type PendingInterjection = xai_interjection_core::PendingInterjection
 /// persist-only: every pane already rendered the text from the
 /// `x.ai/session/interjection` broadcast, so a live echo would duplicate it.
 pub(crate) const INTERJECT_FALLBACK_PROMPT_PREFIX: &str = "interject-fallback-";
+
+pub(crate) fn is_interject_fallback(prompt_id: &str) -> bool {
+    prompt_id.starts_with(INTERJECT_FALLBACK_PROMPT_PREFIX)
+}
 
 impl SessionActor {
     /// Convert a stranded interjection into a queued prompt turn.
@@ -61,7 +67,7 @@ impl SessionActor {
         };
         let (respond_to, _) = tokio::sync::oneshot::channel();
         // User message (skips queue_input); invalidate in-flight recap now.
-        self.cancel_pending_recap_for_new_prompt();
+        self.invalidate_side_calls_for_new_prompt();
         let item = InputItem {
             prompt_id,
             prompt_blocks,
@@ -98,21 +104,17 @@ impl SessionActor {
         tracing::info!("Converted stranded interjection into a queued prompt turn");
     }
 
-    /// Flush interjections that missed the completed turn's final drain into
-    /// queued prompt turns (front of the queue, original order). Returns
-    /// whether anything was flushed; the caller kicks
-    /// `maybe_start_running_task`.
-    pub(super) async fn flush_stranded_interjections(&self) -> bool {
+    /// Convert interjections that missed their turn's final drain into queued
+    /// prompt turns, front of the queue in original order. Returns the count.
+    pub(super) async fn flush_stranded_interjections(&self) -> usize {
         let stranded = self.pending_interjections.drain_all();
-        if stranded.is_empty() {
-            return false;
-        }
+        let count = stranded.len();
         // Reversed push_fronts keep entry 0 front-most.
         for entry in stranded.into_iter().rev() {
             self.queue_interjection_fallback_prompt(entry.text, entry.attachments, true)
                 .await;
         }
-        true
+        count
     }
     /// Normalize interjection images for injection (shared pipeline above);
     /// notices append to `wrapped` (TEXT side only). Returns the images to
@@ -150,12 +152,8 @@ impl SessionActor {
     }
 
     /// Broadcast a mid-turn interjection to every attached client.
-    /// Fan it out (sessionId-routed, fire-and-forget) so every pane viewing the
-    /// session renders the interjection block — not just the originator. The
-    /// originating pager rendered an optimistic block locally and dedups this
-    /// echo by `id`; other panes (which never minted the id) render it. `id` is
-    /// to chat state. Shared by `add_followup_message_as_user_turn` (which
-    /// `None` only for older clients, in which case every pane renders.
+    /// The originator uses `id` to claim its optimistic prompt block; other
+    /// clients render the notification normally.
     pub(super) fn broadcast_interjection(&self, text: &str, id: Option<&str>) {
         let mut payload = serde_json::json!({
             "sessionId": self.session_info.id.0.as_ref(),
@@ -277,15 +275,32 @@ impl SessionActor {
         .await
     }
 
-    /// Drain all pending interjections, wrap them, and inject each into the
-    /// ([`ConversationItem::interjection`], tagged
-    /// `SyntheticReason::Interjection`) — never appended to tool results, so
-    /// compaction, replay, and analytics see the user's steering text as its
-    /// own user turn.
-    ///
-    /// Returns `true` if any interjections were drained (caller may want to
-    /// Returns `true` if any interjections were drained (caller may want to
-    /// `continue` the turn loop so the model sees them on the next iteration).
+    /// When follow-up behavior is Steer, promote held queue rows into
+    /// interjections, then drain. Call after a tool batch, at loop top, and
+    /// before the turn returns to the user. Returns `true` if any
+    /// interjections were drained (caller may `continue` so the model sees them
+    /// next).
+    pub(super) async fn drain_interjections_at_safe_point(&self) -> bool {
+        // Queue (default) must not re-parse config on every tool/model/turn-end
+        // drain. `follow_up_steer_enabled` is mtime-keyed on config.toml so a
+        // live pager settings write is visible without restarting the shell
+        // agent (a separate process); unchanged mtime is a cheap stat.
+        if crate::util::config::follow_up_steer_enabled().await {
+            let has_held = {
+                let state = self.state.lock().await;
+                let running = state.running_prompt_id();
+                running.is_some()
+                    && state.pending_inputs.iter().any(|item| {
+                        !item.origin.is_synthetic() && Some(item.prompt_id.as_str()) != running
+                    })
+            };
+            if has_held {
+                self.promote_queued_as_interjections().await;
+            }
+        }
+        self.drain_pending_interjections().await
+    }
+
     pub(super) async fn drain_pending_interjections(&self) -> bool {
         // Manual drain (not `drain_formatted`): skill parsing needs the raw
         // text — parsed post-wrap, the envelope's closing `</user_query>` tag

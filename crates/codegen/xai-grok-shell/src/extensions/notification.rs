@@ -35,6 +35,21 @@ pub struct WorkflowAgentInfo {
     pub duration_ms: u64,
 }
 
+/// `_meta` key on rename fan-out (`SessionSummaryGenerated` + ACP
+/// `SessionInfoUpdate`). Old clients ignore unknown meta.
+pub const TITLE_IS_MANUAL_META_KEY: &str = "x.ai/titleIsManual";
+
+/// `_meta` object carried on a manual-rename fan-out.
+pub fn title_is_manual_meta() -> serde_json::Value {
+    serde_json::json!({ TITLE_IS_MANUAL_META_KEY: true })
+}
+
+/// `_meta` object carried on `/rename --auto` fan-out. Distinct from
+/// *absent* meta (auto title — must not clobber `display_name`).
+pub fn title_is_unpinned_meta() -> serde_json::Value {
+    serde_json::json!({ TITLE_IS_MANUAL_META_KEY: false })
+}
+
 /// xAI-specific session notification (parallel to acp::SessionNotification)
 /// This wraps an XaiSessionUpdate with session context for persistence and replay.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -544,9 +559,7 @@ pub enum SessionUpdate {
         event_name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_name: Option<String>,
-        /// The prompt turn this batch belongs to, when known; lets the
-        /// client keep a delayed `stop`/`stop_failure` batch off the wrong
-        /// turn's marker.
+        /// Keeps a delayed turn-end batch off the wrong turn's marker.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt_id: Option<String>,
         runs: Vec<HookRunEntryDto>,
@@ -598,6 +611,23 @@ pub enum SessionUpdate {
     /// forever; on receipt the pager clears it. Never emitted for an automatic
     /// recap (those show no spinner).
     SessionRecapUnavailable,
+    /// Ultra-short summary of the just-finished successful turn, generated at
+    /// turn end for the dashboard row's secondary line. Rows show it until
+    /// the next successful turn's summary replaces it.
+    ///
+    /// Transient (never persisted to `updates.jsonl`): the durable copy lives
+    /// in `summary.json` and reaches non-attached clients via the roster.
+    /// Clients may apply deliveries directly — generation is serialized
+    /// shell-side (one in-flight call, aborted by newer turns) and gateway
+    /// delivery is ordered, so the latest delivery is the latest summary.
+    LastTurnSummary {
+        /// One-line fragment (~5–12 words, capped at a safety limit).
+        summary: String,
+        /// Prompt id of the turn this summary describes (provenance; also
+        /// persisted as `Summary::last_turn_summary_prompt_id`).
+        #[serde(default)]
+        prompt_id: Option<String>,
+    },
     /// A compaction checkpoint marker written to `updates.jsonl`.
     ///
     /// This is **persist-only** — it is never sent to the gateway/UI. It records
@@ -776,7 +806,12 @@ pub enum SessionUpdate {
         subagent_id: Option<String>,
     },
     /// A scheduled task was deleted/cancelled.
-    ScheduledTaskDeleted { task_id: String },
+    ScheduledTaskDeleted {
+        task_id: String,
+        /// `Unknown` on rows persisted before the reason field existed.
+        #[serde(default)]
+        reason: xai_grok_tools::notification::ScheduledTaskRemovedReason,
+    },
     /// A monitor event (stdout line from a monitor background process).
     MonitorEvent {
         task_id: String,
@@ -1121,6 +1156,9 @@ impl From<&crate::session::image_normalize::ImageCompressionInfo> for ImageCompr
     }
 }
 
+pub const DISK_FULL_ERROR_TYPE: &str = "disk_full";
+pub const DISK_FULL_USER_MESSAGE: &str = "Out of disk space. Free some space and try again.";
+
 /// State of a retry operation or error for visual feedback in the TUI
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", tag = "type")]
@@ -1160,8 +1198,8 @@ pub enum RetryState {
 /// again. Drives the actionable re-auth banner.
 ///
 /// `legacy_auth` is intentionally excluded: those failures carry their own
-/// detailed migration guidance (`grok logout` / `grok login`) in the
-/// message, so we surface that verbatim instead of the generic prompt.
+/// detailed migration guidance (`grok update` / `grok logout` / `grok login`)
+/// in the message, so we surface that verbatim instead of the generic prompt.
 ///
 /// `auth_transient` is excluded for the opposite reason: the shell emits it
 /// only when the failure self-heals (see `AuthManager::requires_manual_reauth`)

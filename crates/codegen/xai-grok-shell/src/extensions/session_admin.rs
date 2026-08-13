@@ -28,7 +28,9 @@ use serde::Deserialize;
 use super::{ExtResult, parse_params, to_raw_response};
 use crate::agent::MvpAgent;
 use crate::leader::protocol::InternalMethod;
-use crate::session::persistence::list_summaries;
+use crate::session::persistence::{
+    MAX_TITLE_BYTES, MAX_TITLE_SCALARS, PersistenceMsg, list_summaries, sanitize_rename_title,
+};
 use crate::session::storage::StorageAdapter;
 use crate::session::storage::jsonl::JsonlStorageAdapter;
 use crate::session::unified_list::SessionKind;
@@ -36,7 +38,7 @@ use crate::session::{ExtMethodResult, SessionCommand};
 use xai_grok_telemetry::id::agent_id;
 
 #[tracing::instrument(skip_all, fields(method = %args.method))]
-pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
+pub(crate) async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     if let Some(method) = InternalMethod::from_name(args.method.as_ref()) {
         return handle_internal(agent, args, method).await;
     }
@@ -76,25 +78,61 @@ async fn handle_internal(
 
 // session/rename
 
-/// Handles renaming a session.
-async fn handle_session_rename(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct RenameRequest {
-        session_id: String,
-        title: String,
-        #[serde(default)]
-        cwd: Option<String>,
-        #[serde(default)]
-        kind: SessionKind,
-    }
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionRenameRequest {
+    session_id: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    kind: SessionKind,
+    #[serde(default)]
+    reset_to_auto: bool,
+}
 
-    let mut req: RenameRequest = parse_params(args)?;
+/// Handles renaming a session.
+///
+/// Relay-registered sessions (sidebar titles): the relay REST
+/// endpoint remains the sole title authority. This ACP method does not
+/// write through `relay_sync`; a rename that never reaches the relay
+/// reverts on the next sidebar refetch. Clients that own a relay lane
+/// must rename through the relay REST endpoint. Unpin (`resetToAuto`)
+/// has the same gap and cannot clear a relay sidebar title (the relay
+/// REST API can only set a title).
+async fn handle_session_rename(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
+    let mut req: SessionRenameRequest = parse_params(args)?;
+    if req.reset_to_auto {
+        if req.kind == SessionKind::Chat {
+            return Err(acp::Error::invalid_request()
+                .data("chat conversations have no auto-title to restore"));
+        }
+        // Mixed-version: a new pager sends `{title:"", resetToAuto:true}` so
+        // an old shell (unknown field ignored) hits the blank-title rejection
+        // instead of silently renaming. Non-empty here is a client bug.
+        if !sanitize_rename_title(&req.title).is_empty() {
+            return Err(
+                acp::Error::invalid_request().data("title must be empty when resetToAuto is set")
+            );
+        }
+        return reset_session_title_to_auto(agent, &req.session_id, req.cwd.as_deref()).await;
+    }
     // Manual titles must be non-blank: `Summary.title_is_manual` binds to a
     // real `generated_title`, so reject whitespace-only input at the boundary.
-    req.title = req.title.trim().to_string();
+    // Strip C0/C1 controls here (single authority) so a `/rename` OSC/CSI
+    // payload cannot persist on RemoteSync.
+    if req.title.len() > MAX_TITLE_BYTES {
+        return Err(acp::Error::invalid_request().data("title too large"));
+    }
+    req.title = sanitize_rename_title(&req.title).into_owned();
     if req.title.is_empty() {
         return Err(acp::Error::invalid_request().data("title must not be blank"));
+    }
+    if req.title.chars().count() > MAX_TITLE_SCALARS {
+        return Err(acp::Error::invalid_request().data(format!(
+            "title too long (max {MAX_TITLE_SCALARS} characters after removing control characters)"
+        )));
     }
 
     if req.kind == SessionKind::Chat {
@@ -126,6 +164,14 @@ async fn handle_session_rename(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtR
             acp::Error::internal_error().data(format!("failed to update session title: {e}"))
         })?;
 
+    // Resident sessions own RemoteSync inside the persistence actor. Route
+    // via that FIFO channel so a racing auto-title SetTitle cannot overtake.
+    if let Some(handle) = agent.resident_handle(&session_id) {
+        let _ = handle
+            .persistence_tx
+            .send(PersistenceMsg::ManualTitleRenamed(req.title.clone()));
+    }
+
     // Update session search index with new title
     crate::session::storage::search::notify_session_updated(&info.id.to_string(), &info.cwd);
 
@@ -141,6 +187,7 @@ async fn handle_session_rename(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtR
 
         let mut metadata = ExportedMetadata::from_summary(summary);
         metadata.title = Some(req.title.clone());
+        metadata.title_is_manual = Some(true);
         metadata.updated_at = Some(chrono::Utc::now().to_rfc3339());
         if let Err(e) = BackendClient::new()
             .with_auth_manager(agent.auth_manager.clone())
@@ -152,47 +199,171 @@ async fn handle_session_rename(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtR
     }
 
     // Hook 2: update session replica with summary (fire-and-forget)
-    if let Some(client) = agent.session_registry_client() {
-        let sid = req.session_id.to_string();
-        let title = if agent
-            .auth_manager
-            .current_or_expired()
-            .is_some_and(|a| a.is_zdr_team())
-        {
-            None
-        } else {
-            Some(req.title.clone())
-        };
-        tokio::spawn(async move {
-            let update = crate::agent::session_registry_client::UpdateRequest {
-                summary: title,
-                first_prompt: None,
-                last_turn_number: None,
-                repo_head_at_end: None,
-                restorable_turn_number: None,
-            };
-            if let Err(e) = client.update(&sid, &update).await {
-                tracing::warn!(error = %e, "session registry summary update failed (non-fatal)");
-            }
-        });
-    }
+    spawn_registry_title_update(
+        agent,
+        &req.session_id,
+        registry_title_for_agent(agent, Some(req.title.clone())),
+    );
 
     tracing::info!(session_id = %req.session_id, title = %req.title, "Session renamed");
 
     to_raw_response(&serde_json::json!({ "success": true }))
 }
 
+/// `/rename --auto`: clear the local manual pin under the summary lock.
+/// When a pin was actually cleared, enqueue `ResetTitleToAuto` (generator
+/// reset + remote cache clear) and fan out `titleIsManual: false`. Always
+/// re-indexes FTS.
+async fn reset_session_title_to_auto(
+    agent: &MvpAgent,
+    session_id: &str,
+    cwd: Option<&str>,
+) -> ExtResult {
+    let session_id_acp = acp::SessionId::new(Arc::from(session_id));
+
+    let summaries = list_summaries(cwd)
+        .await
+        .map_err(|e| acp::Error::internal_error().data(format!("failed to list sessions: {e}")))?;
+
+    let summary = summaries
+        .iter()
+        .find(|s| s.info.id == session_id_acp)
+        .ok_or_else(|| {
+            acp::Error::invalid_request().data(format!("session not found: {session_id}"))
+        })?;
+
+    let info = summary.info.clone();
+
+    let storage = JsonlStorageAdapter::default();
+    let cleared = storage.reset_title_to_auto(&info).await.map_err(|e| {
+        acp::Error::internal_error().data(format!("failed to reset session title: {e}"))
+    })?;
+
+    if cleared {
+        if let Some(handle) = agent.resident_handle(&session_id_acp) {
+            let _ = handle.persistence_tx.send(PersistenceMsg::ResetTitleToAuto);
+        }
+        // Non-resident sessions have no persistence actor / RemoteSync.
+        // Mirror the rename writeback path so a dormant unpin cannot leave
+        // the remote pin for a later pull to restore.
+        if agent.is_writeback_storage()
+            && let Some(auth) = agent.current_auth()
+            && !auth.is_zdr_team()
+        {
+            use crate::remote::client::BackendClient;
+            use crate::session::export::ExportedMetadata;
+
+            let mut metadata = ExportedMetadata::from_summary(summary);
+            metadata.title = Some(String::new());
+            metadata.title_is_manual = Some(false);
+            metadata.updated_at = Some(chrono::Utc::now().to_rfc3339());
+            if let Err(e) = BackendClient::new()
+                .with_auth_manager(agent.auth_manager.clone())
+                .save_session_data(session_id, &[], Some(&metadata))
+                .await
+            {
+                tracing::warn!(
+                    ?e,
+                    session_id = %session_id,
+                    "failed to clear remote title on unpin"
+                );
+            }
+        }
+        // `titleIsManual: false` is distinct from absent meta (absent =
+        // racing auto title).
+        notify_session_title_unpinned(agent, session_id_acp).await;
+        // Empty string, not None: `UpdateRequest.summary` omits `None` and
+        // the replica would keep advertising the old manual title.
+        spawn_registry_title_update(
+            agent,
+            session_id,
+            registry_title_for_agent(agent, Some(String::new())),
+        );
+    }
+
+    crate::session::storage::search::notify_session_updated(&info.id.to_string(), &info.cwd);
+
+    tracing::info!(session_id = %session_id, cleared, "Session title reset to auto");
+
+    to_raw_response(&serde_json::json!({ "success": true }))
+}
+
+/// ZDR teams omit the title on the wire (`None`); everyone else sends `title`.
+fn registry_title_for_agent(agent: &MvpAgent, title: Option<String>) -> Option<String> {
+    if agent
+        .auth_manager
+        .current_or_expired()
+        .is_some_and(|a| a.is_zdr_team())
+    {
+        None
+    } else {
+        title
+    }
+}
+
+/// Fire-and-forget session-registry summary update. `title = None` omits
+/// the field (no-op on a merge replica); `Some("")` clears a prior pin.
+fn spawn_registry_title_update(agent: &MvpAgent, session_id: &str, title: Option<String>) {
+    let Some(client) = agent.session_registry_client() else {
+        return;
+    };
+    let sid = session_id.to_string();
+    tokio::spawn(async move {
+        let update = crate::agent::session_registry_client::UpdateRequest {
+            summary: title,
+            first_prompt: None,
+            last_turn_number: None,
+            repo_head_at_end: None,
+            restorable_turn_number: None,
+        };
+        if let Err(e) = client.update(&sid, &update).await {
+            tracing::warn!(error = %e, "session registry summary update failed (non-fatal)");
+        }
+    });
+}
+
+/// Unpin fan-out: `SessionSummaryGenerated` with empty text +
+/// `_meta.x.ai/titleIsManual: false` so followers drop `display_name`
+/// without treating this as a racing auto title.
+async fn notify_session_title_unpinned(agent: &MvpAgent, session_id: acp::SessionId) {
+    use crate::extensions::notification::{
+        SessionNotification, SessionUpdate, title_is_unpinned_meta,
+    };
+
+    let notification = SessionNotification {
+        session_id: session_id.clone(),
+        update: SessionUpdate::SessionSummaryGenerated {
+            session_summary: String::new(),
+        },
+        meta: Some(title_is_unpinned_meta()),
+    };
+    if let Ok(params) = serde_json::value::to_raw_value(&notification) {
+        let ext_notification =
+            acp::ExtNotification::new("x.ai/session_notification", params.into());
+        let _ = agent.gateway.ext_notification(ext_notification).await;
+    }
+
+    if agent.is_resident(&session_id) {
+        agent.gateway.forward_fire_and_forget(
+            crate::session::summary::session_info_update_unpinned(session_id),
+        );
+    }
+}
+
 /// Notify connected clients of a session's new title via
-/// `SessionSummaryGenerated`.
+/// `SessionSummaryGenerated`. Manual-rename fan-out stamps
+/// `_meta.x.ai/titleIsManual` so followers can set `display_name`.
 async fn notify_session_title(agent: &MvpAgent, session_id: acp::SessionId, title: &str) {
-    use crate::extensions::notification::{SessionNotification, SessionUpdate};
+    use crate::extensions::notification::{
+        SessionNotification, SessionUpdate, title_is_manual_meta,
+    };
 
     let notification = SessionNotification {
         session_id: session_id.clone(),
         update: SessionUpdate::SessionSummaryGenerated {
             session_summary: title.to_owned(),
         },
-        meta: None,
+        meta: Some(title_is_manual_meta()),
     };
     if let Ok(params) = serde_json::value::to_raw_value(&notification) {
         let ext_notification =
@@ -233,7 +404,7 @@ async fn rename_chat_conversation(
 
     // If this conversation is open live, notify clients of the new title.
     let session_id = acp::SessionId::new(Arc::from(conversation_id));
-    if agent.sessions.borrow().contains_key(&session_id) {
+    if agent.is_resident(&session_id) {
         notify_session_title(agent, session_id, title).await;
     }
 
@@ -274,12 +445,10 @@ async fn handle_session_delete(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtR
     let needs_remote =
         agent.is_writeback_storage() && agent.current_auth().is_some_and(|a| !a.is_zdr_team());
 
-    // Tear down any live actor first (cancel turn/subagents/bg tasks,
-    // process-scope kill, flush). Then wipe history so shutdown cannot
-    // rewrite the session directory after delete.
-    if agent.sessions.borrow().contains_key(&session_id) {
-        agent.teardown_live_session_before_delete(&session_id).await;
-    }
+    // Always drain: even a non-resident session can still have coordinator
+    // children finishing after an earlier fire-and-forget TeardownSession
+    // (e.g. idle unload). hard_stop / kill_all no-op when not resident.
+    agent.teardown_live_session_before_delete(&session_id).await;
 
     // Shared delete: remote-first, then local disk + FTS eviction.
     // Mirrored by the `grok sessions delete <id>` CLI path.
@@ -321,7 +490,7 @@ async fn soft_delete_chat_conversation(agent: &MvpAgent, conversation_id: &str) 
         })?;
 
     let session_id = acp::SessionId::new(Arc::from(conversation_id));
-    if agent.sessions.borrow().contains_key(&session_id) {
+    if agent.is_resident(&session_id) {
         agent.request_session_shutdown(&session_id);
         agent.remove_session(&session_id);
     }
@@ -344,25 +513,19 @@ async fn handle_update_mcp_servers(agent: &MvpAgent, args: &acp::ExtRequest) -> 
     let params: Params = parse_params(args)?;
 
     let (handle, cwd) = {
-        let sessions = agent.sessions.borrow();
-        let h = sessions
-            .get(&params.session_id)
-            .cloned()
+        let h = agent
+            .resident_handle(&params.session_id)
             .ok_or_else(|| acp::Error::invalid_params().data("unknown session id"))?;
         let cwd = std::path::PathBuf::from(&h.info.cwd);
         (h, cwd)
     };
 
-    // Await managed first, then one compat snapshot for admit + merge so a
-    // settings reapply mid-await cannot make the seed and spawned set disagree.
-    let managed = agent.get_managed_mcp_configs().await;
     let compat = agent.cfg.borrow().compat_resolved;
     let admitted =
         crate::session::managed_mcp::admit_client_mcp_servers(params.mcp_servers, &cwd, &compat);
     let merged = crate::session::managed_mcp::merge_managed_mcp_servers(
         admitted.clone(),
         &cwd,
-        &managed,
         agent.plugin_registry_handle().snapshot().as_deref(),
         &compat,
     );
@@ -384,9 +547,9 @@ async fn handle_update_mcp_servers(agent: &MvpAgent, args: &acp::ExtRequest) -> 
     // Store the admitted (not raw) client set: hot-reloads re-merge from this
     // seed, and a raw list would re-spawn a previously rejected vendor server
     // once on-disk attribution vanishes.
-    if let Some(h) = agent.sessions.borrow_mut().get_mut(&params.session_id) {
+    agent.with_resident_mut(&params.session_id, |h| {
         h.initial_client_mcp_servers = admitted;
-    }
+    });
 
     ExtMethodResult::success(serde_json::json!({ "ok": true }))
         .to_ext_response()
@@ -407,9 +570,8 @@ async fn handle_add_local_workspace(agent: &MvpAgent, args: &acp::ExtRequest) ->
 
     let params: Params = parse_params(args)?;
     let cwd = {
-        let sessions = agent.sessions.borrow();
-        let h = sessions
-            .get(&params.session_id)
+        let h = agent
+            .resident_handle(&params.session_id)
             .ok_or_else(|| acp::Error::invalid_params().data("unknown session id"))?;
         std::path::PathBuf::from(&h.info.cwd)
     };
@@ -452,7 +614,7 @@ fn handle_reload_workflows(agent: &MvpAgent) -> ExtResult {
 /// Reload MCP servers for ALL active sessions. Called by the config
 /// hot-reload watcher when `[mcp_servers]` changes in config.toml.
 async fn handle_reload_all_mcp_servers(agent: &MvpAgent) -> ExtResult {
-    let session_ids: Vec<acp::SessionId> = agent.sessions.borrow().keys().cloned().collect();
+    let session_ids = agent.resident_ids();
 
     if session_ids.is_empty() {
         return ExtMethodResult::success(serde_json::json!({ "updated": 0 }))
@@ -460,27 +622,24 @@ async fn handle_reload_all_mcp_servers(agent: &MvpAgent) -> ExtResult {
             .map_err(|e| acp::Error::internal_error().data(e.to_string()));
     }
 
-    let managed = agent.get_managed_mcp_configs().await;
     let mut updated = 0u32;
     for session_id in &session_ids {
-        let Some(handle) = agent.sessions.borrow().get(session_id).cloned() else {
+        let Some(handle) = agent.resident_handle(session_id) else {
             continue;
         };
         let cwd = std::path::PathBuf::from(&handle.info.cwd);
         let compat = agent.cfg.borrow().compat_resolved;
         // Re-seed the merge with the session's original client-provided MCP
-        // servers (e.g. a managed connector injected at `session/new` by a
-        // client session binding). `merge_managed_mcp_servers` already
-        // re-reads every disk source (config.toml, plugins, ~/.claude.json,
-        // ~/.cursor/mcp.json, .mcp.json) internally, so passing
-        // `load_mcp_servers()` output here was redundant — and silently
-        // dropped client servers that exist in no on-disk config, tearing
-        // them down on every config hot-reload.
+        // servers (e.g. a client session binding injected at `session/new`).
+        // `merge_managed_mcp_servers` already re-reads every disk source
+        // (config.toml, plugins, ~/.claude.json, ~/.cursor/mcp.json, .mcp.json)
+        // internally, so passing `load_mcp_servers()` output here was redundant
+        // — and silently dropped client servers that exist in no on-disk config,
+        // tearing them down on every config hot-reload.
         if crate::session::managed_mcp::merge_and_send_managed_mcp_update(
             &handle.cmd_tx,
             &cwd,
             handle.initial_client_mcp_servers.clone(),
-            &managed,
             agent.plugin_registry_handle().snapshot().as_deref(),
             &compat,
         ) {
@@ -521,13 +680,11 @@ async fn handle_reload_project_mcp_servers(agent: &MvpAgent, args: &acp::ExtRequ
 
     // Collect (session_id, cwd) pairs once so we don't hold the
     // `sessions` RefCell borrow across `.await` points.
-    let session_ids: Vec<(acp::SessionId, std::path::PathBuf)> = agent
-        .sessions
-        .borrow()
-        .iter()
-        .map(|(sid, h)| (sid.clone(), std::path::PathBuf::from(&h.info.cwd)))
-        .filter(|(_, cwd)| cwd_matches(cwd, &target_cwd))
-        .collect();
+    let mut session_ids = Vec::new();
+    agent.for_each_resident(|sid, h| {
+        session_ids.push((sid.clone(), std::path::PathBuf::from(&h.info.cwd)));
+    });
+    session_ids.retain(|(_, cwd)| cwd_matches(cwd, &target_cwd));
 
     if session_ids.is_empty() {
         return ExtMethodResult::success(serde_json::json!({ "updated": 0 }))
@@ -535,10 +692,9 @@ async fn handle_reload_project_mcp_servers(agent: &MvpAgent, args: &acp::ExtRequ
             .map_err(|e| acp::Error::internal_error().data(e.to_string()));
     }
 
-    let managed = agent.get_managed_mcp_configs().await;
     let mut updated = 0u32;
     for (session_id, cwd) in &session_ids {
-        let Some(handle) = agent.sessions.borrow().get(session_id).cloned() else {
+        let Some(handle) = agent.resident_handle(session_id) else {
             continue;
         };
         // See `handle_reload_all_mcp_servers`: seed with the session's
@@ -548,7 +704,6 @@ async fn handle_reload_project_mcp_servers(agent: &MvpAgent, args: &acp::ExtRequ
         let merged = crate::session::managed_mcp::merge_managed_mcp_servers(
             handle.initial_client_mcp_servers.clone(),
             cwd,
-            &managed,
             agent.plugin_registry_handle().snapshot().as_deref(),
             &agent.cfg.borrow().compat_resolved,
         );
@@ -678,12 +833,11 @@ fn handle_auth_cleared(agent: &MvpAgent) -> ExtResult {
 
 async fn handle_plugins_reload(agent: &MvpAgent) -> ExtResult {
     // Rebuild the shared registry so future/new sessions clone the latest.
-    let session_cwd = agent
-        .sessions
-        .borrow()
-        .values()
-        .next()
-        .map(|h| std::path::PathBuf::from(&h.info.cwd));
+    let session_cwd = agent.resident_ids().into_iter().next().and_then(|id| {
+        agent
+            .resident_handle(&id)
+            .map(|h| std::path::PathBuf::from(&h.info.cwd))
+    });
     let mut plugins = agent.cfg.borrow().plugins.clone();
     plugins.merge_claude_enabled_plugins(session_cwd.as_deref());
     let disk_cfg = plugins.to_discovery_config();
@@ -815,4 +969,127 @@ async fn handle_session_fork(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtRes
         .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
 
     to_raw_response(&response)
+}
+
+#[cfg(test)]
+mod sanitize_rename_title_tests {
+    use std::borrow::Cow;
+
+    use crate::session::persistence::sanitize_rename_title;
+
+    #[test]
+    fn strips_ascii_controls_and_trims() {
+        assert_eq!(
+            sanitize_rename_title("  Hello\u{1b}[31mWorld\u{07}  ").as_ref(),
+            "Hello[31mWorld"
+        );
+    }
+
+    #[test]
+    fn strips_c1_controls() {
+        assert_eq!(
+            sanitize_rename_title("ok\u{9b}[31m\u{9c}done").as_ref(),
+            "ok[31mdone"
+        );
+    }
+
+    #[test]
+    fn strips_bidi_overrides() {
+        assert_eq!(
+            sanitize_rename_title("deploy-prod\u{202e}gnp.hs").as_ref(),
+            "deploy-prodgnp.hs"
+        );
+    }
+
+    #[test]
+    fn control_only_title_becomes_blank() {
+        assert!(sanitize_rename_title("\u{1b}\u{07}\n\t\u{9b}").is_empty());
+    }
+
+    #[test]
+    fn already_clean_title_is_borrowed() {
+        let s = "Fix Login Bug";
+        let out = sanitize_rename_title(s);
+        assert_eq!(out.as_ref(), s);
+        assert!(matches!(out, Cow::Borrowed(_)));
+
+        let padded = "  hello  ";
+        let out = sanitize_rename_title(padded);
+        assert_eq!(out.as_ref(), "hello");
+        assert!(matches!(out, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn dirty_title_is_owned() {
+        let out = sanitize_rename_title("a\u{1b}b");
+        assert_eq!(out.as_ref(), "ab");
+        assert!(matches!(out, Cow::Owned(_)));
+    }
+
+    #[test]
+    fn length_is_counted_in_scalars_after_strip() {
+        use crate::session::persistence::MAX_TITLE_SCALARS;
+        let exact: String = "é".repeat(MAX_TITLE_SCALARS);
+        assert_eq!(
+            sanitize_rename_title(&exact).chars().count(),
+            MAX_TITLE_SCALARS
+        );
+        let with_controls = format!("\u{1b}{} ", "👍".repeat(MAX_TITLE_SCALARS));
+        assert_eq!(
+            sanitize_rename_title(&with_controls).chars().count(),
+            MAX_TITLE_SCALARS
+        );
+    }
+
+    #[test]
+    fn rename_request_reset_to_auto_deserializes_empty_title_convention() {
+        let unpin: super::SessionRenameRequest = serde_json::from_value(serde_json::json!({
+            "sessionId": "sid",
+            "title": "",
+            "cwd": "/repo",
+            "resetToAuto": true,
+        }))
+        .unwrap();
+        assert!(unpin.reset_to_auto);
+        assert!(unpin.title.is_empty());
+        assert_eq!(unpin.kind, crate::session::unified_list::SessionKind::Build);
+
+        let absent_title: super::SessionRenameRequest = serde_json::from_value(serde_json::json!({
+            "sessionId": "sid",
+            "resetToAuto": true,
+        }))
+        .unwrap();
+        assert!(absent_title.reset_to_auto);
+        assert!(absent_title.title.is_empty());
+
+        let ordinary: super::SessionRenameRequest = serde_json::from_value(serde_json::json!({
+            "sessionId": "sid",
+            "title": "Fix Login Bug",
+            "kind": "chat",
+        }))
+        .unwrap();
+        assert!(!ordinary.reset_to_auto);
+        assert_eq!(ordinary.title, "Fix Login Bug");
+        assert_eq!(
+            ordinary.kind,
+            crate::session::unified_list::SessionKind::Chat
+        );
+    }
+
+    #[test]
+    fn rename_fanout_meta_serializes_title_is_manual() {
+        use crate::extensions::notification::{
+            SessionNotification, SessionUpdate, TITLE_IS_MANUAL_META_KEY, title_is_manual_meta,
+        };
+        let n = SessionNotification {
+            session_id: agent_client_protocol::SessionId::new("s"),
+            update: SessionUpdate::SessionSummaryGenerated {
+                session_summary: "raw & title".into(),
+            },
+            meta: Some(title_is_manual_meta()),
+        };
+        let v = serde_json::to_value(&n).unwrap();
+        assert_eq!(v["_meta"][TITLE_IS_MANUAL_META_KEY], true);
+        assert_eq!(v["update"]["session_summary"], "raw & title");
+    }
 }

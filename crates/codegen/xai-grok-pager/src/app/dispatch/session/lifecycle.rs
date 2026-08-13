@@ -351,11 +351,15 @@ pub(in crate::app::dispatch) fn dispatch_new_session_inner_with_id(
     app: &mut AppView,
     model_id: Option<acp::ModelId>,
 ) -> (AgentId, Vec<Effect>) {
-    let mut effects =
-        unregister_session_effect(get_active_agent(app).and_then(|a| a.session.session_id.clone()));
-    let (effective_cwd, inherit_worktree) = get_active_agent(app)
-        .map(|a| (a.session.cwd.clone(), a.session.is_worktree))
-        .unwrap_or_else(|| (app.cwd.clone(), false));
+    let (previous_session_id, effective_cwd, inherit_worktree) = match get_active_agent(app) {
+        Some(a) => (
+            a.session.session_id.clone(),
+            a.session.cwd.clone(),
+            a.session.is_worktree,
+        ),
+        None => (None, app.cwd.clone(), false),
+    };
+    let mut effects = unregister_session_effect(previous_session_id);
     reseed_tip_for_new_session(app);
     let agent_id = AgentId(app.next_agent_id);
     app.next_agent_id += 1;
@@ -435,6 +439,7 @@ pub(in crate::app::dispatch) fn dispatch_new_session_inner_with_id(
     let chat_kind = consume_chat_kind(app);
     if let Some(agent) = app.agents.get_mut(&agent_id) {
         agent.chat_kind = chat_kind;
+        agent.conversation_entry = chat_kind;
         #[cfg(feature = "local-workspace")]
         {
             let local_intent = match &app.welcome_session_local_workspace {
@@ -487,6 +492,23 @@ pub(in crate::app::dispatch) fn dispatch_exit_session(app: &mut AppView) -> Vec<
     app.exit_session_pending = None;
     effects
 }
+/// Aftermath for `/delete` on the active agent: dashboard overlay returns
+/// there; standalone agent sessions go home.
+fn after_delete_current_session(
+    app: &AppView,
+    id: AgentId,
+) -> crate::app::actions::AfterSessionDelete {
+    use crate::app::actions::AfterSessionDelete;
+    if app
+        .dashboard
+        .as_ref()
+        .is_some_and(|d| d.attached_agent == Some(id))
+    {
+        AfterSessionDelete::Dashboard
+    } else {
+        AfterSessionDelete::Welcome
+    }
+}
 /// Confirm deleting the parent session (not a subagent view).
 pub(in crate::app::dispatch) fn open_delete_current_session_question(
     app: &mut AppView,
@@ -497,6 +519,13 @@ pub(in crate::app::dispatch) fn open_delete_current_session_question(
     };
     let ActiveView::Agent(id) = app.active_view else {
         return vec![];
+    };
+    let delete_description = if after_delete_current_session(app, id)
+        == crate::app::actions::AfterSessionDelete::Dashboard
+    {
+        "Remove history and return to the dashboard"
+    } else {
+        "Remove history and return home"
     };
     let Some(agent) = app.agents.get_mut(&id) else {
         return vec![];
@@ -515,7 +544,7 @@ pub(in crate::app::dispatch) fn open_delete_current_session_question(
         options: vec![
             QuestionOption {
                 label: "Delete".into(),
-                description: "Remove history and return home".into(),
+                description: delete_description.into(),
                 preview: None,
                 id: None,
             },
@@ -566,11 +595,12 @@ pub(in crate::app::dispatch) fn dispatch_delete_current_session_answered(
         app.show_toast("No active session to delete");
         return vec![];
     };
+    let after = after_delete_current_session(app, id);
     let mut effects = vec![Effect::CancelTurn {
         session_id: session_id.clone(),
         cancel_subagents: true,
         trigger: None,
-        rewind_if_pristine: false,
+        rewind_if_no_output: false,
     }];
     effects.extend(
         running_bg_tasks
@@ -578,6 +608,7 @@ pub(in crate::app::dispatch) fn dispatch_delete_current_session_answered(
             .map(|task_id| Effect::KillBgTask {
                 session_id: session_id.clone(),
                 task_id,
+                source: xai_grok_shell::extensions::task::TaskKillSource::Teardown,
             }),
     );
     app.show_toast("Deleting session\u{2026}");
@@ -585,7 +616,7 @@ pub(in crate::app::dispatch) fn dispatch_delete_current_session_answered(
         source: "current".into(),
         session_id: session_id.to_string(),
         cwd,
-        after: crate::app::actions::AfterSessionDelete::Welcome,
+        after,
     });
     effects
 }
@@ -921,6 +952,7 @@ pub(in crate::app::dispatch) fn dispatch_new_worktree_session(
             &app.tier_restricted_commands,
         );
         agent.chat_kind = chat_kind;
+        agent.conversation_entry = chat_kind;
         #[cfg(feature = "local-workspace")]
         {
             let local_intent = match &app.welcome_session_local_workspace {
@@ -1078,6 +1110,7 @@ pub(in crate::app::dispatch) fn handle_session_created(
         effects.push(Effect::FetchBilling {
             agent_id,
             silent: true,
+            nonce: 0,
         });
         if let Some(switch) = deferred {
             effects.push(Effect::SwitchModel {
@@ -1130,6 +1163,10 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
         agent.scheduler_background_loops = scheduler_background_loops;
         agent.session.cwd = session_cwd.clone();
         agent.session.is_worktree = true;
+        agent.current_branch = None;
+        agent.main_repo = None;
+        agent.is_worktree = true;
+        crate::git_info::populate_from_cwd_async(session_cwd.clone());
         if let Some(m) = new_models {
             app.models = Some(m).into();
             agent.session.models = app.models.clone();
@@ -1181,6 +1218,7 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
         effects.push(Effect::FetchBilling {
             agent_id,
             silent: true,
+            nonce: 0,
         });
         if let Some(switch) = deferred {
             effects.push(Effect::SwitchModel {
@@ -1226,6 +1264,25 @@ fn push_session_create_failure_warning(app: &mut AppView, msg: &str) {
         });
     }
 }
+/// After an orphan create fails, New/Fork may already have moved overlay
+/// attach onto the removed placeholder. Re-point to the survivor so
+/// Left/Esc still exit to the dashboard; clear when recovery is Welcome.
+fn restore_dashboard_attach_after_orphan_remove(
+    app: &mut AppView,
+    removed: AgentId,
+    survivor: Option<AgentId>,
+) {
+    let Some(d) = app.dashboard.as_mut() else {
+        return;
+    };
+    if d.attached_agent != Some(removed) {
+        return;
+    }
+    match survivor {
+        Some(target) => d.repoint_attach_if_on(removed, target),
+        None => d.close_popup(),
+    }
+}
 /// Failed plain `CreateSession`: drop orphan placeholders, clear the
 /// starting-session spinner, and surface the error (toast when an agent
 /// remains; startup warning on the welcome screen, which has no toast).
@@ -1248,6 +1305,7 @@ pub(in crate::app::dispatch) fn handle_session_failed(
             if failed_was_active {
                 switch_to_agent(app, target, SwitchCause::Picker);
             }
+            restore_dashboard_attach_after_orphan_remove(app, agent_id, Some(target));
             if matches!(app.active_view, ActiveView::Welcome) {
                 push_session_create_failure_warning(app, &msg);
             } else {
@@ -1261,6 +1319,7 @@ pub(in crate::app::dispatch) fn handle_session_failed(
             app.session_picker_state.selected = 0;
             app.session_picker_content_results = None;
             app.session_picker_content_loading = false;
+            restore_dashboard_attach_after_orphan_remove(app, agent_id, None);
             push_session_create_failure_warning(app, &msg);
         }
     } else if let Some(agent) = app.agents.get_mut(&agent_id) {
@@ -1297,6 +1356,7 @@ pub(in crate::app::dispatch) fn handle_worktree_session_failed(
         remove_agent_and_cleanup(app, agent_id);
         if let Some(target) = fallback {
             switch_to_agent(app, target, SwitchCause::Picker);
+            restore_dashboard_attach_after_orphan_remove(app, agent_id, Some(target));
         } else {
             show_welcome(app);
             app.welcome_prompt_focused = true;
@@ -1305,6 +1365,7 @@ pub(in crate::app::dispatch) fn handle_worktree_session_failed(
             app.session_picker_state.selected = 0;
             app.session_picker_content_results = None;
             app.session_picker_content_loading = false;
+            restore_dashboard_attach_after_orphan_remove(app, agent_id, None);
         }
         let msg = format!("Cannot create worktree: {error}");
         if !app.startup_warnings.iter().any(|w| w.message == msg) {

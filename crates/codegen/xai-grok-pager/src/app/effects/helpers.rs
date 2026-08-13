@@ -8,9 +8,48 @@ use super::agent::AgentId;
 use crate::unified_log as ulog;
 use xai_grok_shell::sampling::error::{
     RATE_LIMITED_ERROR_CODE, error_detail_from_data, format_rate_limited_user_message,
+    http_status_from_error,
 };
 use xai_grok_shell::session::ExtMethodResult;
 use xai_grok_shell::session::unified_list::ListScope;
+/// Floor for the session create/load RPCs.
+const SESSION_RPC_FLOOR: std::time::Duration = std::time::Duration::from_secs(180);
+/// Headroom over the agent-side `.envrc` budget for the rest of session setup.
+const SESSION_RPC_SLACK: std::time::Duration = std::time::Duration::from_secs(50);
+/// Always covers the agent-side `.envrc` budget so the backstop cannot fire
+/// before the agent's own deadline. Reads `GROK_ENVRC_TIMEOUT_SECS` in this
+/// process; the agent inherits the same environment.
+pub(super) fn session_rpc_timeout() -> std::time::Duration {
+    SESSION_RPC_FLOOR.max(xai_grok_workspace::envrc::loader_budget() + SESSION_RPC_SLACK)
+}
+/// `acp_send` bounded by [`session_rpc_timeout`]; on expiry, an error naming
+/// `action` instead of an eternal spinner.
+pub(super) async fn acp_send_bounded<R, T>(
+    request: T,
+    tx: &tokio::sync::mpsc::UnboundedSender<R>,
+    action: &str,
+) -> Result<T::Response, acp::Error>
+where
+    T: xai_acp_lib::AcpRequest,
+    R: From<xai_acp_lib::AcpArgs<T>> + std::fmt::Debug,
+{
+    let timeout = session_rpc_timeout();
+    match tokio::time::timeout(timeout, acp_send(request, tx)).await {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            Err(
+                acp::Error::new(
+                    acp::ErrorCode::InternalError.into(),
+                    format!(
+                "{action} timed out after {}s. It may still finish in the background; \
+                 retrying right away can run into the same delay.",
+                timeout.as_secs()
+            ),
+                ),
+            )
+        }
+    }
+}
 /// Typed progress message for session restore.
 /// Keeps the progress channel from accepting arbitrary `TaskResult` variants.
 pub(crate) struct RestoreProgressMsg {
@@ -88,7 +127,8 @@ pub(super) async fn fetch_plugin_cta_mcps(
 /// Rate-limit errors: free-usage paywall, else server detail (with API-key
 /// rewrite when the body pushes personal SuperGrok), else auth-aware fallback
 /// (see [`format_rate_limited_user_message`]).
-/// All other errors are sanitized to remove internal service names and jargon.
+/// All other errors render as the formatted request-failure banner text
+/// (status headline + sanitized detail).
 pub(super) fn format_acp_error(err: &acp::Error, is_api_key_auth: bool) -> String {
     if i32::from(err.code) == RATE_LIMITED_ERROR_CODE {
         let detail = err.data.as_ref().and_then(error_detail_from_data);
@@ -99,9 +139,20 @@ pub(super) fn format_acp_error(err: &acp::Error, is_api_key_auth: bool) -> Strin
     if err.code == acp::ErrorCode::InvalidParams && let Some(data) = &err.data
         && let Some(msg) = error_detail_from_data(data) && !msg.is_empty()
     {
-        return msg;
+        return sanitize_user_error(&msg);
     }
-    sanitize_user_error(&err.to_string())
+    let raw = err
+        .data
+        .as_ref()
+        .and_then(error_detail_from_data)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| err.to_string());
+    crate::app::error_display::format_request_failure(
+            http_status_from_error(err),
+            None,
+            &raw,
+        )
+        .message()
 }
 /// Format a Duration for user-visible restore progress messages.
 pub(super) fn format_restore_elapsed(d: std::time::Duration) -> String {
@@ -188,7 +239,7 @@ pub(crate) fn parse_session_scheduler_background_loops(
         .and_then(|v| v.as_bool())
 }
 /// Whether `raw` is (or wraps) a disk-full / ENOSPC failure.
-fn is_disk_full_error(raw: &str) -> bool {
+pub(crate) fn is_disk_full_error(raw: &str) -> bool {
     raw.contains(xai_fast_worktree::OUT_OF_DISK_CONTEXT)
         || raw.contains(xai_fast_worktree::ENOSPC_OS_MESSAGE)
         || raw.contains("Disk quota exceeded") || raw.contains("Out of disk space")
@@ -784,6 +835,11 @@ pub(super) fn parse_session_picker_entries(
                 .or_else(|| v.get("worktree_label"))
                 .and_then(|s| s.as_str())
                 .map(String::from);
+            let last_turn_summary = v
+                .get("lastTurnSummary")
+                .or_else(|| v.get("last_turn_summary"))
+                .and_then(|s| s.as_str())
+                .map(String::from);
             let repo_name = crate::views::session_picker::repo_name_from_cwd(&cwd_str);
             Some(SessionPickerEntry {
                 id,
@@ -799,6 +855,7 @@ pub(super) fn parse_session_picker_entries(
                 branch,
                 repo_name,
                 worktree_label,
+                last_turn_summary,
                 card_detail: None,
             })
         })
@@ -839,6 +896,7 @@ pub(super) fn session_picker_entry_to_roster(
         model_id: e.model_id.clone(),
         yolo: false,
         activity: RosterActivity::Dormant,
+        last_turn_summary: e.last_turn_summary.clone(),
         resident: false,
         last_change_unix_ms: last_change.timestamp_millis(),
         origin: RosterOrigin {
@@ -1019,11 +1077,27 @@ pub(crate) async fn persist_setting(
                 .await
                 .map_err(|e| e.to_string())
         }
+        "confirm_before_rewind" => {
+            let SettingValue::Bool(b) = value else {
+                return Err(kind_mismatch("confirm_before_rewind", "Bool", &value));
+            };
+            xai_grok_shell::util::config::set_confirm_before_rewind(b)
+                .await
+                .map_err(|e| e.to_string())
+        }
         "combine_queued_prompts" => {
             let SettingValue::Bool(b) = value else {
                 return Err(kind_mismatch("combine_queued_prompts", "Bool", &value));
             };
             xai_grok_shell::util::config::set_combine_queued_prompts(b)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        "follow_up_behavior" => {
+            let SettingValue::Enum(s) = value else {
+                return Err(kind_mismatch("follow_up_behavior", "Enum", &value));
+            };
+            xai_grok_shell::util::config::set_follow_up_behavior(s.to_string())
                 .await
                 .map_err(|e| e.to_string())
         }
@@ -1666,7 +1740,7 @@ pub(super) fn unregister_active_session_best_effort_in(
     root: &Path,
     session_id: &acp::SessionId,
 ) {
-    match xai_grok_shell::active_sessions::try_unregister_in(root, session_id) {
+    match xai_grok_active_sessions::try_unregister_in(root, session_id) {
         Ok(true) => {}
         Ok(false) => {
             tracing::debug!(

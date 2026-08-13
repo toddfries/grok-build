@@ -75,7 +75,7 @@ impl MvpAgent {
                 footprint_bytes: usage.footprint_bytes,
                 threads: usage.threads,
                 open_files: usage.open_files,
-                resident_sessions: self.sessions.borrow().len(),
+                resident_sessions: self.session_registry.resident_count(),
                 session_threads: self.session_registry.counts().session_threads,
             },
         );
@@ -84,8 +84,10 @@ impl MvpAgent {
     /// Called from the heap monitor's poll loop, which runs whether or not
     /// profiling is on. A session that never closes reports through this.
     ///
-    /// Every tick pays one memory read; only a tick that reports pays for the
-    /// thread and descriptor counts.
+    /// Every tick pays one memory read, which now carries the thread count
+    /// (free from the same `/proc/self/status` read on Linux, one
+    /// `proc_pidinfo` on macOS); only a tick that reports pays for the
+    /// descriptor scan.
     pub(super) fn report_resource_usage_if_due(&self) {
         let memory = xai_tty_utils::sample_process_memory();
         let due = CADENCE.with_borrow(|cadence| cadence.is_due(Instant::now(), memory.rss_bytes));

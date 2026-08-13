@@ -405,7 +405,7 @@ pub(crate) async fn run_auth_flow_with_stderr_bridge(
 
 /// Full auth chain: cache → refresh → external provider → interactive (OIDC/OAuth2/legacy).
 /// When `url_tx` and `code_rx` are `None`, falls back to stderr/stdin (CLI mode).
-pub async fn run_auth_flow(
+pub(crate) async fn run_auth_flow(
     auth_manager: &Arc<AuthManager>,
     grok_com_config: &GrokComConfig,
     reauth: bool,
@@ -988,13 +988,10 @@ pub async fn run_cli_login(
     let result = run_cli_login_steps(config, &auth_manager, oauth, device_auth).await;
 
     // Posts run on a spawned task and this process exits as soon as we return.
-    xai_grok_telemetry::session_ctx::drain_pending(CLI_TELEMETRY_DRAIN).await;
+    xai_grok_telemetry::session_ctx::drain_pending(xai_grok_telemetry::session_ctx::CLI_DRAIN)
+        .await;
     result
 }
-
-/// Returns as soon as the post lands (~1.7s cold), so the bound only bites on a
-/// black-holed network — where waiting out the HTTP client timeout would be worse.
-const CLI_TELEMETRY_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 async fn run_cli_login_steps(
     config: &crate::agent::config::Config,
@@ -2136,9 +2133,7 @@ mod tests {
             &self,
             _reason: crate::auth::manager::RefreshReason,
         ) -> crate::auth::refresh::RefreshOutcome {
-            crate::auth::refresh::RefreshOutcome::TransientFailure {
-                message: "simulated network failure".into(),
-            }
+            crate::auth::refresh::RefreshOutcome::transient("simulated network failure")
         }
     }
 
