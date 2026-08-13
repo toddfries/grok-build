@@ -1,117 +1,18 @@
 //! Built-in files extracted to `~/.grok/` on startup.
 
-const BUNDLED_FILES: &[(&str, &str)] = &[("README.md", include_str!("../README.md"))];
+const BUILTIN_FILES: &[(&str, &str)] = &[("README.md", include_str!("../README.md"))];
 
-const HELP_SKILL_MD: &str = include_str!("../skills/help/SKILL.md");
-const CREATE_SKILL_MD: &str = include_str!("../skills/create-skill/SKILL.md");
-const CODE_REVIEW_SKILL_MD: &str = include_str!("../skills/code-review/SKILL.md");
-const IMAGINE_SKILL_MD: &str = include_str!("../skills/imagine/SKILL.md");
-/// Compiled-in SKILL.md content for `/check-work` (available to headless mode).
-pub const CHECK_SKILL_MD: &str = include_str!("../skills/check-work/SKILL.md");
-/// Compiled-in SKILL.md content for headless `--best-of-n` (not extracted as
-/// a bundled skill).
-pub const BEST_OF_N_SKILL_MD: &str = include_str!("../skills/best-of-n/SKILL.md");
-
-/// Legacy bundled skill names (renamed or removed).
+/// Extract built-in metadata files to `~/.grok/` on startup.
 ///
-/// These directories under `~/.grok/skills/` will be deleted on startup
-/// (during bundled file extraction). This ensures that when a bundled
-/// skill is renamed (e.g. `check` → `check-work`), the old slash command
-/// does not linger on users' machines after an upgrade.
-///
-/// Important behavior:
-/// - Deletion happens **early** in `extract_bundled_files`, before we write
-///   any current bundled skills.
-/// - We **never** delete a name that is currently present in `BUNDLED_SKILLS`
-///   (see `remove_legacy_bundled_skills`).
-///
-/// This means:
-/// - If you later re-introduce a skill with a name that is still in this
-///   legacy list (e.g. you ship a new "check" skill years later), the legacy
-///   cleanup will **skip** it and the new skill will be created normally.
-/// - The legacy list is a "delete old user copies of names we no longer ship",
-///   not a permanent blacklist.
-///
-/// Lifecycle / maintenance:
-/// - Add an old name here when you rename/remove a bundled skill.
-/// - Once the directory is gone on a user's machine, further checks are
-///   cheap no-ops.
-/// - You do **not** have to remove entries immediately. It is safe to leave
-///   them for many releases.
-/// - After the rename has had time to propagate, you **may** clean old
-///   strings out of this list for hygiene.
-const LEGACY_BUNDLED_SKILL_NAMES: &[&str] = &["check", "best-of-n", "docx", "pptx", "xlsx"];
-
-/// All bundled skill SKILL.md files. Single source of truth used by both
-/// the full extraction path (version bump) and the missing-file fast path
-/// (same version). Adding a new skill here is all that's needed.
-///
-/// When renaming a bundled skill (e.g. "check" → "check-work"), also add the
-/// old name to `LEGACY_BUNDLED_SKILL_NAMES` so `remove_legacy_bundled_skills`
-/// will clean up the old directory on user machines on the next upgrade.
-///
-/// See the docs on `LEGACY_BUNDLED_SKILL_NAMES` for the full lifecycle
-/// (including when it is safe/optional to remove old entries later).
-const BUNDLED_SKILLS: &[(&str, &str)] = &[
-    ("help", HELP_SKILL_MD),
-    ("create-skill", CREATE_SKILL_MD),
-    ("code-review", CODE_REVIEW_SKILL_MD),
-    ("imagine", IMAGINE_SKILL_MD),
-    ("check-work", CHECK_SKILL_MD),
-];
-
-/// True when a discovered skill is the copy `extract_bundled_files` wrote to
-/// `<grok_home>/skills/<name>/SKILL.md`. Exact-path (not prefix) so a
-/// user-authored skill that reuses a bundled name — even elsewhere under
-/// `<grok_home>/skills/` — is never labeled bundled. Lives beside the
-/// extraction code so the target layout and this predicate move together.
-/// Used by inspect, which otherwise sees extracted copies as user skills.
-pub(crate) fn is_extracted_bundled_skill(
-    name: &str,
-    path: &std::path::Path,
-    grok_home: &std::path::Path,
-) -> bool {
-    BUNDLED_SKILLS.iter().any(|&(n, _)| n == name)
-        && path == grok_home.join("skills").join(name).join("SKILL.md")
-}
-
-/// Resolve the content for a skill, applying any name-specific transforms.
-fn resolve_skill_content(name: &str, raw: &str, grok_home: &std::path::Path) -> String {
-    match name {
-        // Help skill needs path substitution so absolute paths work.
-        "help" => {
-            let grok_home_str = format!("{}/", grok_home.to_string_lossy());
-            raw.replace("~/.grok/", &grok_home_str)
-        }
-        _ => raw.to_string(),
-    }
-}
-
-/// Extract bundled files to `~/.grok/` on startup.
-///
-/// Full extraction runs on every version bump. On same-version startups,
-/// a lightweight check ensures all expected skill files exist on disk —
-/// any missing files are extracted individually.
-///
-/// Legacy/renamed bundled skills (see `LEGACY_BUNDLED_SKILL_NAMES`) are
-/// always cleaned up first so that old slash commands disappear after
-/// a rename (e.g. the previous `/check` after the move to `/check-work`).
-pub fn extract_bundled_files(grok_home: &std::path::Path) {
-    // Always remove legacy/renamed bundled skills first (e.g. the old
-    // `check` directory after the rename to `check-work`). This runs on
-    // every startup so users get cleaned up even without hitting a
-    // version-bump marker change.
-    remove_legacy_bundled_skills(grok_home);
-
+/// User skills under `~/.grok/skills/` are never managed here. Platform skills
+/// are delivered separately through the bundled skill cache.
+pub fn extract_builtin_files(grok_home: &std::path::Path) {
     let version = xai_grok_version::VERSION;
     let marker = grok_home.join(".metadata_version");
 
     if let Ok(existing) = std::fs::read_to_string(&marker)
         && existing.trim() == version
     {
-        // Same version — only extract skill files that are missing on disk.
-        // This handles skills added between version bumps.
-        extract_missing_skills(grok_home);
         return;
     }
 
@@ -123,76 +24,152 @@ pub fn extract_bundled_files(grok_home: &std::path::Path) {
         let _ = std::fs::remove_file(grok_home.join(stale));
     }
 
-    for &(filename, content) in BUNDLED_FILES {
+    for &(filename, content) in BUILTIN_FILES {
         if let Err(e) = std::fs::write(grok_home.join(filename), content) {
-            tracing::debug!(error = %e, filename, "Failed to extract bundled file");
-        }
-    }
-
-    // Skill SKILL.md files.
-    for &(name, raw) in BUNDLED_SKILLS {
-        let skill_dir = grok_home.join("skills").join(name);
-        let _ = std::fs::create_dir_all(&skill_dir);
-        let content = resolve_skill_content(name, raw, grok_home);
-        if let Err(e) = std::fs::write(skill_dir.join("SKILL.md"), content) {
-            tracing::debug!(error = %e, name, "Failed to write skill");
+            tracing::debug!(error = %e, filename, "Failed to extract built-in file");
         }
     }
 
     let _ = std::fs::write(&marker, version);
-    tracing::debug!(version, "Extracted bundled files");
+    tracing::debug!(version, "Extracted built-in files");
 }
 
-/// Extract only missing skill SKILL.md files (same-version fast path).
-/// Iterates `BUNDLED_SKILLS` so adding a new skill there is sufficient.
-fn extract_missing_skills(grok_home: &std::path::Path) {
-    for &(name, raw) in BUNDLED_SKILLS {
-        let skill_md = grok_home.join("skills").join(name).join("SKILL.md");
-        if skill_md.exists() {
-            continue;
-        }
-        let _ = std::fs::create_dir_all(skill_md.parent().unwrap());
-        let content = resolve_skill_content(name, raw, grok_home);
-        let _ = std::fs::write(&skill_md, content);
-    }
+/// `(name, sha256)` of every `SKILL.md` body ever extracted into
+/// `$GROK_HOME/skills/`; `help` rows hash the pre-substitution bytes.
+const FORMER_PLATFORM_SKILL_HASHES: &[(&str, &str)] = &[
+    (
+        "create-skill",
+        "bee1d45089c6374a3349b2db7ed1b9e209878ebe031d651f410212746173bd81",
+    ),
+    (
+        "create-skill",
+        "e383b0013d4b595c141de64b111027f443bf6375c0e8ba1b90c23cd118b2ffd3",
+    ),
+    (
+        "create-skill",
+        "fead9243b902177003c6f0a9d51c6768e20ddcb388be15d68769950d440bfd61",
+    ),
+    (
+        "code-review",
+        "df6f708a5207f34e1d8b7775982788406d7c46e722d50aedde2d0300f420a10a",
+    ),
+    (
+        "imagine",
+        "1754ff52d1d043841fde3cd9ed0f715315b8f06dc18bf2995be59bcde5960def",
+    ),
+    (
+        "imagine",
+        "34f024b6636495bf1d453072fde41fd7cb8726d57436c8b1d4773fbe1c112a56",
+    ),
+    (
+        "imagine",
+        "ced79ca46b183e21c3ef484f199870c265d0a6c5f3a4f25470079816af2bcb20",
+    ),
+    (
+        "create-workflow",
+        "51345342753d1c7b0e8d3a671458df4a3bc0b1c94e683ab5dc1c3c97c2bf652e",
+    ),
+    (
+        "help",
+        "f1e921dbd64725e801d25f2b8879dd49490ff47a7e64a23fb7ac6f765f726b4d",
+    ),
+    (
+        "help",
+        "cdd34d84b40f2fdccb74893939751e2ec9ef2463149ec8d001840f151e317491",
+    ),
+    (
+        "help",
+        "7c507f7095b2b80188a994de476012cfb876f186aadab959ed546df0c0f6a42d",
+    ),
+    (
+        "help",
+        "4595c5fc67cb8d9159f45b18516a6aa4fa092cd5e5cd996688c4faa2dfb17c62",
+    ),
+    (
+        "help",
+        "2811d78c10d4983c0b1083579fc6ae7cc399d70b67ff4f2efc3ca98fd882ca70",
+    ),
+    (
+        "check-work",
+        "1d9044a4f02c3abcb4153783d451611731f669643ba371bb6069a1e1c2d3e95d",
+    ),
+    (
+        "check-work",
+        "fcc1b642413af11e8077c3eda96f412a1d3894c2ef8ee06b597012b9e912f213",
+    ),
+    (
+        "check-work",
+        "51a57345db2b6c393bcd83c635b586bf4e821e680ae96c4f7b2d34c43ea00582",
+    ),
+    (
+        "best-of-n",
+        "e0e1849ead8d884030e1d34bb651517c9961918f6e1ec62457c68dd2be06636b",
+    ),
+    (
+        "check",
+        "5ddcd2f42eaeb6efc27dc1a651ad36be71e331e58da8ed16ec7a28b2f8bb0d4e",
+    ),
+    (
+        "check",
+        "feeab8afc3040071229e0ff0803795f25b180dd1f8f8e697caa09953fcffc300",
+    ),
+    (
+        "docx",
+        "cfbabd72b1aec7dfaad988fb6e5e16b27dc744b9a00cae15db9045e95f53903e",
+    ),
+    (
+        "pptx",
+        "e5b0df918cbe9d62508b3cf808d73899633f82fc19f6258a25ef9f0de7e62125",
+    ),
+    (
+        "xlsx",
+        "dd316db7785a6be12966c2a2d848931fbf5f518b3cdb0a66fa62ee835ead1cfc",
+    ),
+];
+
+/// Remove platform-skill leftovers extracted into `$GROK_HOME/skills/` by
+/// pre-bundle binaries, where they shadow `bundled/skills/`. Only dirs whose
+/// `SKILL.md` byte-matches a known shipped body are removed; user skills and
+/// edits are kept. Runs every startup so restored backups get re-cleaned.
+pub fn purge_stale_extracted_skills(grok_home: &std::path::Path) {
+    purge_skill_dirs_matching(grok_home, FORMER_PLATFORM_SKILL_HASHES);
 }
 
-/// Remove directories for legacy/renamed bundled skills (e.g. old `check`
-/// after it was renamed to `check-work`).
-///
-/// Called on every startup from `extract_bundled_files`. Safe and idempotent.
-///
-/// Key guarantees (see `LEGACY_BUNDLED_SKILL_NAMES` docs for details):
-/// - If a name is still present in `BUNDLED_SKILLS`, we deliberately skip
-///   deletion. This allows safe re-use of a skill name in the future.
-/// - If the target directory no longer exists, this is a trivial no-op.
-fn remove_legacy_bundled_skills(grok_home: &std::path::Path) {
-    remove_legacy_skills(grok_home, LEGACY_BUNDLED_SKILL_NAMES, BUNDLED_SKILLS);
-}
+fn purge_skill_dirs_matching(grok_home: &std::path::Path, known: &[(&str, &str)]) {
+    // For reversing the extract-time `~/.grok/` -> home rewrite (help only).
+    let home_prefix = format!("{}/", grok_home.to_string_lossy());
 
-/// Core implementation, extracted for testability.
-fn remove_legacy_skills(
-    grok_home: &std::path::Path,
-    legacy_names: &[&str],
-    bundled_skills: &[(&str, &str)],
-) {
-    for name in legacy_names {
-        // Safety: Never delete a name that we are currently shipping.
-        // This protects against re-introducing a skill name that still has
-        // an entry in the legacy list.
-        if bundled_skills.iter().any(|(n, _)| *n == *name) {
-            continue;
-        }
+    let mut names: Vec<&str> = known.iter().map(|&(name, _)| name).collect();
+    names.dedup();
 
+    for name in names {
         let dir = grok_home.join("skills").join(name);
-        if dir.exists() {
-            if let Err(e) = std::fs::remove_dir_all(&dir) {
-                tracing::debug!(error = %e, name, "Failed to remove legacy bundled skill");
-            } else {
-                tracing::debug!(name, "Removed legacy bundled skill directory");
+        // Absent or unreadable: nothing provably ours.
+        let Ok(content) = std::fs::read_to_string(dir.join("SKILL.md")) else {
+            continue;
+        };
+        let on_disk = sha256_hex(content.as_bytes());
+        let unrewritten = sha256_hex(content.replace(&home_prefix, "~/.grok/").as_bytes());
+        let managed = known
+            .iter()
+            .any(|&(n, hash)| n == name && (hash == on_disk || hash == unrewritten));
+        if !managed {
+            continue;
+        }
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => {
+                tracing::info!(name, "removed stale extracted platform skill");
+            }
+            Err(e) => {
+                tracing::warn!(name, error = %e, "failed to remove stale extracted platform skill");
             }
         }
     }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 #[cfg(test)]
@@ -200,220 +177,172 @@ mod tests {
     use super::*;
 
     #[test]
-    fn version_bump_re_extracts_all_files() {
+    fn version_bump_reextracts_metadata_without_touching_skills() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
 
-        extract_bundled_files(home);
-
-        for &(filename, _) in BUNDLED_FILES {
-            std::fs::write(home.join(filename), "old").unwrap();
-        }
-        std::fs::write(home.join("skills/help/SKILL.md"), "old").unwrap();
-        for name in ["check-work", "imagine", "code-review"] {
-            std::fs::write(home.join(format!("skills/{name}/SKILL.md")), "old").unwrap();
-        }
+        extract_builtin_files(home);
+        std::fs::write(home.join("README.md"), "old").unwrap();
         std::fs::write(home.join(".metadata_version"), "0.0.0-stale").unwrap();
 
-        // Simulate legacy skills that should be cleaned up.
-        for name in ["check", "best-of-n", "docx", "pptx", "xlsx"] {
-            std::fs::create_dir_all(home.join(format!("skills/{name}"))).unwrap();
-            std::fs::write(
-                home.join(format!("skills/{name}/SKILL.md")),
-                "old legacy skill",
-            )
-            .unwrap();
+        let skill_names = [
+            "help",
+            "create-skill",
+            "code-review",
+            "imagine",
+            "check-work",
+            "check",
+            "best-of-n",
+            "docx",
+            "pptx",
+            "xlsx",
+        ];
+        for name in skill_names {
+            let dir = home.join("skills").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("SKILL.md"), format!("custom {name}")).unwrap();
+            std::fs::write(dir.join("user-file.txt"), "keep").unwrap();
         }
 
-        extract_bundled_files(home);
+        extract_builtin_files(home);
 
-        for &(filename, _) in BUNDLED_FILES {
-            assert_ne!(
-                std::fs::read_to_string(home.join(filename)).unwrap(),
-                "old",
-                "{filename} was not re-extracted after version bump"
-            );
-        }
         assert_ne!(
-            std::fs::read_to_string(home.join("skills/help/SKILL.md")).unwrap(),
+            std::fs::read_to_string(home.join("README.md")).unwrap(),
             "old"
         );
-        for name in ["check-work", "imagine", "code-review"] {
-            assert_ne!(
-                std::fs::read_to_string(home.join(format!("skills/{name}/SKILL.md"))).unwrap(),
-                "old",
-                "{name} skill was not re-extracted after version bump"
+        for name in skill_names {
+            let dir = home.join("skills").join(name);
+            assert_eq!(
+                std::fs::read_to_string(dir.join("SKILL.md")).unwrap(),
+                format!("custom {name}")
             );
-        }
-
-        // Legacy skill directories must have been removed (the key part of
-        // supporting renames like check → check-work without leaving orphans).
-        for name in ["check", "best-of-n", "docx", "pptx", "xlsx"] {
-            assert!(
-                !home.join(format!("skills/{name}")).exists(),
-                "legacy '{name}' skill directory should have been deleted during version bump"
+            assert_eq!(
+                std::fs::read_to_string(dir.join("user-file.txt")).unwrap(),
+                "keep"
             );
         }
     }
 
     #[test]
-    fn office_skills_not_bundled() {
+    fn same_version_does_not_restore_missing_or_delete_legacy_skills() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        std::fs::create_dir_all(home.join("skills/check")).unwrap();
+        std::fs::write(home.join("skills/check/SKILL.md"), "custom check").unwrap();
+        std::fs::write(home.join(".metadata_version"), xai_grok_version::VERSION).unwrap();
+
+        extract_builtin_files(home);
+
+        assert!(!home.join("skills/help/SKILL.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(home.join("skills/check/SKILL.md")).unwrap(),
+            "custom check"
+        );
+    }
+
+    const EXTRACTED_BODY: &str = "old platform skill body\n";
+    const OLDER_EXTRACTED_BODY: &str = "even older platform skill body\n";
+
+    /// Purge against a table with two create-skill generations and one help body.
+    fn purge_with_test_table(home: &std::path::Path) {
+        let current = sha256_hex(EXTRACTED_BODY.as_bytes());
+        let older = sha256_hex(OLDER_EXTRACTED_BODY.as_bytes());
+        purge_skill_dirs_matching(
+            home,
+            &[
+                ("create-skill", current.as_str()),
+                ("create-skill", older.as_str()),
+                ("help", current.as_str()),
+            ],
+        );
+    }
+
+    fn write_skill(home: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        let dir = home.join("skills").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), body).unwrap();
+        dir
+    }
+
+    #[test]
+    fn purge_removes_any_managed_generation_with_companions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let dir = write_skill(home, "create-skill", OLDER_EXTRACTED_BODY);
+        std::fs::create_dir_all(dir.join("scripts")).unwrap();
+        std::fs::write(dir.join("scripts/gen.py"), "print()").unwrap();
+
+        purge_with_test_table(home);
+
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn purge_fails_closed_on_anything_not_provably_ours() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
 
-        extract_bundled_files(home);
+        // Missing skills/ is a no-op and must not create it.
+        purge_with_test_table(home);
+        assert!(!home.join("skills").exists());
 
-        // Former office document skills must NOT be extracted as bundled.
-        for name in ["docx", "pptx", "xlsx"] {
-            assert!(
-                !home.join(format!("skills/{name}")).exists(),
-                "{name} should not be a bundled skill"
-            );
+        let edited = write_skill(home, "create-skill", "my customized body\n");
+        // Managed bytes under a name we never extracted.
+        let unknown = write_skill(home, "my-custom", EXTRACTED_BODY);
+        // Former platform name without a SKILL.md: unknown layout.
+        let no_manifest = home.join("skills/help");
+        std::fs::create_dir_all(&no_manifest).unwrap();
+        std::fs::write(no_manifest.join("notes.txt"), "user data").unwrap();
+
+        purge_with_test_table(home);
+
+        assert!(edited.join("SKILL.md").exists());
+        assert!(unknown.join("SKILL.md").exists());
+        assert!(no_manifest.join("notes.txt").exists());
+    }
+
+    #[test]
+    fn purge_reverses_home_rewrite_before_hashing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        // help's on-disk bytes are machine-dependent (home substituted in).
+        let raw = EXTRACTED_BODY.replace("platform", "read ~/.grok/docs/user-guide then platform");
+        let body = raw.replace("~/.grok/", &format!("{}/", home.to_string_lossy()));
+        let raw_hash = sha256_hex(raw.as_bytes());
+        let dir = write_skill(home, "help", &body);
+
+        purge_skill_dirs_matching(home, &[("help", raw_hash.as_str())]);
+
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn shipped_hash_table_is_well_formed() {
+        let mut names: Vec<&str> = FORMER_PLATFORM_SKILL_HASHES
+            .iter()
+            .map(|&(n, _)| n)
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            names,
+            [
+                "best-of-n",
+                "check",
+                "check-work",
+                "code-review",
+                "create-skill",
+                "create-workflow",
+                "docx",
+                "help",
+                "imagine",
+                "pptx",
+                "xlsx",
+            ]
+        );
+        for &(_, hash) in FORMER_PLATFORM_SKILL_HASHES {
+            assert_eq!(hash.len(), 64);
+            assert!(hash.bytes().all(|b| b.is_ascii_hexdigit()));
         }
-    }
-
-    #[tokio::test]
-    async fn help_skill_discovered_by_skill_pipeline() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
-
-        extract_bundled_files(home);
-
-        let workspace = tmp.path().join("workspace");
-        std::fs::create_dir_all(workspace.join(".grok").join("skills").join("help")).unwrap();
-        std::fs::copy(
-            home.join("skills/help/SKILL.md"),
-            workspace.join(".grok/skills/help/SKILL.md"),
-        )
-        .unwrap();
-
-        let skills = xai_grok_agent::prompt::skills::list_skills(
-            Some(workspace.to_str().unwrap()),
-            &Default::default(),
-            xai_grok_agent::prompt::skills::CompatConfig::default(),
-        )
-        .await;
-
-        let help = skills.iter().find(|s| s.name == "help");
-        assert!(
-            help.is_some(),
-            "help skill not found. skills: {:?}",
-            skills.iter().map(|s| &s.name).collect::<Vec<_>>()
-        );
-        let help = help.unwrap();
-        assert!(help.description.contains("configuration"));
-        assert!(help.user_invocable);
-    }
-
-    // ---------------------------------------------------------------------
-    // Tests for legacy bundled skill removal (the rename migration system)
-    // ---------------------------------------------------------------------
-
-    #[test]
-    fn remove_legacy_deletes_old_skill_when_not_currently_shipped() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
-
-        // Simulate an old legacy "check" directory from before a rename.
-        let legacy_dir = home.join("skills/check");
-        std::fs::create_dir_all(&legacy_dir).unwrap();
-        std::fs::write(legacy_dir.join("SKILL.md"), "old check").unwrap();
-
-        // "check" is in legacy list but NOT in current BUNDLED_SKILLS
-        remove_legacy_skills(home, &["check"], BUNDLED_SKILLS);
-
-        assert!(
-            !legacy_dir.exists(),
-            "legacy skill directory should have been deleted"
-        );
-    }
-
-    #[test]
-    fn remove_legacy_does_not_delete_when_name_is_reused_in_current_bundled() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
-
-        // User still has an old "check" directory.
-        let legacy_dir = home.join("skills/check");
-        std::fs::create_dir_all(&legacy_dir).unwrap();
-        std::fs::write(legacy_dir.join("SKILL.md"), "user had old check").unwrap();
-
-        // Simulate the situation where we later re-ship a skill named "check".
-        // In this case the legacy entry should be ignored.
-        let fake_bundled: &[(&str, &str)] = &[("check", "fake content"), ("help", "help")];
-
-        remove_legacy_skills(home, &["check"], fake_bundled);
-
-        // The directory must still exist (we did not nuke the user's copy
-        // or a skill we're about to (re)create).
-        assert!(
-            legacy_dir.exists(),
-            "should not delete a name that is currently being shipped"
-        );
-    }
-
-    #[test]
-    fn remove_legacy_handles_multiple_names_some_current_some_legacy() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
-
-        std::fs::create_dir_all(home.join("skills/old-renamed")).unwrap();
-        std::fs::write(home.join("skills/old-renamed/SKILL.md"), "old").unwrap();
-
-        std::fs::create_dir_all(home.join("skills/another-legacy")).unwrap();
-        std::fs::write(home.join("skills/another-legacy/SKILL.md"), "old2").unwrap();
-
-        // Current bundled skills include one name that used to be legacy
-        let current: &[(&str, &str)] = &[("another-legacy", "now shipping again")];
-
-        // Legacy list contains both the truly removed one and the reintroduced one
-        remove_legacy_skills(home, &["old-renamed", "another-legacy"], current);
-
-        assert!(
-            !home.join("skills/old-renamed").exists(),
-            "truly legacy name should be removed"
-        );
-        assert!(
-            home.join("skills/another-legacy").exists(),
-            "reintroduced name must not be deleted"
-        );
-    }
-
-    #[test]
-    fn remove_legacy_is_noop_when_directory_does_not_exist() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
-
-        // No directory exists for the legacy name
-        remove_legacy_skills(home, &["check"], BUNDLED_SKILLS);
-
-        // Should not panic or create anything
-        assert!(!home.join("skills/check").exists());
-    }
-
-    #[test]
-    fn legacy_cleanup_runs_even_on_same_version_fast_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
-
-        // First run: extract current state
-        extract_bundled_files(home);
-
-        // Simulate user still having an old legacy directory
-        let legacy_dir = home.join("skills/check");
-        std::fs::create_dir_all(&legacy_dir).unwrap();
-        std::fs::write(legacy_dir.join("SKILL.md"), "stale").unwrap();
-
-        // Force the "same version" fast path by writing the current version marker
-        let version = xai_grok_version::VERSION;
-        std::fs::write(home.join(".metadata_version"), version).unwrap();
-
-        // This should still run legacy cleanup even though we're in fast path
-        extract_bundled_files(home);
-
-        assert!(
-            !legacy_dir.exists(),
-            "legacy cleanup must run even on same-version fast path"
-        );
     }
 }

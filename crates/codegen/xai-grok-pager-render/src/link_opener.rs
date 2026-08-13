@@ -4,7 +4,65 @@
 //! code path (keyboard navigation, mouse click, action dispatch) can
 //! open a link safely without duplicating platform-specific logic.
 
+use std::collections::HashMap;
+
 use crate::terminal::hyperlinks::SchemeFilter;
+
+/// Outcome of attempting to open a URL in the system browser/handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenUrlResult {
+    /// Opener was launched (or the test seam recorded the URL).
+    Opened,
+    /// Scheme was rejected by the safety filter.
+    RejectedScheme,
+    /// Browser cannot run here (headless / no display) or the opener
+    /// failed to spawn. Callers should surface the URL for manual open.
+    BrowserUnavailable,
+}
+
+/// Whether the environment looks capable of opening a GUI browser.
+///
+/// Pure helper for tests. On Linux/BSD, requires a non-empty `DISPLAY` or
+/// `WAYLAND_DISPLAY` (or a non-empty `BROWSER` override). macOS/Windows
+/// are treated as available at the env level (spawn failure is still
+/// reported by [`open_url`]).
+pub fn browser_open_likely_available_from_env(env: &HashMap<String, String>) -> bool {
+    if cfg!(any(target_os = "macos", target_os = "windows")) {
+        return true;
+    }
+    // Explicit BROWSER override: allow even without a display server so
+    // scripted/headless setups that point at a CLI browser still try.
+    if env.get("BROWSER").is_some_and(|v| !v.is_empty()) {
+        return true;
+    }
+    env.get("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty())
+        || env.get("DISPLAY").is_some_and(|v| !v.is_empty())
+}
+
+/// Whether this process likely has a GUI browser available right now.
+pub fn browser_open_likely_available() -> bool {
+    let env = crate::host::collect_unicode_env();
+    browser_open_likely_available_from_env(&env)
+}
+
+const BROWSER_UNAVAILABLE_NOTICE: &str = "Could not open a browser. Open this URL manually";
+
+/// Multi-line copy for agent scrollback: notice, then the full URL alone
+/// so it is easy to select/copy in the TUI.
+pub fn browser_unavailable_message(url: &str) -> String {
+    format!("{BROWSER_UNAVAILABLE_NOTICE}:\n{url}")
+}
+
+/// Single-line welcome toast: URL first so prefix truncation keeps the
+/// destination. `copied` is true only when clipboard delivery reported
+/// success — never claim a copy that did not happen.
+pub fn browser_unavailable_line(url: &str, copied: bool) -> String {
+    if copied {
+        format!("{url} — {BROWSER_UNAVAILABLE_NOTICE} (URL copied)")
+    } else {
+        format!("{url} — {BROWSER_UNAVAILABLE_NOTICE}")
+    }
+}
 
 /// Open a URL in the system's default browser/handler.
 ///
@@ -12,9 +70,15 @@ use crate::terminal::hyperlinks::SchemeFilter;
 /// Linux, `cmd /c start` on Windows) with fully detached stdio so it
 /// cannot block the pager.
 ///
+/// Returns `true` when the opener was launched (or the test seam recorded
+/// the URL). Returns `false` when the environment looks headless or spawn
+/// fails — callers should surface the URL via [`browser_unavailable_message`]
+/// (scrollback) or [`browser_unavailable_line`] (welcome toast).
+///
 /// **Callers handling untrusted input** should call [`is_safe_to_open`]
-/// first, or use [`open_url_if_safe`] which combines both steps.
-pub fn open_url(url: &str) {
+/// first, or use [`open_url_if_safe`] / [`try_open_url`] which combine both.
+#[allow(clippy::disallowed_methods)] // fire and forget; the child is reaped when this process exits
+pub fn open_url(url: &str) -> bool {
     // Test seam: PTY e2e must observe the open without launching a real
     // browser. When set, append the URL to the file and skip the OS opener.
     if let Ok(path) = std::env::var("GROK_TEST_OPEN_URL_FILE") {
@@ -28,8 +92,17 @@ pub fn open_url(url: &str) {
             .and_then(|mut f| writeln!(f, "{url}"))
         {
             tracing::warn!(error = %e, path, "GROK_TEST_OPEN_URL_FILE write failed");
+            return false;
         }
-        return;
+        return true;
+    }
+
+    // Skip the doomed spawn on headless Linux VMs (no DISPLAY / Wayland)
+    // so billing Upgrade / Buy-credits clicks can fall back to showing the
+    // URL instead of silently no-op'ing.
+    if !browser_open_likely_available() {
+        tracing::info!("skipping browser open: no display server / BROWSER");
+        return false;
     }
 
     #[cfg(target_os = "macos")]
@@ -48,16 +121,20 @@ pub fn open_url(url: &str) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     xai_grok_tools::util::detach_std_command(&mut command);
-    if let Err(e) = command.spawn() {
-        // Redact URL to avoid leaking sensitive query params to logs.
-        let redacted = url::Url::parse(url)
-            .map(|mut u| {
-                u.set_query(None);
-                u.set_fragment(None);
-                u.to_string()
-            })
-            .unwrap_or_else(|_| "<unparseable>".to_string());
-        tracing::warn!(url = %redacted, error = %e, "failed to open URL");
+    match command.spawn() {
+        Ok(_) => true,
+        Err(e) => {
+            // Redact URL to avoid leaking sensitive query params to logs.
+            let redacted = url::Url::parse(url)
+                .map(|mut u| {
+                    u.set_query(None);
+                    u.set_fragment(None);
+                    u.to_string()
+                })
+                .unwrap_or_else(|_| "<unparseable>".to_string());
+            tracing::warn!(url = %redacted, error = %e, "failed to open URL");
+            false
+        }
     }
 }
 
@@ -94,6 +171,7 @@ fn build_open_path_command(path: &std::path::Path) -> std::process::Command {
 ///   expansion corrupts the percent-encoded session-directory segment in
 ///   imagine media paths (e.g. `…\C%3A%5CUsers…`).
 /// - **macOS / Linux**: `open` / `xdg-open` open the file in its default app.
+#[allow(clippy::disallowed_methods)] // fire and forget; the child is reaped when this process exits
 pub fn open_path(path: &std::path::Path) -> bool {
     // Never launch a real GUI app in tests.
     #[cfg(test)]
@@ -127,6 +205,7 @@ pub fn open_path(path: &std::path::Path) -> bool {
 /// Prefer the on-disk path as-is. When the file is missing, open the parent
 /// folder (no `/select`) so the user lands near the media instead of Home.
 #[cfg(all(not(test), target_os = "windows"))]
+#[allow(clippy::disallowed_methods)] // fire and forget; the child is reaped when this process exits
 fn reveal_in_explorer(path: &std::path::Path) -> bool {
     use std::os::windows::process::CommandExt;
 
@@ -199,14 +278,26 @@ pub fn is_safe_to_open(url: &str, filter: SchemeFilter) -> bool {
     false
 }
 
-/// Validate scheme and open a URL if permitted. Returns `true` if opened.
+/// Validate scheme and open a URL if permitted.
+///
+/// Returns `true` only when the scheme is allowed **and** the opener was
+/// launched. Distinguishes scheme rejection from browser unavailability
+/// via [`try_open_url`].
 pub fn open_url_if_safe(url: &str, filter: SchemeFilter) -> bool {
-    if is_safe_to_open(url, filter) {
-        open_url(url);
-        true
-    } else {
+    matches!(try_open_url(url, filter), OpenUrlResult::Opened)
+}
+
+/// Validate scheme and attempt to open. Prefer this when the caller needs
+/// to show a manual-URL fallback on [`OpenUrlResult::BrowserUnavailable`].
+pub fn try_open_url(url: &str, filter: SchemeFilter) -> OpenUrlResult {
+    if !is_safe_to_open(url, filter) {
         tracing::debug!(url, "URL scheme not permitted");
-        false
+        return OpenUrlResult::RejectedScheme;
+    }
+    if open_url(url) {
+        OpenUrlResult::Opened
+    } else {
+        OpenUrlResult::BrowserUnavailable
     }
 }
 
@@ -445,5 +536,91 @@ mod tests {
             "MAILTO:user@example.com",
             SchemeFilter::Standard
         ));
+    }
+
+    fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn browser_available_with_x11_display() {
+        assert!(browser_open_likely_available_from_env(&env(&[(
+            "DISPLAY", ":0"
+        )])));
+    }
+
+    #[test]
+    fn browser_available_with_wayland() {
+        assert!(browser_open_likely_available_from_env(&env(&[(
+            "WAYLAND_DISPLAY",
+            "wayland-0"
+        )])));
+    }
+
+    #[test]
+    fn browser_available_with_browser_env_override() {
+        // Headless boxes can still open via BROWSER=… even without DISPLAY.
+        assert!(browser_open_likely_available_from_env(&env(&[(
+            "BROWSER", "firefox"
+        )])));
+    }
+
+    #[test]
+    fn browser_unavailable_when_display_vars_empty_or_missing() {
+        if cfg!(any(target_os = "macos", target_os = "windows")) {
+            // Desktop OSes do not gate on DISPLAY.
+            assert!(browser_open_likely_available_from_env(&env(&[])));
+            return;
+        }
+        assert!(!browser_open_likely_available_from_env(&env(&[])));
+        assert!(!browser_open_likely_available_from_env(&env(&[
+            ("DISPLAY", ""),
+            ("WAYLAND_DISPLAY", ""),
+            ("BROWSER", ""),
+        ])));
+    }
+
+    #[test]
+    fn browser_unavailable_message_includes_full_url() {
+        let url = "https://grok.com/supergrok?referrer=grok-build";
+        assert_eq!(
+            browser_unavailable_message(url),
+            format!("{BROWSER_UNAVAILABLE_NOTICE}:\n{url}")
+        );
+    }
+
+    #[test]
+    fn browser_unavailable_line_is_url_first_single_line() {
+        let url = "https://grok.com/supergrok?referrer=grok-build";
+        let plain = browser_unavailable_line(url, false);
+        assert!(plain.starts_with(url), "{plain}");
+        assert!(!plain.contains('\n'), "{plain}");
+        assert!(
+            !plain.to_ascii_lowercase().contains("copied"),
+            "must not claim copy on failure: {plain}"
+        );
+        assert!(
+            plain.contains(BROWSER_UNAVAILABLE_NOTICE),
+            "shares notice stem with multi-line form: {plain}"
+        );
+
+        let with_copy = browser_unavailable_line(url, true);
+        assert!(with_copy.starts_with(url), "{with_copy}");
+        assert!(!with_copy.contains('\n'), "{with_copy}");
+        assert!(
+            with_copy.contains("URL copied"),
+            "copy claim only when copied=true: {with_copy}"
+        );
+    }
+
+    #[test]
+    fn try_open_url_rejects_unsafe_scheme_without_opening() {
+        assert_eq!(
+            try_open_url("javascript:alert(1)", SchemeFilter::Standard),
+            OpenUrlResult::RejectedScheme
+        );
     }
 }

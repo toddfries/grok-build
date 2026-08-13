@@ -11,6 +11,8 @@ pub(crate) struct PendingRunningAdoption {
     /// The queued prompt's text (for the turn-start shim's user block), if the
     /// pager knew about the prompt. `None` for prompts queued by other clients.
     pub text: Option<String>,
+    /// Combined-turn display segments (len ≥ 2); shim paints one bubble each.
+    pub combined_texts: Option<Vec<String>>,
     /// The adopted entry's `kind` (`"prompt"`/`"bash"`/`"verification"`/…),
     /// which selects the turn-start shim's display block + focus flag.
     pub kind: String,
@@ -69,19 +71,30 @@ pub(super) fn handle_queue_changed(notif: &acp::ExtNotification, app: &mut AppVi
     let running_prompt_id = changed.running_prompt_id.clone();
     let session_id = changed.session_id.clone();
 
-    // Capture the running prompt's text + kind from the currently-known queue
-    // (an optimistic echo, or a prior authoritative entry) BEFORE the broadcast
-    // is applied — the new broadcast drops the now-running item from `entries`,
-    // so it's gone afterward. The turn-start shim uses them to render the right
-    // display block.
+    // Prefer running_* fields on the payload (authoritative; present when a
+    // turn is promoting). Fall back to the local mirror for older shells.
     let running_entry = running_prompt_id.as_ref().and_then(|pid| {
         app.shared_prompt_queue(&session_id)
             .and_then(|q| q.iter().find(|e| &e.id == pid).cloned())
     });
-    let running_text: Option<String> = running_entry.as_ref().map(|e| e.text.clone());
-    let running_kind: String = running_entry
-        .as_ref()
-        .map(|e| e.kind.clone())
+    let running_text: Option<String> = changed
+        .running_text
+        .clone()
+        .or_else(|| running_entry.as_ref().map(|e| e.text.clone()));
+    let running_combined: Option<Vec<String>> = changed
+        .running_combined_texts
+        .clone()
+        .filter(|v| v.len() >= 2)
+        .or_else(|| {
+            running_entry
+                .as_ref()
+                .and_then(|e| e.combined_texts.clone())
+                .filter(|v| v.len() >= 2)
+        });
+    let running_kind: String = changed
+        .running_kind
+        .clone()
+        .or_else(|| running_entry.as_ref().map(|e| e.kind.clone()))
         .unwrap_or_else(|| "prompt".to_string());
 
     // Resolve the owning agent before the queue is replaced.
@@ -154,6 +167,13 @@ pub(super) fn handle_queue_changed(notif: &acp::ExtNotification, app: &mut AppVi
                         && stashed_pid.as_deref() != Some(pid.as_str())
                         && !raw_entries.iter().any(|(eid, _)| eid == *pid)
                         && !agent.optimistic_queue_ids.contains(*pid)
+                        // An active-goal Send Now painted block awaiting its
+                        // interjection claim: its row legitimately vanishes from
+                        // the broadcast the instant the shell converts the Send
+                        // Now into an interjection, so absence here is expected.
+                        // Keep it in place for `handle_interjection` to convert;
+                        // retiring it would drop and re-push it at the end.
+                        && !agent.is_send_now_awaiting_interjection_claim(pid)
                 })
                 .cloned()
                 .collect();
@@ -207,10 +227,30 @@ pub(super) fn handle_queue_changed(notif: &acp::ExtNotification, app: &mut AppVi
                     new_text: None,
                 });
         }
-        // A queue change can empty the visible queue mid-wait — the marker
-        // may become eligible now (see `maybe_push_parked_marker`).
-        if let Some(agent) = app.agents.get_mut(&aid) {
-            agent.maybe_push_parked_marker();
+    }
+
+    // Wake-turn marker reconcile: `running_prompt_id` is authoritative. A
+    // broadcast naming a wake prompt offers the stop affordance even before
+    // its first delta; any other value retires a stale marker (recovery for
+    // a lost wake terminal).
+    if let Some(aid) = agent_id
+        && let Some(agent) = app.agents.get_mut(&aid)
+    {
+        let running = running_prompt_id.as_deref();
+        if agent
+            .running_wake_turn
+            .as_ref()
+            .is_some_and(|wake| Some(wake.prompt_id.as_str()) != running)
+        {
+            agent.running_wake_turn = None;
+        }
+        if let Some(pid) = running
+            && is_wake_prompt(pid)
+        {
+            // The broadcast is authoritative: the shell says this wake is
+            // running, so an earlier terminal's record no longer applies.
+            agent.finished_wake_prompts.remove(pid);
+            agent.note_streaming_wake_turn(pid);
         }
     }
 
@@ -279,14 +319,16 @@ pub(super) fn handle_queue_changed(notif: &acp::ExtNotification, app: &mut AppVi
                 // Nothing running locally: adopt now + run the turn-start shim
                 // (render the queued prompt's user block, set `TurnRunning`).
                 None => {
-                    if let Some(agent) = app.agents.get_mut(&aid) {
+                    let page_flip_entry = app.agents.get_mut(&aid).and_then(|agent| {
                         super::super::dispatch::apply_turn_start_shim(
                             agent,
                             pid,
                             running_text,
                             &running_kind,
-                        );
-                    }
+                            running_combined,
+                        )
+                    });
+                    super::super::dispatch::note_peek_page_flip(app, aid, page_flip_entry);
                 }
                 // A different prompt is still finishing locally (FIFO handoff
                 // race — the next broadcast can arrive before the previous
@@ -355,6 +397,7 @@ pub(super) fn handle_queue_changed(notif: &acp::ExtNotification, app: &mut AppVi
                         PendingRunningAdoption {
                             prompt_id: pid.clone(),
                             text: running_text,
+                            combined_texts: running_combined,
                             kind: running_kind,
                             turn_ended: false,
                         },

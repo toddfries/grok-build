@@ -284,7 +284,10 @@ pub(crate) async fn upload_tool_state_queued(
     {
         EnqueueOutcome::Enqueued => {
             dc_log!(
-                info, session_id = % session_id, turn_number, bytes = bytes_len,
+                info,
+                session_id = %session_id,
+                turn_number,
+                bytes = bytes_len,
                 "workspace: tool_state upload enqueued"
             );
             record_upload_outcome("tool_state", "succeeded");
@@ -292,7 +295,10 @@ pub(crate) async fn upload_tool_state_queued(
         }
         EnqueueOutcome::FellBackToInline => {
             dc_log!(
-                info, session_id = % session_id, turn_number, bytes = bytes_len,
+                info,
+                session_id = %session_id,
+                turn_number,
+                bytes = bytes_len,
                 "workspace: tool_state upload fell back to inline"
             );
             record_upload_outcome("tool_state", "succeeded");
@@ -300,10 +306,24 @@ pub(crate) async fn upload_tool_state_queued(
         }
         EnqueueOutcome::Deduplicated => {
             dc_log!(
-                info, session_id = % session_id, turn_number,
+                info,
+                session_id = %session_id,
+                turn_number,
                 "workspace: tool_state upload deduplicated, identical upload already in flight"
             );
             record_upload_outcome("tool_state", "succeeded");
+            Ok(())
+        }
+        EnqueueOutcome::Skipped { reason } => {
+            dc_log!(
+                info,
+                session_id = %session_id,
+                turn_number,
+                skip_reason = reason.as_str(),
+                "workspace: tool_state upload skipped"
+            );
+            record_upload_skipped("tool_state", &reason);
+            record_upload_outcome("tool_state", "skipped");
             Ok(())
         }
         EnqueueOutcome::Failed { reason } => Err(reason.into()),
@@ -392,8 +412,10 @@ mod tests {
         let cfg = source.resolve();
         assert_eq!(cfg.bucket_url.as_deref(), Some("gs://placeholder"));
         assert!(
-            matches!(& cfg.upload_method, UploadMethod::Proxy { proxy_base_url, .. } if
-            proxy_base_url == "https://proxy.example/v1"),
+            matches!(
+                &cfg.upload_method,
+                UploadMethod::Proxy { proxy_base_url, .. } if proxy_base_url == "https://proxy.example/v1"
+            ),
             "resolve() must carry the proxy upload method + base url"
         );
         let cfg_async = source.resolve_async().await;
@@ -574,12 +596,18 @@ mod tests {
     fn dc_log_pins_target_level_and_vocabulary() {
         let events = capture_dc(|| {
             dc_log!(
-                info, session_id = % "s", turn_number = 1u64, bytes = 5usize,
+                info,
+                session_id = %"s",
+                turn_number = 1u64,
+                bytes = 5usize,
                 "constant info message"
             );
             dc_log!(
-                warn, session_id = % "s", outcome = "skipped", skip_reason =
-                "no_upload_queue", "constant warn message"
+                warn,
+                session_id = %"s",
+                outcome = "skipped",
+                skip_reason = "no_upload_queue",
+                "constant warn message"
             );
         });
         assert_eq!(events.len(), 2, "both events land on the target");

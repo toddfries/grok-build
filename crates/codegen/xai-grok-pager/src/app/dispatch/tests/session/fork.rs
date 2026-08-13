@@ -41,6 +41,7 @@ fn worktree_forked_sets_session_id_eagerly_and_emits_load() {
             code_restored: false,
             restore_summary: None,
             restore_degree: None,
+            resume_session_id: Some("orig-sess".into()),
         }),
         &mut app,
     );
@@ -61,6 +62,77 @@ fn worktree_forked_sets_session_id_eagerly_and_emits_load() {
                 if session_id == "forked-sess-1"));
     // Scrollback has the "Worktree ready" message.
     assert!(!app.agents[&id].scrollback.is_empty());
+}
+
+#[test]
+fn startup_fork_parent_is_worktree_for_standalone_clone() {
+    let mut app = test_app();
+    let main = crate::test_util::TempGitRepo::init("main-only");
+    let clone = main.standalone_clone("wt-branch");
+    let effects = dispatch(
+        Action::StartupForkSession {
+            parent_session_id: "parent-sid".into(),
+            parent_cwd: Some(clone.path.clone()),
+            new_session_id: None,
+        },
+        &mut app,
+    );
+    assert!(
+        effects.iter().any(|e| matches!(
+            e,
+            Effect::ForkSession {
+                parent_is_worktree: true,
+                ..
+            }
+        )),
+        "startup fork from a standalone clone must pass parent_is_worktree, got {effects:?}"
+    );
+}
+
+#[test]
+fn worktree_forked_clears_sticky_branch_from_main_repo() {
+    let mut app = test_app_git();
+    dispatch(
+        Action::NewWorktreeSession {
+            load_session_id: Some("orig-sess".into()),
+            label: None,
+            git_ref: None,
+        },
+        &mut app,
+    );
+    let id = AgentId(0);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.current_branch = Some("main-random".into());
+        agent.main_repo = Some("~/old-main".into());
+        agent.is_worktree = false;
+    }
+
+    let worktree_path = PathBuf::from("/tmp/grok-worktrees/pager-fork-sticky");
+    let session_cwd = worktree_path.join("sub");
+    dispatch(
+        Action::TaskComplete(TaskResult::WorktreeForked {
+            agent_id: id,
+            session_id: acp::SessionId::new("forked-sess-sticky"),
+            worktree_path,
+            session_cwd: session_cwd.clone(),
+            code_restored: false,
+            restore_summary: None,
+            restore_degree: None,
+            resume_session_id: Some("orig-sess".into()),
+        }),
+        &mut app,
+    );
+
+    let agent = &app.agents[&id];
+    assert!(
+        agent.current_branch.is_none(),
+        "sticky main-repo branch must not survive the worktree cwd switch"
+    );
+    assert!(agent.main_repo.is_none());
+    assert!(agent.is_worktree);
+    assert!(agent.session.is_worktree);
+    assert_eq!(agent.session.cwd, session_cwd);
 }
 
 #[test]
@@ -89,6 +161,7 @@ fn worktree_forked_with_restore_shows_summary_in_scrollback() {
                 "checked out abc12345, staged: true, unstaged: false, untracked: 3".into(),
             ),
             restore_degree: Some(xai_grok_workspace::session::git::RestoreDegree::Full),
+            resume_session_id: Some("orig-sess".into()),
         }),
         &mut app,
     );
@@ -143,6 +216,7 @@ fn worktree_forked_with_restore_failure_shows_warning_banner() {
                 "restore aborted (checkout failed); stash skipped: MERGE_HEAD present".into(),
             ),
             restore_degree: None,
+            resume_session_id: Some("orig-fail".into()),
         }),
         &mut app,
     );
@@ -198,6 +272,7 @@ fn fork_initiation_supersedes_open_reload_window() {
             agent_id: id,
             new_session_id: acp::SessionId::new("sess-fork"),
             cwd: std::path::PathBuf::from("/tmp"),
+            parent_session_id: acp::SessionId::new("sess-old"),
         }),
         &mut app,
     );
@@ -229,6 +304,7 @@ fn fork_initiation_supersedes_open_reload_window() {
             restore_summary: None,
             restore_degree: None,
             running_prompt_id: None,
+            scheduler_background_loops: None,
         }),
         &mut app,
     );
@@ -551,6 +627,64 @@ fn dispatch_fork_sets_forked_from_on_new_agent() {
     assert_eq!(new_agent.session.forked_from, Some(AgentId(0)));
 }
 
+/// GBT-4789 — dashboard attach follows the forked child.
+#[test]
+fn dispatch_fork_repoints_dashboard_attached_agent_to_child() {
+    let mut app = fork_test_app();
+    ensure_dashboard_state(&mut app);
+    app.dashboard.as_mut().unwrap().attached_agent = Some(AgentId(0));
+
+    dispatch(Action::Fork(fork_args(Some(false), None)), &mut app);
+
+    assert!(
+        matches!(app.active_view, ActiveView::Agent(id) if id == AgentId(1)),
+        "fork must switch active view to the child"
+    );
+    assert_eq!(
+        app.dashboard.as_ref().unwrap().attached_agent,
+        Some(AgentId(1)),
+        "attached_agent must re-point to the forked child so overlay \
+         back-out (Left/Esc/Ctrl+\\) keeps working",
+    );
+}
+
+/// Fork must not invent dashboard attach when none was set.
+#[test]
+fn dispatch_fork_without_dashboard_attach_leaves_attached_none() {
+    let mut app = fork_test_app();
+    ensure_dashboard_state(&mut app);
+    assert!(app.dashboard.as_ref().unwrap().attached_agent.is_none());
+
+    dispatch(Action::Fork(fork_args(Some(false), None)), &mut app);
+
+    assert_eq!(
+        app.dashboard.as_ref().unwrap().attached_agent,
+        None,
+        "fork must not enable overlay chrome when the parent was not attached",
+    );
+}
+
+#[test]
+fn dispatch_fork_keeps_stale_attach_on_other_agent() {
+    let mut app = fork_test_app();
+    insert_placeholder_agent(&mut app, AgentId(1));
+    app.next_agent_id = 2;
+    ensure_dashboard_state(&mut app);
+    app.dashboard.as_mut().unwrap().attached_agent = Some(AgentId(1));
+
+    dispatch(Action::Fork(fork_args(Some(false), None)), &mut app);
+
+    assert!(
+        matches!(app.active_view, ActiveView::Agent(id) if id == AgentId(2)),
+        "fork must switch active view to the child"
+    );
+    assert_eq!(
+        app.dashboard.as_ref().unwrap().attached_agent,
+        Some(AgentId(1)),
+        "attach on a different agent must not be re-pointed to the fork child",
+    );
+}
+
 #[test]
 fn dispatch_fork_pushes_parent_marker_with_directive() {
     let mut app = fork_test_app();
@@ -752,8 +886,9 @@ fn dispatch_fork_inherits_appearance_sharing_and_plugin_visibility() {
             .slash_controller
             .registry()
             .get("usage")
-            .is_none()
+            .is_some()
     );
+    assert!(!new_agent.billing_surface_visible);
     assert_eq!(
         new_agent
             .credit_balance
@@ -969,6 +1104,111 @@ fn dispatch_new_session_worktree_mode_never_skips_modal_and_creates_in_cwd() {
 }
 
 #[test]
+fn fork_session_ready_retargets_suppress_from_parent_to_child() {
+    let mut app = fork_test_app();
+    insert_placeholder_agent(&mut app, AgentId(1));
+    app.agents.get_mut(&AgentId(1)).unwrap().session.session_id = None;
+    app.suppress_code_restore_once = Some("parent-sid".into());
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::ForkSessionReady {
+            agent_id: AgentId(1),
+            new_session_id: "child-sid".into(),
+            cwd: PathBuf::from("/tmp/forked"),
+            parent_session_id: acp::SessionId::new("parent-sid"),
+        }),
+        &mut app,
+    );
+    assert_eq!(app.suppress_code_restore_once.as_deref(), Some("child-sid"));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::LoadSession { session_id, .. }] if session_id == "child-sid"
+    ));
+    let flags_restore = crate::app::event_loop::take_load_restore_code(&mut app, &effects);
+    assert_eq!(flags_restore, Some(false));
+    assert!(app.suppress_code_restore_once.is_none());
+}
+
+#[test]
+fn fork_session_ready_does_not_retarget_unrelated_suppress() {
+    let mut app = fork_test_app();
+    insert_placeholder_agent(&mut app, AgentId(1));
+    app.agents.get_mut(&AgentId(1)).unwrap().session.session_id = None;
+    app.suppress_code_restore_once = Some("other-sid".into());
+    dispatch(
+        Action::TaskComplete(TaskResult::ForkSessionReady {
+            agent_id: AgentId(1),
+            new_session_id: "child-sid".into(),
+            cwd: PathBuf::from("/tmp/forked"),
+            parent_session_id: acp::SessionId::new("parent-sid"),
+        }),
+        &mut app,
+    );
+    assert_eq!(app.suppress_code_restore_once.as_deref(), Some("other-sid"));
+}
+
+#[test]
+fn worktree_forked_retargets_suppress_to_child() {
+    let mut app = test_app_git();
+    dispatch(
+        Action::NewWorktreeSession {
+            load_session_id: Some("orig-sess".into()),
+            label: None,
+            git_ref: None,
+        },
+        &mut app,
+    );
+    app.suppress_code_restore_once = Some("orig-sess".into());
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::WorktreeForked {
+            agent_id: AgentId(0),
+            session_id: acp::SessionId::new("forked-sess-1"),
+            worktree_path: PathBuf::from("/tmp/grok-worktrees/pager-fork"),
+            session_cwd: PathBuf::from("/tmp/grok-worktrees/pager-fork/sub"),
+            code_restored: false,
+            restore_summary: None,
+            restore_degree: None,
+            resume_session_id: Some("orig-sess".into()),
+        }),
+        &mut app,
+    );
+    assert_eq!(
+        app.suppress_code_restore_once.as_deref(),
+        Some("forked-sess-1")
+    );
+    let flags_restore = crate::app::event_loop::take_load_restore_code(&mut app, &effects);
+    assert_eq!(flags_restore, Some(false));
+    assert!(app.suppress_code_restore_once.is_none());
+}
+
+#[test]
+fn worktree_forked_does_not_retarget_unrelated_suppress() {
+    let mut app = test_app_git();
+    dispatch(
+        Action::NewWorktreeSession {
+            load_session_id: Some("orig-sess".into()),
+            label: None,
+            git_ref: None,
+        },
+        &mut app,
+    );
+    app.suppress_code_restore_once = Some("other-sid".into());
+    dispatch(
+        Action::TaskComplete(TaskResult::WorktreeForked {
+            agent_id: AgentId(0),
+            session_id: acp::SessionId::new("forked-sess-1"),
+            worktree_path: PathBuf::from("/tmp/grok-worktrees/pager-fork"),
+            session_cwd: PathBuf::from("/tmp/grok-worktrees/pager-fork/sub"),
+            code_restored: false,
+            restore_summary: None,
+            restore_degree: None,
+            resume_session_id: Some("orig-sess".into()),
+        }),
+        &mut app,
+    );
+    assert_eq!(app.suppress_code_restore_once.as_deref(), Some("other-sid"));
+}
+
+#[test]
 fn fork_session_ready_emits_load_session_with_new_id() {
     let mut app = fork_test_app();
     // Plant a placeholder fork agent (mirroring what dispatch_fork
@@ -980,6 +1220,7 @@ fn fork_session_ready_emits_load_session_with_new_id() {
             agent_id: AgentId(1),
             new_session_id: "new-sid-123".into(),
             cwd: PathBuf::from("/tmp/forked"),
+            parent_session_id: acp::SessionId::new("test-session"),
         }),
         &mut app,
     );
@@ -1019,6 +1260,46 @@ fn fork_session_ready_emits_load_session_with_new_id() {
     assert!(app.agents[&AgentId(1)].session.loading_replay);
 }
 
+/// Successful no-worktree fork under sticky `--chat` (child not a local
+/// Build row under cwd) must stamp `conversation_entry` so `rename_kind()`
+/// matches the effects `kind=chat` load stamp.
+#[test]
+fn fork_session_ready_sticky_chat_sets_rename_kind_chat() {
+    let mut app = fork_test_app();
+    insert_placeholder_agent(&mut app, AgentId(1));
+    app.agents.get_mut(&AgentId(1)).unwrap().session.session_id = None;
+    app.agents.get_mut(&AgentId(1)).unwrap().conversation_entry = false;
+    app.chat_mode = true;
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::ForkSessionReady {
+            agent_id: AgentId(1),
+            new_session_id: "new-sid-chat".into(),
+            cwd: PathBuf::from("/tmp/forked"),
+            parent_session_id: acp::SessionId::new("test-session"),
+        }),
+        &mut app,
+    );
+    match effects.as_slice() {
+        [Effect::LoadSession { chat_kind, .. }] => {
+            assert!(
+                !*chat_kind,
+                "LoadSession chat_kind stays the raw conversation-entry bit"
+            );
+        }
+        other => panic!("expected LoadSession, got {other:?}"),
+    }
+    let agent = app.agents.get(&AgentId(1)).expect("fork agent kept");
+    assert!(agent.chat_kind, "UI bit comes from sticky --chat");
+    assert!(
+        agent.conversation_entry,
+        "sticky --chat fork with no local disk opens as chat (rename kind)"
+    );
+    assert_eq!(
+        agent.rename_kind(),
+        xai_grok_shell::session::unified_list::SessionKind::Chat
+    );
+}
+
 /// No-worktree fork under sticky `--chat` must refuse a local Build row
 /// (same gate as WorktreeForked / dispatch_load_session_ungated).
 #[test]
@@ -1037,6 +1318,7 @@ fn fork_session_ready_refuses_local_build_under_chat_mode() {
             agent_id: AgentId(1),
             new_session_id: session_id.clone().into(),
             cwd: cwd.clone(),
+            parent_session_id: acp::SessionId::new("test-session"),
         }),
         &mut app,
     );
@@ -1290,14 +1572,15 @@ fn handle_ask_user_question_pushes_system_block_when_displaced_local_fork_modal(
         qv.local_kind.is_none(),
         "ACP-driven question must not have local_kind set"
     );
-    // The displaced local modal triggered a "/fork cancelled by
-    // model question" system block on the agent's scrollback.
+    // The displaced local modal explains why the question disappeared.
     let last = app.agents[&id]
         .scrollback
         .get(app.agents[&id].scrollback.len() - 1)
         .expect("scrollback should have a new entry");
     match &last.block {
-        RenderBlock::System(sys) => assert_eq!(sys.text, "/fork cancelled by model question"),
+        RenderBlock::System(sys) => {
+            assert_eq!(sys.text, "/fork cancelled because another question opened.")
+        }
         other => panic!("expected System block, got {other:?}"),
     }
     assert_eq!(

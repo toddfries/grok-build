@@ -1,10 +1,89 @@
 use super::persist::update_config;
 use anyhow::Result;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::time::UNIX_EPOCH;
 
 // ---------------------------------------------------------------------------
 // Settings helpers — typed disk-write wrappers for each setting.
 // All route through `update_config` → `merge_section` → `save_config`.
 // ---------------------------------------------------------------------------
+
+// Process-wide cache for `[ui].follow_up_behavior == "steer"`.
+//
+// The shell agent is a separate process from the pager, so an in-process
+// atomic updated in the pager never reaches the turn loop. Key the cache on
+// config.toml mtime instead. A live settings write invalidates on the next
+// safe-point drain (cheap stat; full parse only when the file changed).
+//
+// 0 = unknown, 1 = queue, 2 = steer.
+const FOLLOW_UP_CACHE_UNKNOWN: u8 = 0;
+const FOLLOW_UP_CACHE_QUEUE: u8 = 1;
+const FOLLOW_UP_CACHE_STEER: u8 = 2;
+static FOLLOW_UP_STEER_CACHE: AtomicU8 = AtomicU8::new(FOLLOW_UP_CACHE_UNKNOWN);
+static FOLLOW_UP_STEER_MTIME_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Nanoseconds since epoch for the user `config.toml` mtime, or 0 if missing.
+fn follow_up_config_mtime_ns() -> u64 {
+    let path = crate::util::grok_home::grok_home().join("config.toml");
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// Update the hot-path Steer cache (same-process tests / after a local write).
+pub fn set_follow_up_steer_cache(steer: bool) {
+    FOLLOW_UP_STEER_CACHE.store(
+        if steer {
+            FOLLOW_UP_CACHE_STEER
+        } else {
+            FOLLOW_UP_CACHE_QUEUE
+        },
+        Ordering::Relaxed,
+    );
+    FOLLOW_UP_STEER_MTIME_NS.store(follow_up_config_mtime_ns(), Ordering::Relaxed);
+}
+
+/// Whether Steer is enabled in this process.
+///
+/// Hits disk only when the cache is cold or `config.toml` mtime has changed
+/// since the last resolve, so the pager can toggle Follow-up behavior live
+/// without restarting the shell agent. A failed effective-config load does
+/// not pin Queue: previous cache is kept, or cold failure returns false for
+/// this call only without writing QUEUE+mtime.
+pub async fn follow_up_steer_enabled() -> bool {
+    let mtime = follow_up_config_mtime_ns();
+    let cached_mtime = FOLLOW_UP_STEER_MTIME_NS.load(Ordering::Relaxed);
+    let cached = FOLLOW_UP_STEER_CACHE.load(Ordering::Relaxed);
+    if cached != FOLLOW_UP_CACHE_UNKNOWN && mtime != 0 && mtime == cached_mtime {
+        return cached == FOLLOW_UP_CACHE_STEER;
+    }
+    let root = match crate::config::load_effective_config() {
+        Ok(root) => root,
+        Err(_) => {
+            // Transient load failure: do not cache Queue against this mtime.
+            if cached != FOLLOW_UP_CACHE_UNKNOWN {
+                return cached == FOLLOW_UP_CACHE_STEER;
+            }
+            return false;
+        }
+    };
+    let enabled = super::load::load_config_from_toml(&root)
+        .ui
+        .follow_up_steer_enabled();
+    FOLLOW_UP_STEER_CACHE.store(
+        if enabled {
+            FOLLOW_UP_CACHE_STEER
+        } else {
+            FOLLOW_UP_CACHE_QUEUE
+        },
+        Ordering::Relaxed,
+    );
+    FOLLOW_UP_STEER_MTIME_NS.store(mtime, Ordering::Relaxed);
+    enabled
+}
 
 /// Persist `[ui].compact_mode` via `update_config`.
 pub async fn set_compact_mode(value: bool) -> Result<()> {
@@ -15,6 +94,32 @@ pub async fn set_compact_mode(value: bool) -> Result<()> {
 /// is `Option<bool>` — pager-side `None` means "use default" — so we wrap.
 pub async fn set_show_timestamps(value: bool) -> Result<()> {
     update_config(|cfg| cfg.ui.show_timestamps = Some(value)).await
+}
+
+/// Persist `[ui].show_timeline` via `update_config`. Same `Option<bool>`
+/// shape as `show_timestamps`.
+pub async fn set_show_timeline(value: bool) -> Result<()> {
+    update_config(|cfg| cfg.ui.show_timeline = Some(value)).await
+}
+
+pub async fn set_page_flip_on_send(value: bool) -> Result<()> {
+    update_config(|cfg| cfg.ui.page_flip_on_send = Some(value)).await
+}
+
+pub async fn set_confirm_before_rewind(value: bool) -> Result<()> {
+    update_config(|cfg| cfg.ui.confirm_before_rewind = Some(value)).await
+}
+
+/// Persist `[ui].combine_queued_prompts` via `update_config`.
+pub async fn set_combine_queued_prompts(value: bool) -> Result<()> {
+    update_config(|cfg| cfg.ui.combine_queued_prompts = Some(value)).await
+}
+
+/// Persist `[ui].follow_up_behavior` (`"queue"` | `"steer"`).
+pub async fn set_follow_up_behavior(value: String) -> Result<()> {
+    // Keep the hot-path cache in sync before the disk write returns.
+    set_follow_up_steer_cache(value == "steer");
+    update_config(|cfg| cfg.ui.follow_up_behavior = Some(value)).await
 }
 
 /// Persist `[ui].simple_mode` via `update_config`. Same `Option<bool>`
@@ -52,6 +157,11 @@ pub async fn set_contextual_hint_small_screen(value: bool) -> Result<()> {
 /// Persist `[ui.contextual_hints].word_select` via `update_config`.
 pub async fn set_contextual_hint_word_select(value: bool) -> Result<()> {
     update_config(|cfg| cfg.ui.contextual_hints.word_select = Some(value)).await
+}
+
+/// Persist `[ui.contextual_hints].ssh_wrap` via `update_config`.
+pub async fn set_contextual_hint_ssh_wrap(value: bool) -> Result<()> {
+    update_config(|cfg| cfg.ui.contextual_hints.ssh_wrap = Some(value)).await
 }
 
 /// Persist `[ui].theme` via `update_config`. Caller must pass the
@@ -94,6 +204,14 @@ pub async fn set_default_model(value: String) -> Result<()> {
         if value.is_empty() { None } else { Some(value) },
         None,
     )
+    .await
+}
+
+/// Persist `[privacy].privacy_banner_acked` (RFC 3339 UTC dismiss time).
+pub async fn set_privacy_banner_acked(acked_at_rfc3339: String) -> Result<()> {
+    update_config(|cfg| {
+        cfg.privacy.privacy_banner_acked = Some(acked_at_rfc3339);
+    })
     .await
 }
 
@@ -237,6 +355,12 @@ pub async fn set_voice_stt_language(value: String) -> Result<()> {
     update_config(|cfg| cfg.ui.voice_stt_language = Some(value)).await
 }
 
+/// Persist `[ui].voice_keybind_enabled` via `update_config`. When `false` the
+/// Ctrl+Space / F8 voice chord is ignored (`/voice` still works).
+pub async fn set_voice_keybind_enabled(value: bool) -> Result<()> {
+    update_config(|cfg| cfg.ui.voice_keybind_enabled = Some(value)).await
+}
+
 /// Persist `[ui].default_selected_permission` via `update_config`. Value is
 /// one of the canonical strings from `DEFAULT_SELECTED_PERMISSION_CHOICES`
 /// (`default` | `allow_once` | `allow_always` | `reject`); `default` is the
@@ -255,12 +379,12 @@ pub async fn set_cancel_subagents_on_turn_cancel(value: String) -> Result<()> {
     .await
 }
 
-/// Persist `[ui].screen_mode` (`minimal` | `fullscreen`) via `update_config`.
-/// The sticky screen-mode preference: written by the pager when an explicit
-/// `--minimal`/`--fullscreen` flag (including the `/minimal`//`/fullscreen`
-/// relaunch argv) is used; read once at pager startup.
+/// Persist `[ui].screen_mode` (`fullscreen` | `minimal`). Empty clears the key.
 pub async fn set_screen_mode(value: String) -> Result<()> {
-    update_config(|cfg| cfg.ui.screen_mode = Some(value)).await
+    update_config(|cfg| {
+        cfg.ui.screen_mode = if value.is_empty() { None } else { Some(value) };
+    })
+    .await
 }
 
 /// Persist `[cli].show_tips` via `update_config`.

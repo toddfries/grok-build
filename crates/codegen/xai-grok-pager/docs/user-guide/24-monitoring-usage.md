@@ -9,6 +9,22 @@ own OpenTelemetry collector, so platform teams can monitor adoption, token
 consumption, tool-permission decisions, and errors across the fleet — without
 any data flowing through SpaceXAI.
 
+## Related settings
+
+These knobs are independent of each other (and of this guide's external OTEL stream):
+
+| Setting | How to set it |
+|---------|---------------|
+| Telemetry master switch | `[features] telemetry` / `GROK_TELEMETRY_ENABLED` |
+| Coding data, retention, and training | Settings — `/privacy` opens the row |
+| Trace upload | `[telemetry] trace_upload` / `GROK_TELEMETRY_TRACE_UPLOAD` |
+| External OpenTelemetry | `GROK_EXTERNAL_OTEL` / `[telemetry] otel_*` (this guide) |
+
+See also [Authentication](02-authentication.md#related-settings) and
+[Configuration](05-configuration.md#telemetry).
+
+## External OTEL stream
+
 The external stream is:
 
 - **Off by default**, and requires a *double opt-in* (a master switch **and**
@@ -19,7 +35,7 @@ The external stream is:
 - **Structurally separate** from SpaceXAI-internal telemetry: its exporters carry
   only the headers you configure, never SpaceXAI credentials.
 - **Independent of SpaceXAI data-retention opt-outs**: it works even when
-  `telemetry` is disabled and for ZDR (zero-data-retention) teams — those
+  `telemetry` is disabled and for ZDR (zero-data-retention) teams. Those
   settings govern SpaceXAI-side retention; the external stream is governed solely
   by your own OTEL configuration.
 
@@ -50,6 +66,7 @@ without the master switch.
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4318` for HTTP, `http://localhost:4317` for gRPC | Base endpoint. For `http/protobuf`, `/v1/logs` and `/v1/metrics` are appended per the OTLP spec; for `grpc`, the collector endpoint is used as-is. |
 | `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` / `..._METRICS_ENDPOINT` | — | Signal-specific overrides, used verbatim. For gRPC these should normally be collector endpoints without `/v1/...` paths. |
 | `OTEL_EXPORTER_OTLP_HEADERS` (+ signal-specific variants) | — | Collector auth (`k=v,k2=v2`). The **only** headers the external exporters send, and the only supported collector-auth mechanism (no config-file headers key — tokens never live on disk). |
+| `OTEL_EXPORTER_OTLP_CERTIFICATE` (+ signal-specific variants) | — | Path to a PEM bundle with additional trusted CA certificate(s) for verifying the collector — for collectors behind a private/corporate CA. Additive to the default trust roots (system store and embedded Mozilla roots). |
 | `OTEL_EXPORTER_OTLP_TIMEOUT` | `10000` (ms) | Export timeout. |
 | `OTEL_METRIC_EXPORT_INTERVAL` | `60000` (ms) | Metric export interval. |
 | `OTEL_BLRP_SCHEDULE_DELAY` (or alias `OTEL_LOGS_EXPORT_INTERVAL`) | `5000` (ms) | Log batch interval. |
@@ -99,6 +116,30 @@ the `[telemetry]` `otel_*` keys through `grok setup` managed config /
 requirements pins, or force-disable it fleet-wide with the same local config
 layers (`external_otel_disabled`, content-gate locks).
 
+## Startup suppression (why nothing arrives for the first few seconds)
+
+Because xAI can force-disable this stream fleet-wide, the CLI holds emission
+closed at startup until it knows whether that switch is set — it fetches the
+fleet policy from `/v1/settings` and only then starts exporting. In a healthy
+setup that is well under a second and invisible.
+
+**The wait is bounded**, so a deployment that cannot reach xAI still exports:
+
+- If no fleet policy can apply at all — `[features] remote_fetch = false`, or
+  `[endpoints] cli_chat_proxy_base_url` points somewhere other than xAI — the
+  stream starts immediately, governed by your local configuration.
+- If the policy fetch fails or never completes (firewalled host, offline
+  laptop), emission starts anyway once the attempt is exhausted, and in all
+  cases no later than 30 seconds after startup.
+
+A fleet policy that arrives afterwards still applies; it can only ever
+*tighten* (disable the stream or force the content gates off), never enable
+something your local configuration did not.
+
+If your collector receives nothing at all, check the debug log
+(`grok --debug`) for `external otel:` lines — they record whether the stream
+resolved its configuration, and whether it is exporting or suppressed.
+
 ## Resource attributes
 
 | Attribute | Value |
@@ -124,6 +165,25 @@ events only, never metrics.
 | `grok_code.tool.decision` | `{decision}` | `tool_name`, `decision` = `allow` \| `deny` \| `cancelled` \| `followup`, `access_kind`, `permission_mode` |
 | `grok_code.tool.usage` | `{call}` | `tool_name`, `outcome` |
 | `grok_code.error.count` | `{error}` | `error_category`, `model` |
+| `grok_code.startup.total` | `ms` | `outcome` = `ok` \| `timeout` \| `error`; `auth_mode` |
+| `grok_code.startup.phase_duration` | `ms` | `phase`, `outcome`, `auth_mode` |
+| `grok_code.startup.timeout` | `{timeout}` | `stuck_in`, `auth_mode` |
+
+`startup.total` measures process start to a usable session, recorded once per
+process; `outcome` = `timeout` or `error` means startup ended without one.
+`phase_duration` breaks the connect attempt down by step (`load_config`,
+`managed_policy`, `bootstrap`, `model_catalog`, `spawn_worker`,
+`leader_connect`, `acp_initialize`, `eager_auth`); filter on its `outcome`
+(`ok` | `timeout` | `cancelled` | `error`) so truncated samples do not skew
+`ok` percentiles. The later `app_init`
+and `session_create` phases appear in the log timeline and the summary
+strings, not in this metric. `stuck_in` on a timeout names the step that had
+not finished. That is often not the step that took the longest, because a step
+that runs without pausing finishes before the timeout is recorded. The error
+message Grok prints names the longest step instead, so the two can name
+different steps for the same timeout. Use `phase_duration` to compare them.
+`auth_mode` is `personal`, `team`, `deployment`, or `unknown`:
+startup cost differs by kind, so split by it before comparing.
 
 There is no `cost.usage` metric: join `grok_code.token.usage` with your own
 price sheet. `lines_of_code.count` and `active_time.total` are planned for a
@@ -153,7 +213,7 @@ active.
 | `grok_code.tool_decision` | `tool_name`, `decision`, `access_kind`, `permission_mode`, `source` |
 | `grok_code.mcp_server_connection` | `status`, `transport_type`, `duration_ms`, `tool_count?`, `error_type?`; `mcp_server.name` (**details**; collapsed to `mcp_server` otherwise) |
 | `grok_code.permission_mode_changed` | `to_mode`, `trigger` |
-| `grok_code.skill_activated` | `skill_source`; `skill.name` (**details**) |
+| `grok_code.skill_activated` | `skill_source`, `trigger` = `slash_command` \| `skill_md_read` \| `skill_tool`; `skill.name` (**details**) |
 | `grok_code.plugin_loaded` | `install_kind?`, `success`, `error_category?`; `plugin_name` (**details**) |
 | `grok_code.compaction` | `duration_ms`, `tokens_before`, `tokens_after`, `model?` |
 | `grok_code.subagent` | `phase` = `launched` \| `completed`, `subagent_type?`, `outcome?`, `duration_ms?` |

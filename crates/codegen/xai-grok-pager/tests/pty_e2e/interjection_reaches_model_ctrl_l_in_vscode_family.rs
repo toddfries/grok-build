@@ -5,7 +5,7 @@ use super::common::*;
 /// 19b. **VS Code family: Ctrl+L (form feed) is the send-now chord** with the
 /// same cancel-and-send semantics as the default Ctrl+Enter binding: the
 /// running turn is cancelled silently and the composer text runs as its own
-/// next turn (standard `<user_query>` prompt, no interjection preamble).
+/// next turn (with the interjection preamble).
 /// Harness strips `TERM_PROGRAM` then applies env — pass `vscode` so
 /// defaults bind the chord to Ctrl+L.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -14,18 +14,30 @@ async fn interjection_reaches_model_ctrl_l_in_vscode_family() {
     let content = ContentController::start().await.expect("start content");
     // Gate turn 1's terminal event so the typed text + chord provably land
     // mid-turn regardless of suite load.
-    content.hold_agent_completions();
-    content.set_turns([
+    let mut turn_one = content.expect_agent_turn_blocked(
+        "running turn before VS Code send-now",
         slow_turn_text("TURNONE"),
-        "TURNTWO reply to the sent-now message.".to_owned(),
-    ]);
+    );
+    let _turn_two = content.expect_agent_turn(
+        "VS Code sent-now message",
+        "TURNTWO reply to the sent-now message.",
+    );
 
     let binary = pager_binary().expect("resolve pager binary");
-    let mut env = content.env_for_pager();
-    env.push(("TERM_PROGRAM".into(), "vscode".into()));
-    let env_refs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    let mut harness = PtyHarness::new(&binary, DEFAULT_ROWS, DEFAULT_COLS, &[], &env_refs)
-        .expect("spawn pager with vscode brand");
+    let overrides: Vec<(String, String)> = vec![("TERM_PROGRAM".into(), "vscode".into())];
+    let env_refs: Vec<(&str, &str)> = overrides
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    let mut harness = PtyHarness::spawn_with_content_env(
+        &binary,
+        DEFAULT_ROWS,
+        DEFAULT_COLS,
+        &content,
+        &[],
+        &env_refs,
+    )
+    .expect("spawn pager with vscode brand");
 
     harness
         .wait_for_text(WELCOME_SCREEN_SENTINEL, WELCOME_TIMEOUT)
@@ -36,12 +48,15 @@ async fn interjection_reaches_model_ctrl_l_in_vscode_family() {
     harness
         .wait_for_text("TURNONE", Duration::from_secs(30))
         .expect("turn 1 streaming");
+    tokio::time::timeout(Duration::from_secs(10), turn_one.wait_blocked())
+        .await
+        .expect("turn 1 reached completion barrier");
 
     harness
         .inject_keys(b"please also check the logs")
         .expect("type message");
     harness.inject_keys(CTRL_L).expect("send-now via Ctrl+L");
-    content.release_agent_completions();
+    turn_one.release();
     harness
         .wait_for_text(
             "\u{276F} please also check the logs",
@@ -65,8 +80,8 @@ async fn interjection_reaches_model_ctrl_l_in_vscode_family() {
         .find(|u| u.contains("please also check the logs"))
         .unwrap_or_else(|| panic!("sent-now message never reached the wire: {users:#?}"));
     assert!(
-        !sent.contains(INTERJECTION_WIRE_PREFIX),
-        "send-now must not use the interjection preamble: {sent}"
+        sent.contains(INTERJECTION_WIRE_PREFIX),
+        "send-now must use the interjection preamble: {sent}"
     );
     assert!(
         sent.contains("<user_query>"),

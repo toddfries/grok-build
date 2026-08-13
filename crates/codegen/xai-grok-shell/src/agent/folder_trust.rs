@@ -1,12 +1,14 @@
 //! Folder-trust gate ("do you trust this folder?").
 //!
-//! Repo-local MCP / LSP servers are configured by files an attacker can ship
-//! inside a cloned repository (`.mcp.json`, project `.grok/config.toml`,
-//! `~/.claude.json` `projects.<cwd>`, project `.grok/lsp.json`). Those configs
-//! contain commands that the CLI would otherwise spawn automatically — a
-//! 1-click RCE. This module resolves a VS-Code-style trust decision ONCE per
-//! workspace, BEFORE any repo-local server is spawned, and exposes a cheap
-//! [`project_scope_allowed`] check that the MCP/LSP loaders consult.
+//! Repo-local MCP / LSP servers and permission policy are configured by files
+//! an attacker can ship inside a cloned repository (`.mcp.json`, project
+//! `.grok/config.toml` including `[permission]` / `[mcp_servers]` /
+//! `[plugins].paths`, `~/.claude.json` `projects.<cwd>`, project `.grok/lsp.json`).
+//! Those configs contain commands or auto-approve rules the CLI would otherwise
+//! honor automatically — a 1-click RCE / policy bypass. This module resolves a
+//! VS-Code-style trust decision ONCE per workspace, BEFORE any repo-local
+//! server is spawned, and exposes a cheap [`project_scope_allowed`] check that
+//! the MCP/LSP/permission loaders consult.
 //!
 //! Resolution lives here (not in `acp_session`) so the session core stays free
 //! of feature logic; the loaders only call [`project_scope_allowed`].
@@ -74,7 +76,7 @@ static DECISIONS: LazyLock<Mutex<HashMap<PathBuf, bool>>> =
 /// their grants and denies, so a cache deny would be the one verdict nothing
 /// (grant, store, prompt) could ever lift. Returns whether the folder had been
 /// trusted. Symmetric with [`grant_folder_trust`].
-pub fn revoke_folder_trust(cwd: &Path) -> bool {
+pub(crate) fn revoke_folder_trust(cwd: &Path) -> bool {
     // Local/dev builds are fully inert: nothing was trusted-via-gate to revoke,
     // and recording `false` here would make `project_scope_allowed` wrongly gate.
     if folder_trust_inert() {
@@ -121,7 +123,7 @@ pub fn revoke_folder_trust(cwd: &Path) -> bool {
 ///
 /// `DECISIONS` uses `parking_lot::Mutex` (no poisoning), so this gate cannot
 /// fail OPEN on a poisoned lock.
-pub fn project_scope_allowed(cwd: &Path) -> bool {
+pub(crate) fn project_scope_allowed(cwd: &Path) -> bool {
     let key = workspace_key(cwd);
     // Copy out of the lock so the Some(false) reconcile can re-acquire it
     // (parking_lot mutexes are not re-entrant).
@@ -229,7 +231,11 @@ pub(crate) fn record_for_test(cwd: &Path, allowed: bool) {
 /// whose cwd differs from the launch dir, `grok mcp doctor`) passes `false`, so
 /// an unresolved interactive-but-untrusted workspace resolves **fail-closed**
 /// (untrusted, no prompt) — only the launch dir is ever prompted for.
-pub fn resolve_and_record(cwd: &Path, remote: Option<&RemoteSettings>, allow_prompt: bool) -> bool {
+pub(crate) fn resolve_and_record(
+    cwd: &Path,
+    remote: Option<&RemoteSettings>,
+    allow_prompt: bool,
+) -> bool {
     // Local/dev builds are fully inert: project scope is always allowed, so skip
     // the `trusted_folders.toml` read entirely.
     if folder_trust_inert() {
@@ -263,7 +269,7 @@ pub fn resolve_and_record(cwd: &Path, remote: Option<&RemoteSettings>, allow_pro
 /// no-configs case (config added post-startup via git pull / agent write is
 /// caught). The init-time dedup belongs to the one-shot caller (a `OnceCell` on
 /// `MvpAgent`), NOT to any new shared-cache entry.
-pub fn resolve_launch_dir_trust(cwd: &Path, remote: Option<&RemoteSettings>) -> bool {
+pub(crate) fn resolve_launch_dir_trust(cwd: &Path, remote: Option<&RemoteSettings>) -> bool {
     // Local/dev builds are fully inert: project scope is always allowed, skipping
     // the store read + repo scan entirely.
     if folder_trust_inert() {
@@ -406,7 +412,7 @@ fn compute_from_inputs(
 /// Edge case: a name declared in BOTH a project config and the global
 /// `~/.grok/config.toml` is dropped when untrusted. This is intended — untrusted
 /// project content must not influence the command spawned for a shared name.
-pub fn project_scoped_mcp_names(cwd: &Path) -> HashSet<String> {
+pub(crate) fn project_scoped_mcp_names(cwd: &Path) -> HashSet<String> {
     let mut names = HashSet::new();
 
     // `.grok/config.toml [mcp_servers]` entries tagged project (the loader's key
@@ -448,7 +454,7 @@ pub fn project_scoped_mcp_names(cwd: &Path) -> HashSet<String> {
 /// with a project-declared name is ALSO dropped when untrusted: an untrusted repo
 /// must not influence the command spawned for that name (see
 /// [`project_scoped_mcp_names`]). Servers with no project-name collision are kept.
-pub fn filter_untrusted_project_mcp(
+pub(crate) fn filter_untrusted_project_mcp(
     cwd: &Path,
     merged: Vec<acp::McpServer>,
 ) -> Vec<acp::McpServer> {
@@ -480,7 +486,7 @@ pub fn filter_untrusted_project_mcp(
 /// Thin `cwd`→verdict wrapper over the shared
 /// [`xai_grok_tools::implementations::lsp::config::filter_project_lsp_when_untrusted`]
 /// predicate, so Site B and the workspace build path share one gate.
-pub fn filter_untrusted_project_lsp(
+pub(crate) fn filter_untrusted_project_lsp(
     cwd: &Path,
     sourced: std::collections::BTreeMap<
         String,
@@ -968,6 +974,34 @@ mod tests {
         assert!(
             !project_scope_allowed(tmp.path()),
             "plugin-only untrusted repo must be denied"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn project_scope_allowed_denies_untrusted_permission_only_repo() {
+        // Bridge: a clone whose ONLY repo-local config is `.grok/config.toml`
+        // `[permission]` (no MCP/hooks/plugins) must still produce untrusted via
+        // the real `repo_configs_present` → `decide` → `project_scope_allowed`
+        // path. Resolver unit tests inject `project_trusted = false` directly and
+        // miss this detector gap. Subdir launch ensures the cwd→git-root walk.
+        let _sim = simulate_release_build();
+        let home = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set("GROK_HOME", home.path());
+        let _flag = EnvGuard::unset("GROK_FOLDER_TRUST");
+        let tmp = repo_tmp();
+        let grok = tmp.path().join(".grok");
+        std::fs::create_dir_all(&grok).unwrap();
+        std::fs::write(
+            grok.join("config.toml"),
+            "[permission]\nallow = [\"Bash(*)\"]\n",
+        )
+        .unwrap();
+        let subdir = tmp.path().join("crates").join("inner");
+        std::fs::create_dir_all(&subdir).unwrap();
+        assert!(
+            !project_scope_allowed(&subdir),
+            "permission-only untrusted repo must be denied from a subdirectory"
         );
     }
 

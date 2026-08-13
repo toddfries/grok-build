@@ -48,6 +48,12 @@ pub(crate) fn set_quit_notify(notify: std::sync::Arc<tokio::sync::Notify>) {
     *QUIT_NOTIFY.lock() = Some(notify);
 }
 
+/// Deregister the quit notify once the event loop has exited; a later first
+/// signal force-exits instead of notifying nobody.
+pub(crate) fn clear_quit_notify() {
+    *QUIT_NOTIFY.lock() = None;
+}
+
 /// Whether the TUI currently owns the terminal. Set by [`install`], cleared
 /// by [`mark_restored`] or by [`shutdown_with_terminal_restore`] after
 /// teardown completes. The SIGPIPE path (SIG_IGN, no handler) does not
@@ -104,22 +110,17 @@ fn spawn_async_signal_task() {
             let mut ctrl_shutdown = windows::ctrl_shutdown().ok();
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
-                    request_graceful_or_exit(130);
-                    let _ = tokio::signal::ctrl_c().await;
-                    shutdown_with_terminal_restore(130);
+                    handle_windows_ctrl_c_double().await;
                 }
-                _ = async {
-                    if let Some(s) = ctrl_close.as_mut() { let _ = s.recv().await; }
-                    else { std::future::pending::<()>().await; }
-                } => shutdown_with_terminal_restore(1),
-                _ = async {
-                    if let Some(s) = ctrl_logoff.as_mut() { let _ = s.recv().await; }
-                    else { std::future::pending::<()>().await; }
-                } => shutdown_with_terminal_restore(0),
-                _ = async {
-                    if let Some(s) = ctrl_shutdown.as_mut() { let _ = s.recv().await; }
-                    else { std::future::pending::<()>().await; }
-                } => shutdown_with_terminal_restore(0),
+                _ = recv_optional_ctrl_close(&mut ctrl_close) => {
+                    shutdown_with_terminal_restore(1);
+                }
+                _ = recv_optional_ctrl_logoff(&mut ctrl_logoff) => {
+                    shutdown_with_terminal_restore(0);
+                }
+                _ = recv_optional_ctrl_shutdown(&mut ctrl_shutdown) => {
+                    shutdown_with_terminal_restore(0);
+                }
             }
         }
         #[cfg(not(any(unix, windows)))]
@@ -134,23 +135,65 @@ fn spawn_async_signal_task() {
 }
 
 /// Wait for the next SIGINT/SIGTERM/SIGHUP and map it to its exit code.
+///
+/// Shared with the agent binary (`xai-grok-pager-bin`) so the 130/143/129 map
+/// cannot drift between TUI and agent signal handlers.
 #[cfg(unix)]
-async fn next_signal_code(
+pub async fn next_signal_code(
     sigterm: &mut Option<tokio::signal::unix::Signal>,
     sighup: &mut Option<tokio::signal::unix::Signal>,
 ) -> i32 {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => 130,
-        _ = async {
-            if let Some(s) = sigterm.as_mut() { let _ = s.recv().await; }
-            else { std::future::pending::<()>().await; }
-        } => 143,
-        _ = async {
-            if let Some(s) = sighup.as_mut() { let _ = s.recv().await; }
-            else { std::future::pending::<()>().await; }
-        } => 129,
+        _ = recv_optional_unix_signal(sigterm) => 143,
+        _ = recv_optional_unix_signal(sighup) => 129,
     }
 }
+
+/// Await one recv on an optional unix signal stream, or pend forever if absent.
+#[cfg(unix)]
+pub async fn recv_optional_unix_signal(sig: &mut Option<tokio::signal::unix::Signal>) {
+    if let Some(s) = sig.as_mut() {
+        let _ = s.recv().await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(windows)]
+async fn handle_windows_ctrl_c_double() {
+    request_graceful_or_exit(130);
+    let _ = tokio::signal::ctrl_c().await;
+    shutdown_with_terminal_restore(130);
+}
+
+// Tokio exposes distinct CtrlClose / CtrlLogoff / CtrlShutdown types with no
+// shared trait — generate the three identical recv helpers from one body.
+#[cfg(windows)]
+macro_rules! define_recv_optional_windows_signal {
+    ($name:ident, $ty:ty) => {
+        async fn $name(sig: &mut Option<$ty>) {
+            if let Some(s) = sig.as_mut() {
+                let _ = s.recv().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+}
+
+#[cfg(windows)]
+define_recv_optional_windows_signal!(recv_optional_ctrl_close, tokio::signal::windows::CtrlClose);
+#[cfg(windows)]
+define_recv_optional_windows_signal!(
+    recv_optional_ctrl_logoff,
+    tokio::signal::windows::CtrlLogoff
+);
+#[cfg(windows)]
+define_recv_optional_windows_signal!(
+    recv_optional_ctrl_shutdown,
+    tokio::signal::windows::CtrlShutdown
+);
 
 /// Request the event loop's graceful quit when it is registered and the TUI
 /// still owns the terminal; otherwise hard-exit (agent mode, or a signal after
@@ -160,10 +203,17 @@ fn request_graceful_or_exit(code: i32) {
     if TERMINAL_OWNED.load(Ordering::Acquire)
         && let Some(n) = notify
     {
+        // An orphan never gets the second, forcing signal; bound the quit.
+        super::exit_timeout::arm(code);
         n.notify_one();
     } else {
         shutdown_with_terminal_restore(code);
     }
+}
+
+/// The second-signal teardown, exposed for the exit-timeout path.
+pub(crate) fn force_exit(exit_code: i32) -> ! {
+    shutdown_with_terminal_restore(exit_code)
 }
 
 /// Restore the terminal first, then flush observability, then exit.
@@ -193,7 +243,7 @@ fn shutdown_with_terminal_restore(exit_code: i32) -> ! {
     TERMINAL_OWNED.store(false, Ordering::Release);
     // Best-effort unregister (non-blocking flock to avoid hanging).
     if let Some(ref sid) = *CURRENT_SESSION_ID.lock() {
-        let _ = xai_grok_shell::active_sessions::try_unregister(sid);
+        let _ = xai_grok_active_sessions::try_unregister(sid);
     }
     flush_telemetry_and_exit(exit_code);
 }

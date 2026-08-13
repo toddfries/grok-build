@@ -4,7 +4,7 @@
 //! *queues*; a second bare Enter on the empty prompt is cancel-and-send — the
 //! running turn is cancelled (silently: no "Turn cancelled by user" marker)
 //! and the queued row runs as the next turn, arriving on the wire as a
-//! standard `<user_query>` prompt with no interjection preamble.
+//! standard `<user_query>` prompt with the interjection preamble.
 
 use std::time::Duration;
 
@@ -15,7 +15,6 @@ use crate::{ContentController, PtyHarness, pager_binary};
 
 const DEFAULT_ROWS: u16 = 50;
 const DEFAULT_COLS: u16 = 120;
-/// The interjection-merge preamble: send-now must never produce it.
 const INTERJECTION_WIRE_PREFIX: &str = "The user sent a message while you were working";
 
 fn slow_turn_text(sentinel: &str) -> String {
@@ -53,11 +52,12 @@ pub async fn assert_empty_enter_force_sends_top_queued() -> Result<()> {
         .context("start ContentController")?;
     // Gate turn 1's terminal event so the queue + empty-Enter provably land
     // mid-turn — a paced-chunk window races turn end on slow (remote) workers.
-    content.hold_agent_completions();
-    content.set_turns([
-        slow_turn_text("TURNONE"),
-        "TURNTWO reply to the promoted follow-up.".to_owned(),
-    ]);
+    let mut turn_one = content
+        .expect_agent_turn_blocked("running turn before send-now", slow_turn_text("TURNONE"));
+    let mut turn_two = content.expect_agent_turn(
+        "promoted queued follow-up",
+        "TURNTWO reply to the promoted follow-up.",
+    );
 
     let binary = pager_binary().context("resolve pager binary")?;
     let mut harness =
@@ -70,6 +70,9 @@ pub async fn assert_empty_enter_force_sends_top_queued() -> Result<()> {
     harness
         .wait_for_text("TURNONE", Duration::from_secs(30))
         .context("turn 1 streaming")?;
+    tokio::time::timeout(Duration::from_secs(10), turn_one.wait_blocked())
+        .await
+        .context("turn 1 completion-barrier timeout")?;
 
     harness
         .inject_keys(b"please also check the logs\r")
@@ -81,8 +84,7 @@ pub async fn assert_empty_enter_force_sends_top_queued() -> Result<()> {
     harness.inject_keys(b"\r").context("empty Enter send-now")?;
     // Cancel-and-send: the shell cancels turn 1 (its held completion is
     // irrelevant — the abort wins) and promotes the row to run as turn 2.
-    // Release the gate so any completion race resolves rather than hangs.
-    content.release_agent_completions();
+    turn_one.release();
     // The promoted row renders as a standard user prompt block ("❯ " prefix
     // distinguishes the committed block from the prefix-less queue row) with
     // the new turn's reply below it.
@@ -95,6 +97,9 @@ pub async fn assert_empty_enter_force_sends_top_queued() -> Result<()> {
     harness
         .wait_for_text("TURNTWO", Duration::from_secs(40))
         .context("promoted turn reply")?;
+    tokio::time::timeout(Duration::from_secs(10), turn_two.wait_satisfied())
+        .await
+        .context("promoted turn expectation timeout")?;
 
     // A send-now cancel is silent: no "Turn cancelled by user" marker may
     // appear between the partial turn-1 output and the promoted prompt.
@@ -112,11 +117,11 @@ pub async fn assert_empty_enter_force_sends_top_queued() -> Result<()> {
     else {
         bail!("queued follow-up never reached the wire: {users:#?}");
     };
-    if promoted.contains(INTERJECTION_WIRE_PREFIX) {
-        bail!("send-now must not use the interjection preamble: {promoted}");
+    if !promoted.contains(INTERJECTION_WIRE_PREFIX) {
+        bail!("send-now must use the interjection preamble: {promoted}");
     }
     if !promoted.contains("<user_query>") {
-        bail!("send-now must arrive as a standard user_query prompt: {promoted}");
+        bail!("send-now must wrap the steered text in user_query: {promoted}");
     }
     if harness.contains_text("panicked") {
         bail!("pager panicked\n{}", harness.screen_contents());

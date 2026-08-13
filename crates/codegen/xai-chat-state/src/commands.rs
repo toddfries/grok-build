@@ -35,6 +35,23 @@ impl std::fmt::Display for RepairHistoryBlocked {
 
 impl std::error::Error for RepairHistoryBlocked {}
 
+/// Result of a strict persistence-acknowledged working-directory switch append.
+#[derive(Debug, Clone)]
+pub enum StrictAppendAck {
+    Appended,
+    AlreadyPresent(ConversationItem),
+}
+
+#[derive(Debug)]
+pub enum StrictAppendError {
+    NotCommitted(std::io::Error),
+    Committed {
+        acknowledgement: StrictAppendAck,
+        source: std::io::Error,
+    },
+    Indeterminate(std::io::Error),
+}
+
 /// Commands sent to the ChatStateActor via mpsc channel.
 pub enum ChatStateCommand {
     // ═══ Mutations (fire-and-forget) ═══
@@ -46,6 +63,14 @@ pub enum ChatStateCommand {
     PushUserMessageAndAck {
         item: ConversationItem,
         reply: oneshot::Sender<()>,
+    },
+
+    /// Append one working-directory switch without repair or pruning, then
+    /// acknowledge only after persistence processes the generation-aware append.
+    AppendWorkingDirectorySwitchAndAck {
+        content: String,
+        cwd_generation: std::num::NonZeroU64,
+        reply: oneshot::Sender<Result<StrictAppendAck, StrictAppendError>>,
     },
 
     /// Push a user message with an explicit dangling-repair reason.
@@ -126,6 +151,15 @@ pub enum ChatStateCommand {
         reply: oneshot::Sender<
             Result<crate::compaction_utils::HistoryRepairReport, RepairHistoryBlocked>,
         >,
+    },
+
+    /// Persist a URL-scoped strip. In-actor so it serializes with turn pushes.
+    /// Replies with the typed [`crate::StripOutcome`] once the DISK write is
+    /// acknowledged: `Applied` means the backup and rewrite both landed, so
+    /// the caller can honestly claim durable removal.
+    StripConversationImages {
+        urls: Vec<std::sync::Arc<str>>,
+        reply: tokio::sync::oneshot::Sender<crate::StripOutcome>,
     },
 
     /// Atomically align the leading `System` message with `prompt` (inserting
@@ -297,6 +331,13 @@ pub enum ChatStateCommand {
         reply: oneshot::Sender<Option<String>>,
     },
 
+    /// Like `GetLastAssistantText`, but bounded to the current prompt turn:
+    /// returns `None` when the turn produced no assistant text (the walk stops
+    /// at the first turn-starting user item).
+    GetLastAssistantTextInTurn {
+        reply: oneshot::Sender<Option<String>>,
+    },
+
     /// Get the text of the first `Text` content part in the first `User` message.
     /// Returns `None` if the conversation has no user messages or the first user
     /// message has no text content part.
@@ -354,6 +395,12 @@ mod tests {
             item: ConversationItem::user("hello"),
             reply: tx,
         };
+        let (tx, _rx) = oneshot::channel();
+        let _ = ChatStateCommand::AppendWorkingDirectorySwitchAndAck {
+            content: "moved".into(),
+            cwd_generation: std::num::NonZeroU64::new(1).unwrap(),
+            reply: tx,
+        };
         let _ = ChatStateCommand::PushAssistantResponse {
             item: ConversationItem::assistant("hi"),
         };
@@ -371,6 +418,8 @@ mod tests {
                 top_p: None,
                 api_backend: Default::default(),
                 extra_headers: Default::default(),
+                query_params: Default::default(),
+                env_http_headers: Default::default(),
                 context_window: std::num::NonZeroU64::new(128_000).unwrap(),
                 reasoning_effort: None,
                 stream_tool_calls: None,
@@ -460,6 +509,9 @@ mod tests {
 
         let (tx, _rx) = oneshot::channel();
         let _ = ChatStateCommand::GetLastAssistantText { reply: tx };
+
+        let (tx, _rx) = oneshot::channel();
+        let _ = ChatStateCommand::GetLastAssistantTextInTurn { reply: tx };
 
         let (tx, _rx) = oneshot::channel();
         let _ = ChatStateCommand::GetFirstUserText { reply: tx };

@@ -109,8 +109,13 @@ fn quit_gracefully(mut harness: PtyHarness) {
     harness.inject_keys(b"\x11").expect("ctrl-q arm");
     harness.update(Duration::from_millis(200));
     harness.inject_keys(b"\x11").expect("ctrl-q confirm");
-    let code = harness.wait_exit_code(Duration::from_secs(10));
-    assert_eq!(code, Some(0), "graceful quit should exit 0, got {code:?}");
+    let exit = wait_for_exit_status(&mut harness, Duration::from_secs(10))
+        .expect("wait for graceful quit");
+    assert_eq!(
+        exit,
+        PtyExitPoll::Exited(0),
+        "graceful quit should exit 0, got {exit:?}"
+    );
 }
 
 /// Spawn a pager in `project` against `content`, submit one turn, and settle.
@@ -155,7 +160,7 @@ fn submit_rename(harness: &mut PtyHarness, title: &str) {
 /// top border (info-line dim text treatment), right-aligned before the `╮`
 /// corner.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "PTY e2e; run with cargo test -p xai-grok-pager --test pty_e2e -- --ignored"]
+#[ignore = "PTY e2e; run the owning pty_e2e_* Cargo test with --ignored (see Cargo.toml)"]
 async fn rename_title_shows_in_prompt_border() {
     let content = ContentController::start().await.expect("start content");
     content.set_response(format!("{MOCK_RESPONSE_SENTINEL} rename title turn."));
@@ -186,7 +191,7 @@ async fn rename_title_shows_in_prompt_border() {
 /// resume. The inverse holds too: a session that was never renamed resumes
 /// with a plain top border (auto titles never show on the border).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "PTY e2e; run with cargo test -p xai-grok-pager --test pty_e2e -- --ignored"]
+#[ignore = "PTY e2e; run the owning pty_e2e_* Cargo test with --ignored (see Cargo.toml)"]
 async fn rename_title_survives_resume_and_stays_absent_without_rename() {
     let content = ContentController::start().await.expect("start content");
     content.set_response(format!("{MOCK_RESPONSE_SENTINEL} resume title turn."));
@@ -258,4 +263,48 @@ async fn rename_title_survives_resume_and_stays_absent_without_rename() {
         "pager panicked on plain resume\nscreen:\n{screen}"
     );
     quit_gracefully(plain_resumed);
+}
+
+/// `/rename --auto` clears the prompt-border title. Followers / picker
+/// converge later when a regenerated auto title is adopted; this test
+/// pins the initiating pager's optimistic clear.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "PTY e2e; run the owning pty_e2e_* Cargo test with --ignored (see Cargo.toml)"]
+async fn rename_auto_clears_prompt_border_title() {
+    let content = ContentController::start().await.expect("start content");
+    content.set_response(format!("{MOCK_RESPONSE_SENTINEL} unpin title turn."));
+
+    let project = tempfile::tempdir().expect("project dir");
+    std::fs::create_dir_all(project.path().join(".git")).expect("create .git");
+
+    let mut harness = spawn_settled_session(&content, project.path());
+    submit_rename(&mut harness, RENAME_TITLE);
+    wait_for_title_row(&mut harness, RENAME_TITLE, Duration::from_secs(10));
+
+    inject_keys_paced(&mut harness, b"/rename --auto");
+    harness.inject_keys(b"\r").expect("submit /rename --auto");
+    harness
+        .wait_for_text("Session title reset to auto", Duration::from_secs(15))
+        .expect("unpin durable-write ack");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        harness.update(Duration::from_millis(200));
+        let screen = harness.screen_contents();
+        if let Some(border) = prompt_top_border_row(&screen)
+            && is_plain_border_row(&border)
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("prompt top border must be plain after --auto\nscreen:\n{screen}");
+        }
+    }
+
+    assert!(
+        !harness.contains_text("panicked"),
+        "pager panicked\nscreen:\n{}",
+        harness.screen_contents()
+    );
+    quit_gracefully(harness);
 }

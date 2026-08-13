@@ -2,13 +2,126 @@
 //! its buffered/transient/direct variants, xAI-notification handling, and
 //! the gateway-bridge dispatch shims.
 use super::*;
-/// Exit code reported on the `SubagentStop` hook payload; unknown statuses report none.
-fn subagent_exit_code(status: &str) -> Option<i32> {
-    match status {
-        "completed" => Some(0),
-        "failed" => Some(1),
-        "cancelled" => Some(-1),
-        _ => None,
+fn scrub_inbound_session_summary(
+    notification: &mut crate::extensions::notification::SessionNotification,
+) {
+    use crate::extensions::notification::{SessionUpdate, TITLE_IS_MANUAL_META_KEY};
+    use crate::session::persistence::sanitize_and_cap_title;
+    let SessionUpdate::SessionSummaryGenerated { session_summary } = &mut notification.update
+    else {
+        return;
+    };
+    *session_summary = sanitize_and_cap_title(session_summary).unwrap_or_default();
+    if let Some(serde_json::Value::Object(m)) = notification.meta.as_mut() {
+        m.remove(TITLE_IS_MANUAL_META_KEY);
+    }
+}
+#[cfg(test)]
+mod inbound_title_scrub_tests {
+    use super::scrub_inbound_session_summary;
+    use crate::extensions::notification::{
+        SessionNotification, SessionUpdate, TITLE_IS_MANUAL_META_KEY,
+    };
+    #[test]
+    fn strips_controls_caps_and_drops_manual_meta() {
+        use crate::session::persistence::MAX_TITLE_SCALARS;
+        let mut n = SessionNotification {
+            session_id: agent_client_protocol::SessionId::new("s"),
+            update: SessionUpdate::SessionSummaryGenerated {
+                session_summary: format!("\u{1b}]0;X\u{07}{}", "é".repeat(MAX_TITLE_SCALARS + 8)),
+            },
+            meta: Some(serde_json::json!({ TITLE_IS_MANUAL_META_KEY: true, "eventId": "keep" })),
+        };
+        scrub_inbound_session_summary(&mut n);
+        let SessionUpdate::SessionSummaryGenerated { session_summary } = &n.update else {
+            panic!("variant kept");
+        };
+        const PREFIX: &str = "]0;X";
+        let expected = format!(
+            "{PREFIX}{}",
+            "é".repeat(MAX_TITLE_SCALARS - PREFIX.chars().count())
+        );
+        assert_eq!(session_summary, &expected);
+        let meta = n.meta.as_ref().unwrap();
+        assert!(meta.get(TITLE_IS_MANUAL_META_KEY).is_none());
+        assert_eq!(meta.get("eventId").and_then(|v| v.as_str()), Some("keep"));
+    }
+    #[test]
+    fn leaves_other_variants_untouched() {
+        let mut n = SessionNotification {
+            session_id: agent_client_protocol::SessionId::new("s"),
+            update: SessionUpdate::MemoryFlushStarted,
+            meta: Some(serde_json::json!({ TITLE_IS_MANUAL_META_KEY: true })),
+        };
+        scrub_inbound_session_summary(&mut n);
+        assert_eq!(
+            n.meta
+                .as_ref()
+                .and_then(|m| m.get(TITLE_IS_MANUAL_META_KEY)),
+            Some(&serde_json::json!(true))
+        );
+    }
+}
+#[cfg(test)]
+mod inbound_summary_persist_scrub_tests {
+    use super::support::create_test_actor;
+    use super::*;
+    use crate::extensions::notification::TITLE_IS_MANUAL_META_KEY;
+    use crate::session::persistence::MAX_TITLE_SCALARS;
+    /// Drive inbound `_x.ai/session/update` through `handle_xai_session_notification`
+    /// so removing the `scrub_inbound_session_summary` call site fails.
+    #[tokio::test]
+    async fn persist_path_scrubs_title_and_drops_manual_meta() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, _gateway_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+                let (persistence_tx, mut prx) =
+                    tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+                let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+                let dirty = format!("\u{1b}]0;X\u{07}{}", "é".repeat(MAX_TITLE_SCALARS + 8));
+                actor
+                    .handle_xai_session_notification(XaiSessionNotification {
+                        session_id: acp::SessionId::new("test-actor"),
+                        update: XaiSessionUpdate::SessionSummaryGenerated {
+                            session_summary: dirty,
+                        },
+                        meta: Some(serde_json::json!({
+                            TITLE_IS_MANUAL_META_KEY: true,
+                            "eventId": "keep"
+                        })),
+                    })
+                    .await;
+                const PREFIX: &str = "]0;X";
+                let expected = format!(
+                    "{PREFIX}{}",
+                    "é".repeat(MAX_TITLE_SCALARS - PREFIX.chars().count())
+                );
+                loop {
+                    match prx.try_recv().expect("inbound summary must be persisted") {
+                        PersistenceMsg::Update(crate::session::storage::SessionUpdate::Xai(
+                            notif,
+                        )) => {
+                            let XaiSessionUpdate::SessionSummaryGenerated { session_summary } =
+                                &notif.update
+                            else {
+                                continue;
+                            };
+                            assert_eq!(session_summary, &expected);
+                            let meta = notif.meta.as_ref().expect("meta kept for eventId");
+                            assert!(
+                                meta.get(TITLE_IS_MANUAL_META_KEY).is_none(),
+                                "persist rail must drop forged titleIsManual"
+                            );
+                            assert_eq!(meta.get("eventId").and_then(|v| v.as_str()), Some("keep"));
+                            break;
+                        }
+                        _ => continue,
+                    }
+                }
+            })
+            .await;
     }
 }
 /// Result of applying a subagent fold into parent ledgers.
@@ -129,10 +242,11 @@ impl SessionActor {
         let agent_timestamp_ms =
             agent_timestamp_ms_override.unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
         let (update_type, update_params) = Self::extract_update_info(&update);
-        let mut meta = json!(
-            { "totalTokens" : total_tokens, "eventId" : event_id, "agentTimestampMs" :
-            agent_timestamp_ms, }
-        );
+        let mut meta = json!({
+            "totalTokens": total_tokens,
+            "eventId": event_id,
+            "agentTimestampMs": agent_timestamp_ms,
+        });
         let obj = meta
             .as_object_mut()
             .expect("json! literal is always an Object");
@@ -248,8 +362,10 @@ impl SessionActor {
             return;
         }
         tracing::info!(
-            target : "acp_event", event = "xai_buffered_notification_sent", session_id =
-            % self.session_info.id, "Sending buffered xAI session notification"
+            target: "acp_event",
+            event = "xai_buffered_notification_sent",
+            session_id = %self.session_info.id,
+            "Sending buffered xAI session notification"
         );
     }
     fn log_outbound_notification(&self, notification: &acp::SessionNotification) {
@@ -270,9 +386,13 @@ impl SessionActor {
             .and_then(|m| m.get("chunkIndex"))
             .and_then(|v| v.as_u64());
         tracing::info!(
-            target : "acp_event", event = "agent_message_sent", event_id = % event_id,
-            session_id = % self.session_info.id, agent_timestamp_ms = agent_timestamp_ms,
-            update_type = % update_type, chunk_index = ? chunk_index,
+            target: "acp_event",
+            event = "agent_message_sent",
+            event_id = %event_id,
+            session_id = %self.session_info.id,
+            agent_timestamp_ms = agent_timestamp_ms,
+            update_type = %update_type,
+            chunk_index = ?chunk_index,
             "Sending session update"
         );
     }
@@ -324,12 +444,77 @@ impl SessionActor {
                 .forward_fire_and_forget(notification);
         }
     }
+    /// [`Self::send_xai_notification`] minus persistence: broadcast-only, for
+    /// updates whose durable copy lives elsewhere (e.g. `LastTurnSummary` in
+    /// `summary.json`). Skips the rewind-window close and notification hooks.
+    ///
+    /// Must **not** stamp an `eventId`: a reconnect cursor that points at an
+    /// id absent from `updates.jsonl` never resolves and forces a full replay
+    /// (see `ensure_event_id_meta`). Timestamp-only meta keeps the client
+    /// clock without advancing the cursor.
+    pub(super) fn send_xai_notification_transient(&self, update: XaiSessionUpdate) {
+        let notification = XaiSessionNotification {
+            session_id: self.session_info.id.clone(),
+            update,
+            meta: Some(serde_json::json!({
+                "agentTimestampMs": chrono::Utc::now().timestamp_millis(),
+            })),
+        };
+        let params = serde_json::to_value(&notification)
+            .and_then(|v| serde_json::value::to_raw_value(&v))
+            .ok();
+        if let (Some(params), true) = (
+            params,
+            self.notifications
+                .gateway_enabled
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ) {
+            self.notifications
+                .gateway
+                .forward_fire_and_forget(acp::ExtNotification::new(
+                    "x.ai/session_notification",
+                    params.into(),
+                ));
+        }
+    }
+    pub(super) async fn ensure_session_disk_writable(&self) -> Result<(), acp::Error> {
+        if !self.notifications.is_disk_full() {
+            return Ok(());
+        }
+        let (respond_to, response) = tokio::sync::oneshot::channel();
+        if self
+            .notifications
+            .persistence_tx
+            .send(PersistenceMsg::ProbeWritable { respond_to })
+            .is_err()
+        {
+            return self.disk_full_acp_error(None);
+        }
+        match response.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => self.disk_full_acp_error(Some(&error)),
+            Err(_) => self.disk_full_acp_error(None),
+        }
+    }
+    pub(super) fn disk_full_acp_error(
+        &self,
+        flush_error: Option<&std::io::Error>,
+    ) -> Result<(), acp::Error> {
+        use crate::session::persistence::{io_error_to_acp, is_disk_full_io_error};
+        match flush_error {
+            Some(error) if is_disk_full_io_error(error) => Err(io_error_to_acp(error)),
+            _ if self.notifications.is_disk_full() => Err(io_error_to_acp(&std::io::Error::from(
+                std::io::ErrorKind::StorageFull,
+            ))),
+            _ => Ok(()),
+        }
+    }
     /// Flush buffered notifications and drain the persistence merge buffer to
     /// disk. Blocks until the persistence actor confirms the write is complete.
     ///
     /// Must NOT be called from within `run_session()` — the flush goes through
     /// `event_tx`, which is consumed by the same select loop (deadlock / 5s timeout).
-    pub(super) async fn flush_to_disk(&self) {
+    pub(super) async fn flush_to_disk(&self) -> std::io::Result<()> {
         if let Err(e) = crate::session::replay_events::flush_replay_actor(&self.event_tx).await {
             tracing::warn!(?e, "flush_replay_actor failed");
         }
@@ -338,9 +523,16 @@ impl SessionActor {
             .notifications
             .persistence_tx
             .send(PersistenceMsg::FlushAndAck { respond_to: tx })
-            .is_ok()
+            .is_err()
         {
-            let _ = rx.await;
+            return Ok(());
+        }
+        match rx.await {
+            Ok(result) => result,
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "session persistence actor stopped before flush acknowledgement",
+            )),
         }
     }
     /// Extracts the update type name and relevant parameters for logging
@@ -357,31 +549,37 @@ impl SessionActor {
             }
             acp::SessionUpdate::ToolCall(tool_call) => (
                 Some("ToolCall".to_string()),
-                Some(json!(
-                    { "toolCallId" : tool_call.tool_call_id.0, "title" :
-                    tool_call.title, "kind" : format!("{:?}", tool_call.kind),
-                    "status" : format!("{:?}", tool_call.status), }
-                )),
+                Some(json!({
+                    "toolCallId": tool_call.tool_call_id.0,
+                    "title": tool_call.title,
+                    "kind": format!("{:?}", tool_call.kind),
+                    "status": format!("{:?}", tool_call.status),
+                })),
             ),
             acp::SessionUpdate::ToolCallUpdate(tool_update) => (
                 Some("ToolCallUpdate".to_string()),
-                Some(json!(
-                    { "toolCallId" : tool_update.tool_call_id.0, "status" :
-                    tool_update.fields.status.as_ref().map(| s | format!("{:?}",
-                    s)), }
-                )),
+                Some(json!({
+                    "toolCallId": tool_update.tool_call_id.0,
+                    "status": tool_update.fields.status.as_ref().map(|s| format!("{:?}", s)),
+                })),
             ),
             acp::SessionUpdate::Plan(plan) => (
                 Some("Plan".to_string()),
-                Some(json!({ "planSteps" : plan.entries.len(), })),
+                Some(json!({
+                    "planSteps": plan.entries.len(),
+                })),
             ),
             acp::SessionUpdate::AvailableCommandsUpdate(update) => (
                 Some("AvailableCommandsUpdate".to_string()),
-                Some(json!({ "commandsCount" : update.available_commands.len(), })),
+                Some(json!({
+                    "commandsCount": update.available_commands.len(),
+                })),
             ),
             acp::SessionUpdate::CurrentModeUpdate(update) => (
                 Some("CurrentModeUpdate".to_string()),
-                Some(json!({ "currentModeId" : update.current_mode_id, })),
+                Some(json!({
+                    "currentModeId": update.current_mode_id,
+                })),
             ),
             _ => (None, None),
         }
@@ -396,7 +594,10 @@ impl SessionActor {
     pub(super) fn build_notification_meta(&self) -> serde_json::Value {
         let event_id = self.generate_event_id();
         let agent_timestamp_ms = chrono::Utc::now().timestamp_millis();
-        json!({ "eventId" : event_id, "agentTimestampMs" : agent_timestamp_ms, })
+        json!({
+            "eventId": event_id,
+            "agentTimestampMs": agent_timestamp_ms,
+        })
     }
     /// Handle xAI session notifications - store them in persistence
     /// These are client-side events (like diff reviews) that should be part of session history.
@@ -419,6 +620,7 @@ impl SessionActor {
             crate::util::event_id::ensure_event_id_meta(&self.session_info.id.0, &mut meta_map);
             notification.meta = meta_map.map(serde_json::Value::Object);
         }
+        scrub_inbound_session_summary(&mut notification);
         match &notification.update {
             XaiSessionUpdate::SubagentSpawned {
                 subagent_id,
@@ -428,13 +630,6 @@ impl SessionActor {
                 model,
                 ..
             } => {
-                self.subagent_spawn_info.lock().insert(
-                    subagent_id.clone(),
-                    SubagentSpawnInfo {
-                        description: description.clone(),
-                        subagent_type: subagent_type.clone(),
-                    },
-                );
                 if let Some(parent_id) = resumed_from {
                     debug_assert_ne!(parent_id, subagent_id, "subagent cannot resume itself");
                 }
@@ -451,7 +646,8 @@ impl SessionActor {
                             Some(r) => r.last_cumulative_reported,
                             None => {
                                 tracing::debug!(
-                                    parent_id = % pid, subagent_id = % subagent_id,
+                                    parent_id = %pid,
+                                    subagent_id = %subagent_id,
                                     "resume parent not in token registry; anchoring at 0"
                                 );
                                 0
@@ -473,10 +669,12 @@ impl SessionActor {
                         },
                     );
                 }
-                let current_tokens = self.chat_state_handle.get_total_tokens().await as i64;
                 if self.goal_harness_enabled() {
-                    self.drain_goal_updates(current_tokens, DrainPurpose::MidTurn)
-                        .await;
+                    let current_tokens = self.chat_state_handle.get_total_tokens().await as i64;
+                    if !self.goal_runs_on_workflow_engine() {
+                        self.drain_goal_updates(current_tokens, DrainPurpose::MidTurn)
+                            .await;
+                    }
                     let (tokens_used, finished_marginal) = self.goal_tokens(current_tokens);
                     let notify = self.goal_notify_sender();
                     notify.emit_goal_updated(
@@ -508,38 +706,9 @@ impl SessionActor {
             }
             XaiSessionUpdate::SubagentFinished {
                 subagent_id,
-                status,
-                duration_ms,
                 tokens_used,
                 ..
             } => {
-                let spawn_info = self.subagent_spawn_info.lock().remove(subagent_id);
-                let exit_code = subagent_exit_code(status.as_str());
-                let envelope = self.fire_hook(
-                    xai_grok_hooks::event::HookEventName::SubagentEnd,
-                    None,
-                    xai_grok_hooks::event::HookPayload::SubagentStop {
-                        subagent_id: subagent_id.clone(),
-                        subagent_type: spawn_info
-                            .as_ref()
-                            .map(|i| i.subagent_type.clone())
-                            .unwrap_or_default(),
-                        description: spawn_info.map(|i| i.description),
-                        exit_code,
-                        duration_ms: Some(*duration_ms),
-                    },
-                );
-                let hook_registry_snapshot = self.hook_registry.borrow().clone();
-                if let Some(registry) = hook_registry_snapshot {
-                    let ctx = self.hook_run_ctx();
-                    let _ = xai_grok_hooks::dispatcher::dispatch_non_blocking(
-                        &registry,
-                        xai_grok_hooks::event::HookEventName::SubagentEnd,
-                        &envelope,
-                        &ctx,
-                    )
-                    .await;
-                }
                 {
                     let mut records = self.subagent_token_records.lock();
                     if let Some(rec) = records.get_mut(subagent_id) {
@@ -597,7 +766,7 @@ impl SessionActor {
                         Some(_) => None,
                         None => {
                             tracing::debug!(
-                                subagent_id = % subagent_id,
+                                subagent_id = %subagent_id,
                                 "progress tick for unregistered subagent; dropped"
                             );
                             None
@@ -696,11 +865,74 @@ impl SessionActor {
         )
         .await;
     }
+    pub(super) async fn dispatch_permission_prompt_notification(&self, message: &str) {
+        self.dispatch_notification_hook(
+            "permission_prompt",
+            Some(message.to_owned()),
+            None,
+            Some("info".into()),
+        )
+        .await;
+    }
+    /// Wire the manager's prompt-start signal to `permission_prompt`.
+    ///
+    /// Call only from the session that owns the manager (`owns_permission_manager`
+    /// at spawn). Inherited/cloned handles must not call this; first-writer-wins
+    /// on the handle is the backstop. A subagent that spawned its own manager
+    /// should wire — the user waits on that prompt. `Weak` so the listener
+    /// cannot keep a dropped session alive.
+    pub(super) fn wire_permission_prompt_notification(self: &std::sync::Arc<Self>) {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        self.permissions.set_user_prompt_notify(tx);
+        let session = std::sync::Arc::downgrade(self);
+        tokio::task::spawn_local(async move {
+            while rx.recv().await.is_some() {
+                let Some(session) = session.upgrade() else {
+                    break;
+                };
+                session
+                    .dispatch_permission_prompt_notification("Tool permission requested")
+                    .await;
+            }
+        });
+    }
     /// Send an xAI extension notification to the client
     #[tracing::instrument(skip_all)]
     pub(super) async fn send_xai_notification(&self, update: XaiSessionUpdate) {
         self.send_xai_notification_with_extra_meta(update, None)
             .await;
+    }
+    /// Build the per-response boundary update, projecting the response's usage
+    /// into the Messages API `message.usage` shape (uncached `input_tokens`).
+    pub(super) fn response_completed_update(
+        &self,
+        response: &xai_grok_sampling_types::ConversationResponse,
+    ) -> XaiSessionUpdate {
+        let usage =
+            response
+                .usage
+                .as_ref()
+                .map(|u| crate::extensions::notification::ResponseUsage {
+                    input_tokens: u64::from(
+                        u.prompt_tokens
+                            .saturating_sub(u.cached_prompt_tokens)
+                            .saturating_sub(u.cache_creation_prompt_tokens),
+                    ),
+                    output_tokens: u64::from(u.completion_tokens),
+                    cache_read_input_tokens: u64::from(u.cached_prompt_tokens),
+                    cache_creation_input_tokens: u64::from(u.cache_creation_prompt_tokens),
+                    reasoning_tokens: u64::from(u.reasoning_tokens),
+                });
+        let signature = response
+            .reasoning_items()
+            .find_map(|r| r.encrypted_content.clone());
+        XaiSessionUpdate::ResponseCompleted {
+            message_id: response.message_id.clone(),
+            stop_reason: response.raw_stop_reason.clone(),
+            usage,
+            signature,
+            stop_sequence: response.stop_sequence.clone(),
+        }
     }
     /// [`Self::send_xai_notification`] with caller-supplied `_meta` keys merged
     /// into the standard eventId/timestamp meta. Caller keys win on collision.

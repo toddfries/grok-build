@@ -94,6 +94,7 @@ async fn web_search_uses_model_override_from_config_end_to_end() {
         session_env: std::sync::Arc::new(std::collections::HashMap::new()),
         notification_handle: ToolNotificationHandle::noop(),
         owner_session_id: None,
+        subagent: None,
         parent_scheduler_handle: None,
         skills: vec![],
         state_path: std::env::temp_dir().join("grok-web-search-e2e/state.json"),
@@ -108,6 +109,8 @@ async fn web_search_uses_model_override_from_config_end_to_end() {
             // `Credentials` at session-spawn time; in this self-contained
             // test fixture there's no extra access key in scope.
             alpha_test_key: None,
+            allowed_domains: None,
+            excluded_domains: None,
         },
         web_fetch_config: Default::default(),
         lsp: None,
@@ -173,6 +176,7 @@ async fn web_search_errors_when_configured_model_cannot_be_resolved() {
         session_env: std::sync::Arc::new(std::collections::HashMap::new()),
         notification_handle: ToolNotificationHandle::noop(),
         owner_session_id: None,
+        subagent: None,
         parent_scheduler_handle: None,
         skills: vec![],
         state_path: std::env::temp_dir().join("grok-web-search-disabled/state.json"),

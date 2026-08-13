@@ -82,6 +82,8 @@ pub mod user_prompt_meta {
     /// block's `text`; only meaningful when that text is displayed verbatim
     /// (never stamped alongside `displayText`).
     pub const SKILL_TOKEN_RANGES: &str = "skillTokenRanges";
+    /// See [`xai_prompt_queue::COMBINED_DISPLAY_TEXTS_META`].
+    pub const COMBINED_DISPLAY_TEXTS: &str = xai_prompt_queue::COMBINED_DISPLAY_TEXTS_META;
 }
 
 /// `UserMessageChunk` / `ContentChunk._meta` keys stamped by the shell and
@@ -94,6 +96,15 @@ pub mod user_message_chunk_meta {
     pub const HIDE_FROM_SCROLLBACK: &str = "hideFromScrollback";
 }
 
+/// Extract the numeric counter from an `eventId` (`"{sessionId}-{counter}"`).
+/// The counter is the part after the last `-` (session ids themselves contain `-`).
+pub fn event_id_counter(event_id: &str) -> Option<u64> {
+    event_id
+        .rsplit('-')
+        .next()
+        .and_then(|c| c.parse::<u64>().ok())
+}
+
 impl NotificationMeta {
     /// Parse from the `_meta` JSON map on a `SessionNotification`.
     pub fn from_json(meta: Option<&serde_json::Map<String, serde_json::Value>>) -> Self {
@@ -104,12 +115,7 @@ impl NotificationMeta {
             .get("eventId")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        // `eventId` is `"{sessionId}-{counter}"`; the counter is the part
-        // after the LAST '-' (session ids themselves contain '-').
-        let event_seq = event_id
-            .as_deref()
-            .and_then(|s| s.rsplit('-').next())
-            .and_then(|c| c.parse::<u64>().ok());
+        let event_seq = event_id.as_deref().and_then(event_id_counter);
         Self {
             total_tokens: m.get("totalTokens").and_then(|v| v.as_u64()),
             agent_timestamp_ms: m.get("agentTimestampMs").and_then(|v| v.as_i64()),

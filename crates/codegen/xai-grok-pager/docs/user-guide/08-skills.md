@@ -140,6 +140,8 @@ Grok asks where to save the skill:
 - **Project** (`<repo_root>/.grok/skills/<name>/`) -- available only in this repository and shareable with teammates through version control. Grok recommends this scope inside a git repository.
 - **User** (`~/.grok/skills/<name>/`) -- available across all your projects.
 
+To distribute a skill to a whole team or organization, package it in a plugin and publish it through a marketplace. See [Create your own marketplace](09-plugins.md#create-your-own-marketplace) and [Distribute across an organization](09-plugins.md#distribute-across-an-organization).
+
 The new skill appears in the slash menu within a few seconds, because Grok reloads skills when files change on disk.
 
 ---
@@ -165,12 +167,17 @@ To browse your skills, type `/` to open the slash-command menu. Grok lists every
 
 ### Qualified Names
 
-When a skill's name collides with another skill or a built-in command, Grok advertises a qualified name prefixed by the skill's scope -- `local:`, `repo:`, `user:`, or the plugin name. Use the qualified form to choose a specific skill:
+When a skill's name collides with another skill or a built-in command, Grok keeps **both** invocable. The built-in keeps the bare name (`/login`, `/compact`, …). The skill is advertised under a qualified name prefixed by its scope -- `local:`, `repo:`, `user:`, or the plugin name:
 
 ```
 /local:commit        # The "commit" skill from ./.grok/skills/
 /user:commit         # The "commit" skill from ~/.grok/skills/
+/acme:login          # A plugin skill named "login" (built-in /login is unchanged)
 ```
+
+Typing `/login` in the slash menu shows both rows, with a right-aligned **built-in** or **skill · plugin-name** badge so you can tell them apart. Rename the skill (or its directory) if you want the bare `/name` for the skill instead.
+
+`grok inspect` tags colliding skills with `[collides with /login → /acme:login]`.
 
 ### Automatic Invocation
 
@@ -193,13 +200,13 @@ In the human-readable output, the Skills section lists each skill's name and its
 
 The report honors your `[skills]` config the same way a live session does: skills from `paths` are listed, skills under an `ignore` prefix are hidden, and skills named in `disabled` stay listed but tagged `[disabled]`.
 
-The `--json` report includes the full detail for each skill: its `name`, `description`, `source` (with the path to the SKILL.md file), and `userInvocable` flag.
+The `--json` report includes the full detail for each skill: its `name`, `description`, `source` (with the path to the SKILL.md file), and `userInvocable` flag. Skills whose bare slash name is contested — by a built-in command or by another skill — also include `collidesWith` (the contested name) and `invocableAs` (the qualified command to type).
 
 ---
 
 ## Bundled and Plugin Skills
 
-Grok ships with built-in skills and extracts them to `~/.grok/skills/` on startup -- among them `/create-skill`, `/help`, and `/check-work`. Bundled skills behave like user skills, and a same-named skill in a higher-priority location (local or repo) overrides the bundled copy; `grok inspect` labels the extracted copies `bundled` so they stay distinguishable from skills you authored yourself. (A plugin skill of the same name does not override it; it stays available under its qualified `plugin:name` form.)
+Grok distributes platform skills separately from your personal skills. Bundled skills are cached under `~/.grok/bundled/skills/`; Grok never writes them into `~/.grok/skills/`. A same-named local, repo, or user skill overrides the bundled copy. `grok inspect` labels each definition by its actual source. (A plugin skill of the same name does not override a native skill; it stays available under its qualified `plugin:name` form.)
 
 Skills can also come from plugins. When you install a plugin that includes skills, they appear alongside your user and project skills. `grok inspect` labels each plugin-provided skill with its source as `plugin: <name>`.
 

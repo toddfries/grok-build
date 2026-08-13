@@ -1,6 +1,6 @@
 //! Subscription tier checks, credit-limit upsells, and auto-topup handling.
 
-use super::queue::maybe_drain_queue;
+use super::queue::{maybe_drain_queue, note_peek_page_flip};
 use crate::app::actions::Effect;
 use crate::app::agent::AgentId;
 use crate::app::agent_view::AgentView;
@@ -82,37 +82,6 @@ pub(crate) fn is_credit_limit_error(http_status: Option<u16>, message: &str) -> 
         None | Some(_) => m.contains("status 402") || (m.contains("status 403") && legacy),
     }
 }
-
-/// Well-known error code CCP returns (HTTP 429, flat body
-/// `{"code": "...", "error": "..."}`) when a free-tier user exhausts the
-/// free usage quota. Kept in sync with the shared well-known error code
-/// `SUBSCRIPTION_FREE_USAGE_EXHAUSTED`. sampling-types' `parse_error_bytes` prepends the flat
-/// `code` to the flattened message, so the code reaches the pager embedded
-/// in `RetryState::Exhausted.reason` and the -32003 error's data string.
-pub(crate) const FREE_USAGE_EXHAUSTED_ERROR_CODE: &str = "subscription:free-usage-exhausted";
-
-/// Whether a rate-limit error is the free-usage-quota exhaustion (paywall)
-/// rather than transient throttling. Text-sniff on the flattened message,
-/// same precedent as [`is_credit_limit_error`].
-pub(crate) fn is_free_usage_exhausted_error(reason: &str) -> bool {
-    reason.contains(FREE_USAGE_EXHAUSTED_ERROR_CODE)
-}
-
-/// Whether a rate-limited (-32003) ACP error is the free-usage exhaustion.
-/// `data` may be a bare string or the `{message, promptUsage?}` object
-/// `attach_prompt_usage` produces — always read via the shared detail helper.
-pub(crate) fn acp_error_is_free_usage_exhausted(err: &agent_client_protocol::Error) -> bool {
-    err.data
-        .as_ref()
-        .and_then(xai_grok_shell::sampling::error::error_detail_from_data)
-        .as_deref()
-        .is_some_and(is_free_usage_exhausted_error)
-}
-
-/// User-facing message for free-usage exhaustion. Shown by headless mode and
-/// `format_acp_error` in place of auth-aware rate-limit copy. Deliberately
-/// promises no reset duration — the quota window is backend-config-driven.
-pub(crate) const FREE_USAGE_USER_MESSAGE: &str = "You\u{2019}ve reached your free Grok Build usage limit for now. Get SuperGrok for much higher limits, or try again later: https://grok.com/supergrok?referrer=grok-build";
 
 /// Open the credit-limit upsell on the given agent.
 ///
@@ -319,6 +288,7 @@ fn open_supergrok_upsell(
         auth_method,
     });
 
+    // /supergrok lists all plans; every upgrade option lands there.
     let options = vec![
         QuestionOption {
             label: "Upgrade to SuperGrok".into(),
@@ -327,11 +297,15 @@ fn open_supergrok_upsell(
             id: Some(UPSELL_URL_UPGRADE.into()),
         },
         QuestionOption {
+            label: "Upgrade to SuperGrok Plus".into(),
+            description: "Significantly higher usage and rate limits".into(),
+            preview: None,
+            id: Some(UPSELL_URL_UPGRADE.into()),
+        },
+        QuestionOption {
             label: "Upgrade to SuperGrok Heavy".into(),
             description: "Get the most out of Grok Build. Highest usage limits.".into(),
             preview: None,
-            // No Heavy-specific URL exists; the /supergrok page lists
-            // both plans, so both upgrade options land there.
             id: Some(UPSELL_URL_UPGRADE.into()),
         },
     ];
@@ -379,6 +353,7 @@ pub(super) fn handle_billing_fetched(
     silent: bool,
     subscription_tier: Option<String>,
     autotopup: crate::views::credit_bar::AutoTopupFetch,
+    nonce: u64,
 ) -> Vec<Effect> {
     // Parse/transport failures route to `BillingError`, so a `None`
     // balance here means the response carried no billing config. Clear
@@ -398,11 +373,22 @@ pub(super) fn handle_billing_fetched(
     }
     // Render the `/usage` summary from the now-current cached rule.
     let summary_topup = app.auto_topup.clone();
+    let tier_now = app.subscription_tier.clone();
     if let Some(agent) = app.agents.get_mut(&agent_id) {
         // Gateway/chat-kind: do not attach Build coding credits.
         let mut topup = agent.auto_topup.clone();
         apply_auto_topup(&mut topup, &autotopup);
         agent.apply_credit_balance(balance.clone(), topup);
+        // The open usage modal renders from the mirrors updated above; only
+        // its own fetch generation may settle the loading/error flags
+        // (background refreshes carry nonce 0).
+        if let Some(state) = super::status::usage_modal_state_mut(agent)
+            && state.fetch_nonce == nonce
+        {
+            state.billing_loading = false;
+            state.billing_error = None;
+            state.ctx.subscription_tier = tier_now;
+        }
         if !silent && !agent.chat_kind {
             let msg = match &balance {
                 Some(bal) => {
@@ -551,12 +537,14 @@ pub(super) fn handle_credit_limit_recheck_complete(
     // Either way, drop the stashed prompt.
     agent.credit_limit_stashed_prompt = None;
 
-    let mut effects = maybe_drain_queue(agent);
-    effects.push(Effect::FetchBilling {
+    let mut drain = maybe_drain_queue(agent);
+    drain.effects.push(Effect::FetchBilling {
         agent_id,
         silent: true,
+        nonce: 0,
     });
-    effects
+    note_peek_page_flip(app, agent_id, drain.page_flip_entry);
+    drain.effects
 }
 
 // Action handlers.
@@ -578,30 +566,6 @@ pub(super) fn dispatch_open_supergrok_url(app: &mut AppView) -> Vec<Effect> {
     // being correctly configured. If the URL already specifies a
     // referrer it's left alone.
     let url = crate::app::link_opener::ensure_query_param(url, "referrer", "grok-build");
-    crate::app::link_opener::open_url(&url);
+    super::ctx::open_url_or_show(app, &url);
     vec![]
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn free_usage_dual_read_string_and_wrapped_object_data() {
-        let free = "subscription:free-usage-exhausted quota hit";
-        let string_err = agent_client_protocol::Error::new(-32003, "Rate limited").data(free);
-        assert!(acp_error_is_free_usage_exhausted(&string_err));
-
-        // attach_prompt_usage wraps string data as {"message": ..., "promptUsage": ...}.
-        let wrapped =
-            agent_client_protocol::Error::new(-32003, "Rate limited").data(serde_json::json!({
-                "message": free,
-                "promptUsage": { "inputTokens": 1, "outputTokens": 0, "numTurns": 1 }
-            }));
-        assert!(acp_error_is_free_usage_exhausted(&wrapped));
-        assert!(!wrapped.data.as_ref().unwrap().is_string());
-
-        let other = agent_client_protocol::Error::new(-32003, "Rate limited").data("throttled");
-        assert!(!acp_error_is_free_usage_exhausted(&other));
-    }
 }

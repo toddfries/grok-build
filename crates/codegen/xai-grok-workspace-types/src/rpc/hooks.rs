@@ -1,45 +1,28 @@
-//! Hook registry method (`workspace.hook_registry`).
-//!
-//! `xai_grok_hooks` pulls in `git2`/`reqwest`/`xai-grok-tools`, too heavy for
-//! this lean crate, so the response is mirrored here as wire-shape structs
-//! rather than re-exported. The shapes must stay byte-identical to the upstream
-//! serde attributes (the server round-trips via serde).
+//! Wire mirror of the `workspace.hook_registry` response, kept byte-identical to
+//! the upstream serde shape so this lean crate avoids the heavy `xai_grok_hooks` dep.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use super::WorkspaceRpc;
+use super::{RpcActivityClass, WorkspaceRpc};
 
-/// Request for the loaded hook registry. No parameters.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HookRegistryReq {}
 
 impl WorkspaceRpc for HookRegistryReq {
     const METHOD: &'static str = "workspace.hook_registry";
+    const ACTIVITY: RpcActivityClass = RpcActivityClass::Read;
     type Response = HookRegistryWire;
 }
 
-/// Wire mirror of `xai_grok_hooks::discovery::HookRegistry`.
-///
-/// The upstream type keeps its `hooks` map private; the serde shape is
-/// `{ "hooks": { "<event>": [<HookSpec>, …] } }`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HookRegistryWire {
     pub hooks: HashMap<HookEventNameWire, Vec<HookSpecWire>>,
 }
 
-/// Wire mirror of `xai_grok_hooks::config::HookSpec`.
-///
-/// The upstream `matcher` field is `#[serde(skip)]` (compiled regex, never on
-/// the wire) and is therefore omitted here; clients recompile it. All other
-/// fields keep their snake_case names (the upstream type has no `rename_all`).
-///
-/// Must stay in sync with the upstream struct: the lean crate can't depend on
-/// `xai-grok-hooks`, so a server-side test (`xai-grok-workspace`'s
-/// `hook_spec_wire_covers_all_upstream_fields`) exhaustively destructures every
-/// upstream field, failing to compile if upstream adds one.
+/// Compiled `matcher` omitted; drift-guarded by `hook_spec_wire_covers_all_upstream_fields`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookSpecWire {
     pub name: String,
@@ -54,27 +37,24 @@ pub struct HookSpecWire {
     pub timeout_ms: u64,
     pub source_dir: PathBuf,
     pub extra_env: HashMap<String, String>,
+    /// `default` decodes a pre-field server as `file`.
+    #[serde(default = "default_layer")]
+    pub layer: String,
 }
 
-/// Wire mirror of `xai_grok_hooks::event::HookEventName`.
-///
-/// Serializes to snake_case (matching the upstream derive) and is used as a
-/// JSON map key in [`HookRegistryWire`]. `Serialize`/`Deserialize` are
-/// hand-written so it works as a serde_json map key and so an unknown event
-/// from a newer server is preserved losslessly in [`Unknown`](Self::Unknown):
-/// the structured `hook_registry` decode never fails under deploy skew, and
-/// distinct unknown events stay distinct map keys. (Not `Copy` — captured
-/// `String`.)
-///
-/// Known variants must stay in sync with the upstream enum: a server-side test
-/// maps every upstream variant here via an exhaustive `match`, failing to
-/// compile if upstream adds one.
+fn default_layer() -> String {
+    "file".to_string()
+}
+
+/// Snake_case JSON map key; hand-written serde keeps an unknown event lossless in
+/// [`Unknown`](Self::Unknown) so decode never fails under deploy skew.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum HookEventNameWire {
     SessionStart,
     SessionEnd,
     Stop,
     StopFailure,
+    StopCancelled,
     PreToolUse,
     PostToolUse,
     PostToolUseFailure,
@@ -86,18 +66,17 @@ pub enum HookEventNameWire {
     SubagentEnd,
     PreCompact,
     PostCompact,
-    /// An event string this client does not know, preserved verbatim.
     Unknown(String),
 }
 
 impl HookEventNameWire {
-    /// The snake_case wire string (the captured raw value for [`Unknown`]).
     pub fn as_str(&self) -> &str {
         match self {
             Self::SessionStart => "session_start",
             Self::SessionEnd => "session_end",
             Self::Stop => "stop",
             Self::StopFailure => "stop_failure",
+            Self::StopCancelled => "stop_cancelled",
             Self::PreToolUse => "pre_tool_use",
             Self::PostToolUse => "post_tool_use",
             Self::PostToolUseFailure => "post_tool_use_failure",
@@ -131,6 +110,7 @@ impl<'de> Deserialize<'de> for HookEventNameWire {
             "session_end" => Self::SessionEnd,
             "stop" => Self::Stop,
             "stop_failure" => Self::StopFailure,
+            "stop_cancelled" => Self::StopCancelled,
             "pre_tool_use" => Self::PreToolUse,
             "post_tool_use" => Self::PostToolUse,
             "post_tool_use_failure" => Self::PostToolUseFailure,
@@ -142,7 +122,6 @@ impl<'de> Deserialize<'de> for HookEventNameWire {
             "subagent_end" => Self::SubagentEnd,
             "pre_compact" => Self::PreCompact,
             "post_compact" => Self::PostCompact,
-            // Forward-tolerant: preserve an unknown event verbatim.
             _ => Self::Unknown(s),
         })
     }
@@ -157,14 +136,15 @@ mod tests {
         assert_eq!(HookRegistryReq::METHOD, "workspace.hook_registry");
     }
 
+    /// Mirrors `event_name_deser_all_variants` in xai-grok-hooks; the two lists move together.
     #[test]
     fn hook_event_name_wire_snake_case_round_trip() {
-        // All 15 variants (mirrors upstream `event_name_deser_all_variants`).
         for (variant, wire) in [
             (HookEventNameWire::SessionStart, "session_start"),
             (HookEventNameWire::SessionEnd, "session_end"),
             (HookEventNameWire::Stop, "stop"),
             (HookEventNameWire::StopFailure, "stop_failure"),
+            (HookEventNameWire::StopCancelled, "stop_cancelled"),
             (HookEventNameWire::PreToolUse, "pre_tool_use"),
             (HookEventNameWire::PostToolUse, "post_tool_use"),
             (
@@ -220,7 +200,8 @@ mod tests {
                     "url_raw": null,
                     "timeout_ms": 5000,
                     "source_dir": "/home/u/.grok/hooks",
-                    "extra_env": { "FOO": "bar" }
+                    "extra_env": { "FOO": "bar" },
+                    "layer": "file"
                 }]
             }
         });
