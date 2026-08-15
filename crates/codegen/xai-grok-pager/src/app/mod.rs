@@ -73,6 +73,7 @@ use std::io::{self, Write};
 use std::panic;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio_util::sync::CancellationToken;
+pub(crate) use turn_completion::CANCELLATION_CATEGORY_KEY;
 use xai_grok_shell::util::config;
 /// Tracks the extra Kitty keyboard layer pushed while the `/gboom` game is
 /// open (see [`push_gboom_keyboard_flags`]). Kept separate from the base layer
@@ -798,8 +799,8 @@ pub async fn run(
     );
     let connect_flags = crate::acp::ConnectFlags {
         subagents: !args.no_subagents,
-        experimental_memory: args.experimental_memory,
-        no_memory: args.no_memory,
+        memory_enabled_override: args.memory_enabled_override(),
+        memory_override_flag: args.memory_override_flag(),
         disable_web_search: args.disable_web_search,
         todo_gate: args.todo_gate,
         laziness_debug_log: None,
@@ -1961,6 +1962,25 @@ mod tests {
         let args = try_parse_pager(&["grok-pager", "--no-leader"]).unwrap();
         assert!(!args.leader);
         assert!(args.no_leader);
+    }
+    #[test]
+    fn cli_hidden_memory_compat_flags_parse_and_collapse() {
+        let enabled = try_parse_pager(&["grok-pager", "--experimental-memory"]).unwrap();
+        assert_eq!(enabled.memory_enabled_override(), Some(true));
+        assert_eq!(
+            enabled.memory_override_flag(),
+            Some("--experimental-memory")
+        );
+        let disabled = try_parse_pager(&["grok-pager", "--no-memory"]).unwrap();
+        assert_eq!(disabled.memory_enabled_override(), Some(false));
+        assert_eq!(disabled.memory_override_flag(), Some("--no-memory"));
+        let deferred = try_parse_pager(&["grok-pager"]).unwrap();
+        assert_eq!(deferred.memory_enabled_override(), None);
+        assert_eq!(deferred.memory_override_flag(), None);
+    }
+    #[test]
+    fn cli_hidden_memory_compat_flags_conflict() {
+        assert!(try_parse_pager(&["grok-pager", "--experimental-memory", "--no-memory"]).is_err());
     }
     #[test]
     fn cli_neither_leader_flag_defaults_false() {

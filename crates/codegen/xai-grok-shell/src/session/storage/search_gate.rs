@@ -45,7 +45,8 @@ pub(crate) fn session_search_off_reason(source: ConfigSource) -> &'static str {
         ConfigSource::Config
         | ConfigSource::UserConfig
         | ConfigSource::ManagedConfig
-        | ConfigSource::SystemManagedConfig => "the session_search key in a Grok config file",
+        | ConfigSource::SystemManagedConfig
+        | ConfigSource::EnvOverlay => "the session_search key in a Grok config layer",
         // Neither can resolve to off: the default is on and no flag sets this key.
         ConfigSource::Cli | ConfigSource::Default => "a local setting",
     }

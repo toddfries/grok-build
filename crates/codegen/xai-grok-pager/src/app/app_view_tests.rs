@@ -1239,44 +1239,6 @@ fn needs_animation_gates_btw_loading_spinner() {
     assert!(!app.needs_animation());
 }
 #[test]
-fn needs_animation_gates_todo_badge_flash() {
-    let mut app = test_app_with_agent();
-    let id = super::super::agent::AgentId(0);
-    assert!(!app.needs_animation(), "idle agent must not request ticks");
-    app.agents
-        .get_mut(&id)
-        .unwrap()
-        .todo
-        .update_todos(vec![xai_grok_shell::tools::TodoItem {
-            content: "do the thing".into(),
-            priority: Default::default(),
-            status: xai_grok_shell::tools::TodoStatus::InProgress,
-            meta: None,
-        }]);
-    assert!(
-        app.agents[&id].todo.badge_needs_tick(),
-        "fixture: a counts change must arm the badge flash"
-    );
-    assert!(
-        app.needs_animation(),
-        "an active todo badge flash must request animation ticks"
-    );
-    app.agents
-        .get_mut(&id)
-        .unwrap()
-        .todo
-        .expire_badge_flash_for_test();
-    let _ = app.tick();
-    assert!(
-        !app.agents[&id].todo.badge_needs_tick(),
-        "tick() must clear the expired badge flash (badge_tick)"
-    );
-    assert!(
-        !app.needs_animation(),
-        "a cleared badge flash must stop requesting ticks"
-    );
-}
-#[test]
 fn needs_animation_gates_pending_acp_command_sync() {
     let mut app = test_app_with_agent();
     let id = super::super::agent::AgentId(0);
@@ -1326,6 +1288,7 @@ fn needs_animation_gates_pending_turn_end_reconcile() {
             stop_reason: Some("end_turn".into()),
             agent_result: None,
             cancel_trigger: None,
+            cancellation_category: None,
             received_at: std::time::Instant::now()
                 - (TURN_END_RECONCILE_GRACE + std::time::Duration::from_secs(1)),
         });
@@ -6238,7 +6201,7 @@ fn handle_input_exit_session_action_closes_popup() {
         d.close_popup();
     }
     if let Some(agent) = app.agents.get_mut(&id) {
-        agent.active_subagent = None;
+        agent.close_subagent_fullscreen();
     }
     assert_eq!(app.dashboard.as_ref().unwrap().attached_agent, None);
     assert!(

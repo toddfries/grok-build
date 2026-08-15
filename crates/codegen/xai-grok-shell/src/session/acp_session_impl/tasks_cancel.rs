@@ -731,13 +731,17 @@ impl SessionActor {
         if rewound_input.is_none()
             && let Some(prompt_id) = cancelled_prompt_id
         {
-            // Stamp `cancelTrigger` on the terminal `_meta` so clients can tell
-            // a send-now cancel from an interactive Ctrl+C/Esc.
+            // `cancelTrigger` tells clients a send-now cancel from Ctrl+C/Esc;
+            // `MidTurnAbort` matches what the prompt's RPC resolves with below
+            // so the two rails agree.
             self.emit_turn_completed(
                 prompt_id,
                 &Ok(acp::StopReason::Cancelled),
                 cancelled_usage.clone(),
                 trigger.as_ref().map(crate::session::CancelTrigger::as_str),
+                Some(crate::session::commands::meta_category_str(
+                    crate::session::events::CancellationCategory::MidTurnAbort,
+                )),
             )
             .await;
         }
@@ -790,12 +794,10 @@ impl SessionActor {
                     total_tokens,
                     turn_snapshot: None,
                     completion_kind: PromptCompletionKind::Cancelled {
-                        // Previously hard-coded `None`, which dropped the
-                        // category on the abort path so `streaming_partial.json`
-                        // recorded a bare `"cancelled"`. Carry `MidTurnAbort`
-                        // so the partial's `reason` and any downstream consumer
-                        // match what `emit_turn_ended` wrote to `events.jsonl`.
-                        category: Some(crate::session::events::CancellationCategory::MidTurnAbort),
+                        // Running turn only, matching events.jsonl's category;
+                        // queued prompts were removed, not mid-turn aborted.
+                        category: is_running_turn
+                            .then_some(crate::session::events::CancellationCategory::MidTurnAbort),
                         // Thread the trigger on the running turn only (idx 0);
                         // MvpAgent stamps it on the `PromptResponse` `_meta`.
                         context: if is_running_turn {
