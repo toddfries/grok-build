@@ -42,7 +42,7 @@ pub struct DoomLoopRecoverySettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
     /// Highest `tail_repetition` threshold considered confident (clamped to
-    /// 2..=64). Absent ⇒ client default (32). CLIENT-side filter over the
+    /// 2..=64). Absent ⇒ client default (64). CLIENT-side filter over the
     /// trigger labels the server returns — the server emits every fired
     /// threshold; this is never sent as a request parameter.
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -1299,8 +1299,9 @@ pub use jsonl::JsonlStorageAdapter;
 #[cfg(any(test, feature = "test-support"))]
 pub use replay::load_updates_for_replay_at;
 pub use replay::{
-    PreparedReplay, ReplayEmission, ReplayLookupFallback, ReplayPathHint, load_updates_for_replay,
-    prepare_replay_lines, stream_replay_updates_at, stream_replay_updates_at_hinted,
+    PreparedReplay, ReplayEmission, ReplayLookupFallback, ReplayPathHint, ReplayedUpdate,
+    load_updates_for_replay, prepare_replay_lines, replay_would_emit, stream_replay_updates_at,
+    stream_replay_updates_at_hinted,
 };
 pub(crate) use replay::{ReplayToolCollapser, filter_delta_replay_lines};
 

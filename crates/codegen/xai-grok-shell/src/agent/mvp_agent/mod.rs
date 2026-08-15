@@ -58,7 +58,8 @@ use crate::agent::folder_trust;
 use crate::agent::models::{resolve_catalog_key, selectable_catalog_key_for_persisted};
 use crate::agent::session_config;
 use xai_grok_sampling_types::{
-    REASONING_EFFORT_META_KEY, ReasoningEffortOption, reasoning_effort_meta_value,
+    REASONING_EFFORT_META_KEY, ReasoningEffort, ReasoningEffortOption,
+    parse_reasoning_effort_meta, reasoning_effort_meta_value,
     supports_reasoning_effort_meta,
 };
 use crate::agent::update_chunk_merge;
@@ -267,6 +268,8 @@ pub(crate) struct SessionSpawnOptions<'a> {
     pub session_meta: Option<&'a acp::Meta>,
     pub model_agent_type: Option<&'a str>,
     pub session_model_id: acp::ModelId,
+    /// A `session/new` reasoning-effort hint applied to the spawn sampling; `None` for loads.
+    pub initial_reasoning_effort: Option<ReasoningEffort>,
     pub session_yolo_mode: bool,
     pub session_auto_mode: bool,
     pub prompt_display_cwd: Option<String>,
@@ -442,6 +445,7 @@ pub(crate) fn chat_session_spawn_options<'a>(
         session_meta,
         model_agent_type,
         session_model_id,
+        initial_reasoning_effort: None,
         session_yolo_mode,
         session_auto_mode: false,
         prompt_display_cwd: None,
@@ -504,8 +508,10 @@ pub(crate) struct PromptResponseMeta {
     /// Whole-prompt billing (sibling token fields are last call only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<crate::extensions::notification::PromptUsage>,
-    /// Cancellation category when the turn was terminated by the system
-    /// (e.g. doom loop). `None` for normal completions and user cancels.
+    /// Why the turn ended early (`cancellation_category_meta`): a cancel's
+    /// category (`"HookDenied"`, `"MidTurnAbort"`, …) or a synthetic end
+    /// (`"max_turns_reached"`, `"action_stationarity"`); `None` for normal
+    /// completions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cancellation_category: Option<String>,
     /// What triggered a cancelled turn's cancel (`"send_now"`, `"ctrl_c"`,
@@ -821,7 +827,7 @@ pub struct MvpAgent {
     /// [`Self::sync_collection_config_gate`] on every mid-session
     /// `remote_settings` rewrite.
     pub(crate) trace_upload_live: Arc<std::sync::atomic::AtomicBool>,
-    /// Memory system configuration (None when --experimental-memory not set).
+    /// Memory system configuration (None when memory is disabled).
     memory_config: Option<crate::config::MemoryConfig>,
     /// Optional channel to the leader's `ConfigFileWatcher` for dynamic
     /// per-cwd registration as new sessions open. Each
@@ -1398,6 +1404,7 @@ mod session_lifecycle;
 mod subagent_coordinator;
 mod agent_ops;
 mod acp_agent;
+pub(crate) mod reasoning_effort;
 mod session_setup;
 use session_registry::SessionRegistry;
 pub(crate) use session_lifecycle::RegistrySnapshot;
