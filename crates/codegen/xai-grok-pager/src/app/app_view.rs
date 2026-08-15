@@ -447,12 +447,12 @@ pub enum InputOutcome {
     /// Dispatch this action, then redraw.
     Action(Action),
     /// Dispatch this action, then re-process the same event through the
-    /// (now-changed) active view. Used when the welcome screen creates a
-    /// new session on the first keystroke so the character lands in the
-    /// session's prompt instead of being consumed.
+    /// (now-changed) active view. The event loop batches both dispatches into
+    /// one effect wave so state from the forward pass may shape the first
+    /// action's meta (e.g. welcome create + CycleMode sharing session/new flags).
     ActionThenForward(Action),
-    /// Dispatch both actions in order, then redraw (e.g. revert preview
-    /// + open reset confirm).
+    /// Dispatch+process the first action, then dispatch+process the second
+    /// (intentional effect barrier between them; e.g. revert preview then open reset).
     ActionPair(Action, Action),
     /// Arm a double-press pending action (e.g. idle Esc clear/rewind).
     /// AppView installs [`PendingAction`]; second press within `ttl` fires
@@ -2220,6 +2220,7 @@ impl AppView {
     }
     /// Apply a (possibly hot-reloaded) appearance config to all agents.
     pub fn set_appearance(&mut self, config: AppearanceConfig) {
+        crate::render::bidi::set_enabled(config.scrollback.display.rtl_bidi);
         for agent in self.agents.values_mut() {
             agent.scrollback.set_appearance(config.clone());
             for child in agent.subagent_views.values_mut() {
@@ -2856,7 +2857,7 @@ impl AppView {
                                 d.close_popup();
                             }
                             if let Some(agent) = self.agents.get_mut(&agent_id) {
-                                agent.active_subagent = None;
+                                agent.close_subagent_fullscreen();
                             }
                             return InputOutcome::Changed;
                         }
@@ -2903,7 +2904,7 @@ impl AppView {
                                 d.close_popup();
                             }
                             if let Some(agent) = self.agents.get_mut(&agent_id) {
-                                agent.active_subagent = None;
+                                agent.close_subagent_fullscreen();
                             }
                             return InputOutcome::Changed;
                         }
@@ -2935,7 +2936,7 @@ impl AppView {
                                     d.close_popup();
                                 }
                                 if let Some(agent) = self.agents.get_mut(&agent_id) {
-                                    agent.active_subagent = None;
+                                    agent.close_subagent_fullscreen();
                                 }
                                 return InputOutcome::Changed;
                             }
@@ -5405,7 +5406,6 @@ impl AppView {
         {
             needs_redraw |= agent.scrollback.tick();
             needs_redraw |= agent.todo.list_state.tick();
-            needs_redraw |= agent.todo.badge_tick();
             needs_redraw |= agent.tasks.tick();
             for child_view in agent.subagent_views.values_mut() {
                 needs_redraw |= child_view.scrollback.tick();
@@ -5728,7 +5728,6 @@ impl AppView {
                 };
                 let fast = agent.scrollback.needs_animation()
                     || agent.todo.list_state.needs_tick()
-                    || agent.todo.badge_needs_tick()
                     || agent.tasks.needs_tick()
                     || agent.acp_synced_generation != agent.session.available_commands_generation
                     || !agent.session.state.is_idle()

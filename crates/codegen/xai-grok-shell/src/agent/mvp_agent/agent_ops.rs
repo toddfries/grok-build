@@ -3,6 +3,7 @@
 //! Inherent [`MvpAgent`] helpers (MCP/clients/gateway, settings/models, session ops, spawn).
 //! Co-located child of `mvp_agent` (`use super::*`).
 use super::*;
+use super::reasoning_effort::EffortTarget;
 use crate::auth::PreferredAuthMethod;
 use crate::upload::trace::PromptMetadataParams;
 use xai_grok_tools::implementations::grok_build::task::backend::SubagentBackend;
@@ -3950,6 +3951,7 @@ impl MvpAgent {
             session_meta,
             model_agent_type,
             session_model_id,
+            initial_reasoning_effort,
             session_yolo_mode,
             session_auto_mode,
             prompt_display_cwd,
@@ -4290,12 +4292,19 @@ impl MvpAgent {
             );
             agent_definition.user_message_template = template;
         }
-        let (session_model_id, sampling_config) = self
+        let (session_model_id, mut sampling_config) = self
             .apply_agent_model_override(
                 pinned_model.as_ref(),
                 session_model_id,
                 sampling_config,
                 origin_client.clone(),
+            );
+        self.models_manager
+            .apply_supported_effort(
+                &mut sampling_config,
+                initial_reasoning_effort,
+                &session_info.id,
+                EffortTarget::NewSession,
             );
         let max_turns = {
             let cfg = self.cfg.borrow();
@@ -4550,7 +4559,7 @@ impl MvpAgent {
                     }
                     Some(std::sync::Arc::new(merged))
                 });
-            let initial_reasoning_effort = chat_history
+            let reasoning_effort_to_persist = chat_history
                 .is_empty()
                 .then_some(sampling_config.reasoning_effort);
             let _ = persistence
@@ -4558,7 +4567,7 @@ impl MvpAgent {
                 .send(crate::session::persistence::PersistenceMsg::CurrentModel {
                     model_id: session_model_id.clone(),
                     agent_name: Some(agent_definition.name.clone()),
-                    reasoning_effort: initial_reasoning_effort,
+                    reasoning_effort: reasoning_effort_to_persist,
                 });
             let acp_mcp_servers = crate::session::acp_mcp::parse_acp_mcp_servers(
                 session_meta,

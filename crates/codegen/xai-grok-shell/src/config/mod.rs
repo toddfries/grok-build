@@ -3,216 +3,14 @@ pub mod watcher;
 use crate::bundle;
 use serde::Deserialize;
 pub use xai_grok_config_types::{
-    DEFAULT_RECENCY_DECAY, MemoryDreamConfig, MemoryEmbeddingConfig, MemoryFlushConfig,
-    MemoryGcConfig, MemoryIndexConfig, MemoryInitialInjectionConfig, MemorySearchConfig,
-    MemorySessionConfig, MemoryWatcherConfig, MmrConfig, PruningConfig, TemporalDecayConfig,
+    DEFAULT_RECENCY_DECAY, MemoryConfig, MemoryDreamConfig, MemoryDreamSettings,
+    MemoryEmbeddingConfig, MemoryEmbeddingSettings, MemoryFlushConfig, MemoryFlushSettings,
+    MemoryGcConfig, MemoryGcSettings, MemoryIndexConfig, MemoryIndexSettings,
+    MemoryInitialInjectionConfig, MemoryInitialInjectionSettings, MemorySearchConfig,
+    MemorySearchSettings, MemorySessionConfig, MemorySessionSettings, MemorySettings,
+    MemoryWatcherConfig, MemoryWatcherSettings, MmrConfig, MmrSettings, PruningConfig,
+    PruningSettings, TemporalDecayConfig, TemporalDecaySettings,
 };
-/// Full configuration for the memory system.
-///
-/// Parsed from the `[memory]` section of `~/.grok/config.toml` or
-/// `.grok/config.toml`. Disabled by default; enabled via
-/// `--experimental-memory` CLI flag or `GROK_MEMORY=1` env var.
-/// Force-disabled via `GROK_MEMORY=0` (overrides TOML and remote settings).
-///
-/// All sub-configs are pre-populated with production-ready defaults so that
-/// later PRs (indexing, search, flush, pruning) can read them without any
-/// config migration.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[serde(default)]
-pub struct MemoryConfig {
-    /// Whether memory is enabled for this session.
-    pub enabled: bool,
-    /// Index / chunking settings.
-    pub index: MemoryIndexConfig,
-    /// Embedding provider settings.
-    pub embedding: MemoryEmbeddingConfig,
-    /// Hybrid search scoring settings.
-    pub search: MemorySearchConfig,
-    /// First-turn memory injection behavior.
-    pub initial_injection: MemoryInitialInjectionConfig,
-    /// Session lifecycle settings.
-    pub session: MemorySessionConfig,
-    /// File watcher settings for detecting external memory edits.
-    pub watcher: MemoryWatcherConfig,
-    /// Garbage collection settings for orphaned workspace directories.
-    pub gc: MemoryGcConfig,
-    /// autoDream consolidation settings.
-    pub dream: MemoryDreamConfig,
-    /// Pre-compaction memory flush settings.
-    ///
-    /// **Note:** Configured under `[compaction.memory_flush]` in config.toml,
-    /// not under `[memory]`. Flush is a compaction behavior.
-    #[serde(skip)]
-    pub flush: MemoryFlushConfig,
-    /// Tool-result pruning settings.
-    ///
-    /// **Note:** Configured under `[compaction.pruning]` in config.toml,
-    /// not under `[memory]`. Pruning is a compaction behavior.
-    #[serde(skip)]
-    pub pruning: PruningConfig,
-    /// Per-agent memory root override (e.g. `~/.grok/agent-memory/<name>/`).
-    #[serde(skip)]
-    pub root_dir_override: Option<std::path::PathBuf>,
-    /// When true, the root is already project-scoped so MemoryStorage should
-    /// skip the workspace hash subdirectory (use `new_flat` instead of `new`).
-    #[serde(skip)]
-    pub flat_memory_root: bool,
-}
-impl MemoryConfig {
-    /// Resolve the final memory config from all sources (in priority order):
-    /// 1. CLI flag `--no-memory` (absolute highest — always disables, overrides all)
-    /// 2. CLI flag `--experimental-memory` (enables, but overridden by --no-memory)
-    /// 3. `GROK_MEMORY` env var: `1`/`true` enables, `0`/`false` force-disables
-    /// 4. Config file `[memory]` / `[compaction]` sections
-    /// 5. Remote settings from `/v1/settings`
-    ///
-    /// Remote settings only override fields when the corresponding local
-    /// config section is absent. Section-level granularity: if `[memory.search]`
-    /// exists in TOML, all search fields come from TOML; if absent, remote
-    /// search settings apply.
-    pub fn resolve(
-        experimental_memory: bool,
-        no_memory: bool,
-        config: &toml::Value,
-        remote: Option<&crate::util::config::RemoteSettings>,
-    ) -> Self {
-        let mut result: Self = config
-            .get("memory")
-            .and_then(|v| v.clone().try_into().ok())
-            .unwrap_or_default();
-        if let Some(compaction) = config.get("compaction") {
-            if let Some(flush) = compaction.get("memory_flush")
-                && let Ok(f) = flush.clone().try_into()
-            {
-                result.flush = f;
-            }
-            if let Some(pruning) = compaction.get("pruning")
-                && let Ok(p) = pruning.clone().try_into()
-            {
-                result.pruning = p;
-            }
-        }
-        if let Some(remote) = remote {
-            let has_local_search = config.get("memory").and_then(|m| m.get("search")).is_some();
-            if !has_local_search {
-                if let Some(v) = remote.memory_search_max_results {
-                    result.search.max_results = v as usize;
-                }
-                if let Some(v) = remote.memory_search_min_score {
-                    result.search.min_score = v;
-                }
-                if let Some(v) = remote.memory_temporal_decay_enabled {
-                    result.search.temporal_decay.enabled = v;
-                }
-                if let Some(v) = remote.memory_temporal_decay_half_life_days {
-                    result.search.temporal_decay.half_life_days = v;
-                }
-                if let Some(v) = remote.memory_mmr_enabled {
-                    result.search.mmr.enabled = v;
-                }
-                if let Some(v) = remote.memory_mmr_lambda {
-                    result.search.mmr.lambda = v.clamp(0.0, 1.0);
-                }
-            }
-            let has_local_initial_injection = config
-                .get("memory")
-                .and_then(|m| m.get("initial_injection"))
-                .is_some();
-            if !has_local_initial_injection {
-                if let Some(v) = remote.memory_initial_injection_enabled {
-                    result.initial_injection.enabled = v;
-                }
-                if let Some(v) = remote.memory_initial_injection_min_score {
-                    result.initial_injection.min_score = Some(v);
-                }
-            }
-            let has_local_embedding = config
-                .get("memory")
-                .and_then(|m| m.get("embedding"))
-                .is_some();
-            if !has_local_embedding {
-                if let Some(ref v) = remote.memory_embedding_model {
-                    result.embedding.model = Some(v.clone());
-                }
-                if let Some(v) = remote.memory_embedding_dimensions {
-                    result.embedding.dimensions = v as usize;
-                }
-            }
-            let has_local_pruning = config
-                .get("compaction")
-                .and_then(|c| c.get("pruning"))
-                .is_some();
-            if !has_local_pruning {
-                if let Some(v) = remote.pruning_enabled {
-                    result.pruning.enabled = v;
-                }
-                if let Some(v) = remote.pruning_keep_last_n_turns {
-                    result.pruning.keep_last_n_turns = v as usize;
-                }
-                if let Some(v) = remote.pruning_soft_trim_threshold {
-                    result.pruning.soft_trim_threshold = v as usize;
-                }
-            }
-            let has_local_flush = config
-                .get("compaction")
-                .and_then(|c| c.get("memory_flush"))
-                .is_some();
-            if !has_local_flush {
-                if let Some(v) = remote.flush_enabled {
-                    result.flush.enabled = v;
-                }
-                if let Some(v) = remote.flush_soft_threshold_tokens {
-                    result.flush.soft_threshold_tokens = v;
-                }
-                if let Some(v) = remote.flush_idle_timeout_secs {
-                    result.flush.idle_timeout_secs = Some(v);
-                }
-                if let Some(v) = remote.flush_semantic_dedup_threshold {
-                    result.flush.semantic_dedup_threshold = Some(v.clamp(0.0, 1.0));
-                }
-            }
-            let has_local_watcher = config
-                .get("memory")
-                .and_then(|m| m.get("watcher"))
-                .is_some();
-            if !has_local_watcher && let Some(v) = remote.memory_watcher_enabled {
-                result.watcher.enabled = v;
-            }
-            let has_local_dream = config.get("memory").and_then(|m| m.get("dream")).is_some();
-            if !has_local_dream {
-                if let Some(v) = remote.dream_enabled {
-                    result.dream.enabled = v;
-                }
-                if let Some(v) = remote.dream_min_hours {
-                    result.dream.min_hours = v;
-                }
-                if let Some(v) = remote.dream_min_sessions {
-                    result.dream.min_sessions = v;
-                }
-                if let Some(v) = remote.dream_check_interval_secs {
-                    result.dream.check_interval_secs = Some(v);
-                }
-            }
-        }
-        let resolved = crate::agent::config::resolve_enabled(
-            if experimental_memory {
-                Some(true)
-            } else {
-                None
-            },
-            "GROK_MEMORY",
-            result.enabled,
-            config.get("memory").is_some(),
-            remote.and_then(|r| r.memory_enabled),
-            false,
-        );
-        result.enabled = resolved.value;
-        if no_memory {
-            result.enabled = false;
-        }
-        result
-    }
-}
 /// Configuration for subagent (task tool) support.
 ///
 /// Parsed from the `[subagents]` section of `~/.grok/config.toml` or
@@ -1008,13 +806,15 @@ impl StorageMode {
 }
 pub use xai_grok_config::ConfigLayers;
 pub use xai_grok_config::{
-    MDM_REQUIREMENTS_SOURCE, RequirementsLayer, RequirementsSource, ServingIdentity, SyncMarker,
+    GROK_CONFIG_ENV, GROK_CONFIG_PATH_ENV, MDM_REQUIREMENTS_SOURCE, OverlaySource,
+    RequirementsLayer, RequirementsSource, ResolvedOverlay, ServingIdentity, SyncMarker,
     claude_managed_settings_probe_path, confirmed_team_switch, confirmed_team_switch_at,
     is_managed_config_hard_stale_for, is_managed_config_stale_for, load_config_file,
     load_from_disk, load_managed_config, load_merged_requirements, load_system_managed_config,
     load_toml_file, managed_config_identity_changed_at, managed_deployment_id,
     managed_policy_compromised_for, mark_managed_config_synced, mark_managed_config_synced_at,
-    normalize_identity, requirements_layers, system_config_dir, user_grok_home,
+    normalize_identity, requirements_layers, resolved_env_overlay, system_config_dir,
+    user_grok_home,
 };
 /// Map of "dotted.path" to which config file the value came from.
 pub(crate) fn config_origins(
@@ -1044,6 +844,9 @@ pub(crate) fn config_origins(
         ConfigSource::UserConfig,
         &mut origins,
     );
+    if let Some(overlay) = &layers.env_overlay {
+        walk_toml(overlay, &mut vec![], ConfigSource::EnvOverlay, &mut origins);
+    }
     origins
 }
 fn walk_toml(
@@ -1297,7 +1100,7 @@ fn apply_requirements_inner(
     enforce_opt!("cli", "auto_update", config.cli.auto_update);
     enforce_opt!("cli", "use_leader", config.cli.use_leader);
     enforce_opt!("cli", "show_tips", config.cli.show_tips);
-    enforce_val!("memory", "enabled", config.memory.enabled);
+    enforce_opt!("memory", "enabled", config.memory.enabled);
     enforce_val!("subagents", "enabled", config.subagents.enabled);
     enforce_val!("managed_mcps", "enabled", config.managed_mcps.enabled);
     if let Some(val) = req_bool(req, "tools", "respect_gitignore") {

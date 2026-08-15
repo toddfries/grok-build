@@ -1038,7 +1038,9 @@ impl SessionActor {
                     tool_call_count: turn_tool_count,
                     model_id: turn_model_id.clone(),
                     written_repo_paths: Vec::new(),
-                    cancellation_category: Some("action_stationarity".to_string()),
+                    cancellation_category: Some(
+                        crate::session::commands::ACTION_STATIONARITY_CATEGORY.to_string(),
+                    ),
                     cancellation_context: None,
                 })
                 .await;
@@ -1048,7 +1050,9 @@ impl SessionActor {
                         duration_ms: turn_duration_ms,
                         tool_call_count: turn_tool_count,
                         model_id: turn_model_id,
-                        cancellation_category: Some("action_stationarity".to_string()),
+                        cancellation_category: Some(
+                            crate::session::commands::ACTION_STATIONARITY_CATEGORY.to_string(),
+                        ),
                         error_category: None,
                     },
                 );
@@ -1079,7 +1083,8 @@ impl SessionActor {
                         duration_ms: turn_duration_ms,
                         tool_call_count: turn_tool_count,
                         model_id: turn_model_id,
-                        cancellation_category: category.map(|c| format!("{c:?}")),
+                        cancellation_category: category
+                            .map(|c| crate::session::commands::meta_category_str(c).to_string()),
                         error_category: None,
                     },
                 );
@@ -1114,7 +1119,9 @@ impl SessionActor {
                         duration_ms: turn_duration_ms,
                         tool_call_count: turn_tool_count,
                         model_id: turn_model_id,
-                        cancellation_category: Some("max_turns_reached".to_string()),
+                        cancellation_category: Some(
+                            crate::session::commands::MAX_TURNS_REACHED_CATEGORY.to_string(),
+                        ),
                         error_category: None,
                     },
                 );

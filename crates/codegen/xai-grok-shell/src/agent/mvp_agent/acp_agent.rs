@@ -1025,6 +1025,7 @@ impl acp::Agent for MvpAgent {
                             arguments.session_id.clone(),
                             restore_model_id.clone(),
                         ),
+                        None,
                     )
                     .await
                 {
@@ -1363,6 +1364,10 @@ impl acp::Agent for MvpAgent {
                 } => ctx.trigger.clone(),
                 _ => None,
             });
+        let cancellation_category: Option<String> = stop_result
+            .as_ref()
+            .ok()
+            .and_then(|ok| ok.completion_kind.cancellation_category_meta());
         {
             let mapped = stop_result
                 .as_ref()
@@ -1387,6 +1392,9 @@ impl acp::Agent for MvpAgent {
             }
             if let Some(ref t) = cancel_trigger {
                 payload["cancelTrigger"] = serde_json::json!(t);
+            }
+            if let Some(ref c) = cancellation_category {
+                payload["cancellationCategory"] = serde_json::json!(c);
             }
             let params = serde_json::value::to_raw_value(&payload)
                 .expect("prompt_complete params serialization");
@@ -1871,19 +1879,6 @@ impl acp::Agent for MvpAgent {
                     }
                 }
                 let last_turn_usage = last_turn_usage_for_meta;
-                let cancellation_category = match &completion_kind {
-                    crate::session::commands::PromptCompletionKind::Cancelled {
-                        category: Some(cat),
-                        ..
-                    } => Some(format!("{cat:?}")),
-                    crate::session::commands::PromptCompletionKind::MaxTurnsReached {
-                        ..
-                    } => Some("max_turns_reached".to_string()),
-                    crate::session::commands::PromptCompletionKind::StationarityEnded => {
-                        Some("action_stationarity".to_string())
-                    }
-                    _ => None,
-                };
                 Ok(
                     acp::PromptResponse::new(stop_reason)
                         .meta(
@@ -2154,7 +2149,13 @@ impl acp::Agent for MvpAgent {
             );
         }
         let session_id = args.session_id.clone();
-        let res = crate::agent::handlers::model_switch::apply(self, args).await;
+        let effort_override = parse_reasoning_effort_meta(args.meta.as_ref());
+        let res = crate::agent::handlers::model_switch::apply(
+                self,
+                args,
+                effort_override,
+            )
+            .await;
         if res.is_ok()
             && let Some(unavailable) = self
                 .session_registry
