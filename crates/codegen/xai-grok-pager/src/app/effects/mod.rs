@@ -1290,7 +1290,7 @@ pub(crate) fn execute(
                     let send_start = std::time::Instant::now();
                     let mut meta = serde_json::json!({ "cancelSubagents": cancel_subagents });
                     if let Some(t) = trigger_str {
-                        meta["cancelTrigger"] = t.into();
+                        meta[crate::app::turn_completion::CANCEL_TRIGGER_KEY] = t.into();
                     }
                     if rewind_if_no_output {
                         meta["rewindIfNoOutput"] = true.into();

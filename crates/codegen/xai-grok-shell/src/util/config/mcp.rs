@@ -121,8 +121,15 @@ pub(crate) fn load_mcp_servers_with_oauth(
     cwd: &std::path::Path,
     compat: &CompatConfig,
 ) -> (Vec<acp::McpServer>, McpOAuthConfigMap) {
-    let global_config =
-        crate::config::load_from_disk().unwrap_or_else(|_| TomlValue::Table(toml::map::Map::new()));
+    // Read the same effective config that `load_mcp_servers` /
+    // `reload_mcp_servers_merged` start servers from, so the server list and its
+    // parallel OAuth map derive from one snapshot. This aligns the OAuth map
+    // with the effective-config server list, so a managed- or
+    // requirements-defined server cannot start without its OAuth client
+    // settings. (The overlay is stripped of `mcp_servers`, so it never
+    // contributes a server here.)
+    let global_config = crate::config::load_effective_config()
+        .unwrap_or_else(|_| TomlValue::Table(toml::map::Map::new()));
 
     let mut servers_map: IndexMap<String, McpServerConfig> = IndexMap::new();
     for (name, config) in parse_mcp_servers_from_toml(&global_config) {

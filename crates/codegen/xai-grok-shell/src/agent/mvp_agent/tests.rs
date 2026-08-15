@@ -1329,6 +1329,174 @@ async fn model_state_prefers_session_reasoning_effort_over_global() {
         "absent session effort falls back to the global default",
     );
 }
+#[tokio::test]
+async fn apply_supported_effort_assigns_only_when_supported() {
+    use crate::agent::config::{EndpointsConfig, ModelEntry};
+    use crate::agent::mvp_agent::reasoning_effort::EffortTarget;
+    use xai_grok_sampling_types::ReasoningEffort;
+    let agent = build_minimal_agent_for_tests();
+    let mut supported = ModelEntry::fallback("effort-model", &EndpointsConfig::default());
+    supported.info.supports_reasoning_effort = true;
+    agent
+        .models_manager
+        .insert_test_entry("effort-model", supported.clone());
+    let plain = ModelEntry::fallback("plain-model", &EndpointsConfig::default());
+    agent
+        .models_manager
+        .insert_test_entry("plain-model", plain.clone());
+    let sid = acp::SessionId::new("meta-effort-sess");
+    let mut supported_cfg = agent.prepare_sampling_config_for_model(&supported, None);
+    supported_cfg.reasoning_effort = None;
+    agent.models_manager.apply_supported_effort(
+        &mut supported_cfg,
+        Some(ReasoningEffort::High),
+        &sid,
+        EffortTarget::NewSession,
+    );
+    assert_eq!(supported_cfg.reasoning_effort, Some(ReasoningEffort::High));
+    let mut plain_cfg = agent.prepare_sampling_config_for_model(&plain, None);
+    plain_cfg.reasoning_effort = None;
+    agent.models_manager.apply_supported_effort(
+        &mut plain_cfg,
+        Some(ReasoningEffort::High),
+        &sid,
+        EffortTarget::NewSession,
+    );
+    assert_eq!(plain_cfg.reasoning_effort, None);
+    let mut none_cfg = agent.prepare_sampling_config_for_model(&supported, None);
+    none_cfg.reasoning_effort = Some(ReasoningEffort::Low);
+    agent.models_manager.apply_supported_effort(
+        &mut none_cfg,
+        None,
+        &sid,
+        EffortTarget::NewSession,
+    );
+    assert_eq!(none_cfg.reasoning_effort, Some(ReasoningEffort::Low));
+}
+#[test]
+fn split_new_session_effort_routes_hint_to_one_slot() {
+    use crate::agent::mvp_agent::reasoning_effort::{NewSessionEffort, split_new_session_effort};
+    use xai_grok_sampling_types::ReasoningEffort;
+    assert_eq!(
+        split_new_session_effort(None, Some(ReasoningEffort::High)),
+        NewSessionEffort::Spawn(ReasoningEffort::High),
+    );
+    assert_eq!(
+        split_new_session_effort(Some("custom-model"), Some(ReasoningEffort::High)),
+        NewSessionEffort::Switch(ReasoningEffort::High),
+    );
+    assert_eq!(split_new_session_effort(None, None), NewSessionEffort::None,);
+    assert_eq!(
+        split_new_session_effort(Some("custom-model"), None),
+        NewSessionEffort::None,
+    );
+}
+/// New-session default-model path: composing `parse_reasoning_effort_meta` ->
+/// `split_new_session_effort` -> `apply_supported_effort` seeds a
+/// `_meta.reasoningEffort` hint into the spawn sampling for a supported model and
+/// drops it (keeping the catalog default) for an unsupported one.
+#[tokio::test]
+async fn new_session_meta_effort_seeds_spawn_for_supported_model_and_drops_for_unsupported() {
+    use crate::agent::config::{EndpointsConfig, ModelEntry};
+    use crate::agent::mvp_agent::reasoning_effort::{
+        EffortTarget, NewSessionEffort, split_new_session_effort,
+    };
+    use xai_grok_sampling_types::{
+        REASONING_EFFORT_META_KEY, ReasoningEffort, parse_reasoning_effort_meta,
+        reasoning_effort_meta_value,
+    };
+    let agent = build_minimal_agent_for_tests();
+    let mut supported = ModelEntry::fallback("effort-model", &EndpointsConfig::default());
+    supported.info.supports_reasoning_effort = true;
+    supported.info.reasoning_effort = Some(ReasoningEffort::Low);
+    agent
+        .models_manager
+        .insert_test_entry("effort-model", supported.clone());
+    let plain = ModelEntry::fallback("plain-model", &EndpointsConfig::default());
+    agent
+        .models_manager
+        .insert_test_entry("plain-model", plain.clone());
+    let mut meta = acp::Meta::new();
+    meta.insert(
+        REASONING_EFFORT_META_KEY.to_string(),
+        reasoning_effort_meta_value(ReasoningEffort::High),
+    );
+    let request = acp::NewSessionRequest::new("/tmp").meta(Some(meta));
+    let route = split_new_session_effort(None, parse_reasoning_effort_meta(request.meta.as_ref()));
+    assert_eq!(route, NewSessionEffort::Spawn(ReasoningEffort::High));
+    let spawn_effort = match route {
+        NewSessionEffort::Spawn(effort) => Some(effort),
+        NewSessionEffort::Switch(_) | NewSessionEffort::None => None,
+    };
+    let sid = acp::SessionId::new("new-session-meta-effort");
+    let mut supported_cfg = agent.prepare_sampling_config_for_model(&supported, None);
+    agent.models_manager.apply_supported_effort(
+        &mut supported_cfg,
+        spawn_effort,
+        &sid,
+        EffortTarget::NewSession,
+    );
+    assert_eq!(supported_cfg.reasoning_effort, Some(ReasoningEffort::High));
+    let mut plain_cfg = agent.prepare_sampling_config_for_model(&plain, None);
+    agent.models_manager.apply_supported_effort(
+        &mut plain_cfg,
+        spawn_effort,
+        &sid,
+        EffortTarget::NewSession,
+    );
+    assert_eq!(plain_cfg.reasoning_effort, None);
+}
+/// Drive the real `restore_persisted_model` for a session pinned to an
+/// effort-capable model and report the effort it lands on the session handle.
+async fn restore_effort_via_load(
+    initial: Option<xai_grok_sampling_types::ReasoningEffort>,
+    persisted: Option<xai_grok_sampling_types::ReasoningEffort>,
+) -> Option<xai_grok_sampling_types::ReasoningEffort> {
+    use crate::agent::config::{EndpointsConfig, ModelEntry};
+    let agent = build_minimal_agent_for_tests();
+    let mut entry = ModelEntry::fallback("effort-model", &EndpointsConfig::default());
+    entry.info.supports_reasoning_effort = true;
+    agent
+        .models_manager
+        .insert_test_entry("effort-model", entry);
+    let sid = acp::SessionId::new("restore-precedence-sess");
+    let (handle, _cmd_tx, mut cmd_rx) = make_live_session_handle(&sid, None);
+    tokio::spawn(async move {
+        while let Some(cmd) = cmd_rx.recv().await {
+            if let crate::session::SessionCommand::SetSessionModel {
+                sampling_config,
+                responds_to,
+                ..
+            } = cmd
+            {
+                let _ = responds_to.send(Ok(acp::ModelId::new(sampling_config.model)));
+            }
+        }
+    });
+    agent.insert_resident(&sid, handle);
+    let info = crate::session::info::Info {
+        id: sid.clone(),
+        cwd: "/tmp".to_string(),
+    };
+    let mut summary =
+        crate::session::persistence::Summary::new(&info, acp::ModelId::new("effort-model"))
+            .unwrap();
+    summary.reasoning_effort = persisted;
+    agent.restore_persisted_model(&sid, &summary, initial).await;
+    agent.resident_handle(&sid).and_then(|h| h.reasoning_effort)
+}
+#[tokio::test]
+async fn load_effort_precedence_prefers_meta_hint_over_persisted() {
+    use xai_grok_sampling_types::ReasoningEffort;
+    assert_eq!(
+        restore_effort_via_load(Some(ReasoningEffort::High), Some(ReasoningEffort::Low)).await,
+        Some(ReasoningEffort::High),
+    );
+    assert_eq!(
+        restore_effort_via_load(None, Some(ReasoningEffort::Low)).await,
+        Some(ReasoningEffort::Low),
+    );
+}
 /// A session persisted under a routing *slug* (not the catalog map key) must
 /// still get reasoning modes and a selected model from
 /// `session_config_options` — the id is resolved to the catalog key before

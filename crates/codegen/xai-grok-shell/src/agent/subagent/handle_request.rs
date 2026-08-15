@@ -6,6 +6,9 @@ use super::*;
 use crate::upload::trace::PromptMetadataParams;
 use xai_grok_sampling_types::ReasoningEffort;
 use xai_grok_tools::implementations::{grok_build, opencode};
+/// Budget for the pre-completion child transcript flush (replay buffer +
+/// persistence to disk). Mirrors the workflow-shutdown persistence bound.
+const CHILD_COMPLETION_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 pub(super) fn task_model_override_error(
     requested: Option<&str>,
     provenance: ModelOverrideProvenance,
@@ -1489,6 +1492,37 @@ pub(crate) async fn run_shell_child(
             );
         }
         (None, None) => {}
+    }
+    {
+        let (respond_to, ack) = oneshot::channel();
+        if child_handle
+            .cmd_tx
+            .send(SessionCommand::FlushComplete { respond_to })
+            .is_ok()
+        {
+            match tokio::time::timeout(CHILD_COMPLETION_FLUSH_TIMEOUT, ack).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => {
+                    tracing::warn!(
+                        subagent_id = %request.id,
+                        %error,
+                        "child transcript flush failed before completion"
+                    )
+                }
+                Ok(Err(_)) => {
+                    tracing::warn!(
+                        subagent_id = %request.id,
+                        "child session dropped the transcript flush ack before completion"
+                    )
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        subagent_id = %request.id,
+                        "child transcript flush timed out before completion"
+                    )
+                }
+            }
+        }
     }
     let _ = child_handle.cmd_tx.send(SessionCommand::Shutdown(
         crate::session::ShutdownKind::Graceful,

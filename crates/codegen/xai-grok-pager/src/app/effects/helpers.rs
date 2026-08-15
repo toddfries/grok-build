@@ -363,7 +363,7 @@ impl SessionFlags {
     /// `askUserQuestion: false` into the meta, even when paired with
     /// `GROK_AGENT` — the env var chooses the *agent*, but the tool-strip is
     /// independent. Chat mode additionally stamps `x.ai/session.kind`.
-    pub(super) fn to_meta(&self) -> Option<acp::Meta> {
+    pub(crate) fn to_meta(&self) -> Option<acp::Meta> {
         let mut meta = serde_json::Map::new();
         if self.chat_mode {
             if self.plan_mode || self.agent_override.is_some()

@@ -55,10 +55,12 @@ fn initial_injection_backend_params_preserve_default_zero_min_score() {
         search_source: "tool",
         embedding_credentials: crate::session::memory::EndpointScopedCredentials::none(),
     };
-    let (adjusted, effective_min_score) = build_initial_injection_backend_params(
-        &params,
-        &crate::config::MemoryInitialInjectionConfig::default(),
-    );
+    let initial_injection = crate::config::MemoryInitialInjectionConfig {
+        enabled: true,
+        min_score: None,
+    };
+    let (adjusted, effective_min_score) =
+        build_initial_injection_backend_params(&params, &initial_injection);
     assert_eq!("injection", adjusted.search_source);
     assert!((0.41 - adjusted.search_config.min_score).abs() < f32::EPSILON);
     assert!((0.0 - effective_min_score as f32).abs() < f32::EPSILON);
