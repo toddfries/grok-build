@@ -1,6 +1,19 @@
 //! Per-session and connection-level activity tracking for tool server
 //! lifecycle status reporting.
 
+// A panic on a teardown path leaks whatever it was about to free; tests panic freely.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
+
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -295,7 +308,10 @@ impl ActivityTracker {
             seen_at_ms,
         });
 
-        let mut poll = self.scheduled_poll.lock().expect("scheduled_poll lock");
+        let mut poll = self
+            .scheduled_poll
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let changed =
             poll.as_ref().map(|p| p.next_fire_ms) != next.as_ref().map(|p| p.next_fire_ms);
         *poll = next;
@@ -312,7 +328,10 @@ impl ActivityTracker {
             return false;
         }
 
-        let poll = self.scheduled_poll.lock().expect("scheduled_poll lock");
+        let poll = self
+            .scheduled_poll
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(poll) = poll.as_ref() else {
             return false;
         };
@@ -387,7 +406,10 @@ impl ActivityTracker {
         // Gate and stamp under one lock: split across two atomics, a slow
         // older visible note racing a newer hidden one could pass the seq
         // check and stamp after the hidden note, re-arming the withhold.
-        let mut last_seq = self.last_presence_seq.lock().unwrap();
+        let mut last_seq = self
+            .last_presence_seq
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(seq) = seq {
             if *last_seq >= seq {
                 return;

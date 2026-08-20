@@ -256,7 +256,7 @@ impl MvpAgent {
         let auth_manager = self.auth_manager.clone();
         tokio::task::spawn_local(async move {
             let auth_key = auth_manager
-                .get_valid_token_background()
+                .get_valid_token()
                 .await
                 .ok()
                 .or_else(|| auth_manager.current_or_expired().map(|a| a.key));
@@ -647,10 +647,6 @@ impl MvpAgent {
                 self.cfg.borrow().is_trace_upload_enabled(),
                 std::sync::atomic::Ordering::Relaxed,
             );
-    }
-    /// Call after every `remote_settings` rewrite: the gate's readers hold no `Config`.
-    pub(super) fn apply_session_search_gate(&self) {
-        crate::config::apply_session_search_gate(&self.cfg.borrow());
     }
     /// Current client type as set by the most recent `initialize()` call.
     pub(crate) fn client_type(&self) -> ClientType {
@@ -1464,7 +1460,6 @@ impl MvpAgent {
             }
         }
         self.sync_collection_config_gate();
-        self.apply_session_search_gate();
         self.emit_settings_update_notification();
         self.emit_announcements(AnnouncementsPushMode::IfChanged);
         self.reconfigure_heap_profile_monitor();
@@ -1558,27 +1553,29 @@ impl MvpAgent {
         let live = self.auth_manager.current_or_expired().map(|a| a.user_id);
         self.otel_gate.resolve(&identity, outcome, live.as_deref())
     }
-    /// Fetch settings; on a `401` try one self-healing background refresh
-    /// and re-fetch if it yields a *different* token (recovers a 401 from a
-    /// token that expired mid-fetch). Recovery-driven, so background urgency
-    /// (see [`AuthManager::auth_background`]); a dark-wake deferral leaves
-    /// the `Rejected` outcome standing, which every caller tolerates. The
-    /// refresh is bounded by `STARTUP_AUTH_REFRESH_TIMEOUT` so a wedged IdP
-    /// can't hang the caller; on timeout or error the original `Rejected`
-    /// stands.
+    /// Fetch settings; on a `401` try one self-healing [`AuthManager::auth`]
+    /// refresh and re-fetch if it yields a *different* token (recovers a 401
+    /// from a token that expired mid-fetch). The caller waits at most
+    /// `STARTUP_AUTH_REFRESH_TIMEOUT`, but the refresh is spawned and runs to
+    /// completion past the deadline — dropping it mid-exchange could abandon
+    /// an IdP response carrying the rotated refresh token. On timeout or
+    /// error the original `Rejected` stands.
     async fn fetch_settings_self_healing_401(
         &self,
         auth: &crate::auth::GrokAuth,
     ) -> crate::remote::SettingsFetch {
         let outcome = self.fetch_settings(auth).await;
-        if matches!(outcome, crate::remote::SettingsFetch::Rejected)
-            && let Ok(Ok(fresh)) = tokio::time::timeout(
+        if matches!(outcome, crate::remote::SettingsFetch::Rejected) {
+            let manager = self.auth_manager.clone();
+            let attempt = tokio::spawn(async move { manager.auth().await });
+            if let Ok(Ok(Ok(fresh))) = tokio::time::timeout(
                     crate::http::STARTUP_AUTH_REFRESH_TIMEOUT,
-                    self.auth_manager.auth_background(),
+                    attempt,
                 )
                 .await && fresh.key != auth.key
-        {
-            return self.fetch_settings(&fresh).await;
+            {
+                return self.fetch_settings(&fresh).await;
+            }
         }
         outcome
     }
@@ -1627,6 +1624,9 @@ impl MvpAgent {
         let team_id = auth.team_id.clone();
         let remote_was_absent = self.cfg.borrow().remote_settings.is_none();
         let Some(settings) = self.fetch_settings_resolving_gate(auth).await else {
+            if remote_was_absent {
+                self.run_deferred_remote_work();
+            }
             return;
         };
         tracing::info!("post-auth settings refreshed");
@@ -1685,7 +1685,7 @@ impl MvpAgent {
         crate::auth::credential_provider::sync_external_otel_identity();
         self.on_remote_settings_changed();
         if remote_was_absent {
-            self.spawn_auto_worktree_gc();
+            self.run_deferred_remote_work();
         }
     }
     /// Refresh remote settings settings and re-resolve eagerly-resolved config fields.
@@ -1712,7 +1712,6 @@ impl MvpAgent {
             cfg.re_resolve_runtime_fields(&raw_config);
         }
         self.sync_collection_config_gate();
-        self.apply_session_search_gate();
         self.emit_settings_update_notification();
         self.emit_announcements(AnnouncementsPushMode::Force);
         self.reconfigure_heap_profile_monitor();
@@ -1753,15 +1752,20 @@ impl MvpAgent {
                 async move {
                     let auth_result = tokio::time::timeout(
                             crate::http::STARTUP_FETCH_TIMEOUT,
-                            auth_manager.auth_background(),
+                            auth_manager.auth(),
                         )
                         .await;
+                    let mut deferred_to_sibling = false;
                     if let Ok(Ok(auth)) = auth_result {
                         let agent = agent_ref.get();
                         if agent.post_auth_settings_in_flight.get() {
-                            return;
+                            deferred_to_sibling = true;
+                        } else {
+                            agent.refresh_settings_and_reapply(&auth).await;
                         }
-                        agent.refresh_settings_and_reapply(&auth).await;
+                    }
+                    if !deferred_to_sibling {
+                        agent_ref.get().run_deferred_remote_work();
                     }
                 },
             );
@@ -1837,7 +1841,7 @@ impl MvpAgent {
     /// announcements-only apply. Every failure path is a silent skip — the
     /// next tick retries.
     async fn fetch_and_store_polled_announcements(&self) {
-        let Ok(auth) = self.auth_manager.auth_background().await else {
+        let Ok(auth) = self.auth_manager.auth().await else {
             tracing::debug!("announcements refresh skipped: not authenticated");
             return;
         };
@@ -2330,8 +2334,7 @@ impl MvpAgent {
             return WebFetchConfig::Disabled;
         }
         let remote = cfg.remote_settings.as_ref();
-        let enabled = cfg.resolve_web_fetch();
-        if !enabled.value {
+        if !cfg.is_feature_enabled(crate::agent::config::Feature::WebFetch) {
             return WebFetchConfig::Disabled;
         }
         let context_window = Some(self.sampling_config.borrow().context_window);
@@ -2467,6 +2470,7 @@ impl MvpAgent {
             codebase_indexes: Arc::new(
                 parking_lot::Mutex::new(CodebaseIndexManager::new()),
             ),
+            search_index: crate::session::storage::search::SharedSearchIndex::default(),
             worktree_type,
             restore_code,
             session_registry_local,
@@ -2486,6 +2490,7 @@ impl MvpAgent {
             post_unblock_jwt_retry_in_flight: Arc::new(
                 std::sync::atomic::AtomicBool::new(false),
             ),
+            tier_recheck_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             workspace_ops: RefCell::new(None),
             #[cfg(all(feature = "local-workspace", unix))]
             local_workspace_supervisors: Rc::new(RefCell::new(HashMap::new())),
@@ -2518,7 +2523,11 @@ impl MvpAgent {
             #[cfg(test)]
             settings_reapply_spawn_count: std::cell::Cell::new(0),
             #[cfg(test)]
+            auto_gc_spawn_count: std::cell::Cell::new(0),
+            #[cfg(test)]
             post_auth_settings_spawn_count: std::cell::Cell::new(0),
+            #[cfg(test)]
+            tier_recheck_run_count: std::cell::Cell::new(0),
         };
         instance
             .auth_manager
@@ -2622,6 +2631,9 @@ impl MvpAgent {
                 continue;
             }
             if busy {
+                if let Some(handle) = self.resident_handle(&id) {
+                    handle.set_status_line_wanted(false);
+                }
                 self.set_session_live_state(&id, SessionLiveState::Working);
                 kept_resident += 1;
                 tracing::info!(
@@ -3897,6 +3909,42 @@ impl MvpAgent {
         }
         resolved
     }
+    /// Whether the requesting client will draw a status row. Session `_meta`
+    /// first, for the same reason as [`Self::resolve_client_io_caps`]: `init`
+    /// holds whichever client started the process, and a leader multiplexes many.
+    pub(super) fn resolve_status_line_capability(
+        meta: Option<&acp::Meta>,
+        init: &acp::InitializeRequest,
+    ) -> bool {
+        meta.and_then(|m| m.get(xai_grok_status_line::CLIENT_STATUS_LINE_META))
+            .or_else(|| {
+                init
+                    .client_capabilities
+                    .meta
+                    .as_ref()
+                    .and_then(|m| m.get(xai_grok_status_line::STATUS_LINE_CAPABILITY))
+            })
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+    /// Switch the row on for the resident actor an attach reuses and ask it to
+    /// fill it. The store precedes the request because the emitter re-reads the
+    /// capability when the wake lands.
+    pub(super) fn attach_status_line(
+        &self,
+        session_id: &acp::SessionId,
+        meta: Option<&acp::Meta>,
+        init: &acp::InitializeRequest,
+    ) {
+        let Some(handle) = self.resident_handle(session_id) else {
+            return;
+        };
+        let wanted = Self::resolve_status_line_capability(meta, init);
+        handle.set_status_line_wanted(wanted);
+        if wanted {
+            handle.request_status_snapshot();
+        }
+    }
     /// Extract per-client terminal/fs capabilities from request `_meta`
     /// (injected by the leader). Falls back to the shared `init` OnceCell.
     pub(super) fn resolve_client_io_caps(
@@ -4091,7 +4139,7 @@ impl MvpAgent {
                     .unwrap_or(false));
         let (feedback_resolved, feedback_flags) = {
             let cfg = self.cfg.borrow();
-            let resolved = cfg.resolve_feedback();
+            let resolved = cfg.feature(crate::agent::config::Feature::Feedback);
             let flags = crate::session::feedback_manager::FeedbackFlags {
                 enabled: resolved.value,
                 user: cfg.feedback.user.clone(),
@@ -4171,7 +4219,10 @@ impl MvpAgent {
         );
         tool_ctx.monitor_event_buffer = Some(self.monitor_event_buffer.clone());
         tool_ctx.subagent_depth = 0;
-        tool_ctx.auto_wake_enabled = self.cfg.borrow().auto_wake_enabled;
+        tool_ctx.auto_wake_enabled = self
+            .cfg
+            .borrow()
+            .is_feature_enabled(crate::agent::config::Feature::AutoWake);
         let support_permission = self.cfg.borrow().features.support_permission;
         let telemetry_enabled = self.product_analytics_enabled();
         let origin_client = self.origin_client_info_from_meta(init.meta.as_ref());
@@ -4210,7 +4261,7 @@ impl MvpAgent {
         let compaction_verbatim_input = self
             .cfg
             .borrow()
-            .resolve_compaction_verbatim_input();
+            .is_feature_enabled(crate::agent::config::Feature::CompactionVerbatimInput);
         let compaction_tool_choice = self.cfg.borrow().resolve_compaction_tool_choice();
         let two_pass_enabled = self.cfg.borrow().is_two_pass_compaction_enabled();
         let auto_update = self.cfg.borrow().cli.auto_update;
@@ -4328,7 +4379,10 @@ impl MvpAgent {
                 agent_definition.override_file_tools(file_tools);
             }
         }
-        let lsp_tools_enabled = self.cfg.borrow().resolve_lsp_tools().value;
+        let lsp_tools_enabled = self
+            .cfg
+            .borrow()
+            .is_feature_enabled(crate::agent::config::Feature::LspTools);
         if lsp_tools_enabled && tool_ctx.lsp.is_none() {
             let snapshot = self.plugin_registry_handle.snapshot();
             let active: Vec<_> = snapshot
@@ -4413,7 +4467,10 @@ impl MvpAgent {
         let video_gen_config = self.prepare_video_gen_config();
         let app_builder_deployer_config = self.prepare_app_builder_deployer_config();
         let web_fetch_config = self.prepare_web_fetch_config();
-        let write_file_enabled = self.cfg.borrow().resolve_write_file().value;
+        let write_file_enabled = self
+            .cfg
+            .borrow()
+            .is_feature_enabled(crate::agent::config::Feature::WriteFile);
         let goal_enabled = self.cfg.borrow().resolve_goal().value;
         let background_workflows_enabled = self.cfg.borrow().resolve_workflows().value;
         let subagents_enabled = self.cfg.borrow().subagents_enabled;
@@ -4422,10 +4479,16 @@ impl MvpAgent {
             .cfg
             .borrow()
             .workflow_max_concurrent_agents;
+        let media_gen_batch_limits = self.cfg.borrow().media_gen_batch_limits;
         let ask_user_question_enabled = crate::upload::turn::parse_ask_user_question_from_meta(
                 session_meta,
             )
-            .unwrap_or_else(|| self.cfg.borrow().resolve_ask_user_question().value);
+            .unwrap_or_else(|| {
+                self
+                    .cfg
+                    .borrow()
+                    .is_feature_enabled(crate::agent::config::Feature::AskUserQuestion)
+            });
         let client_hooks = crate::extensions::hooks::parse_client_hooks(session_meta);
         let disable_web_search = self.cfg.borrow().disable_web_search;
         let todo_gate = self.cfg.borrow().todo_gate;
@@ -4464,10 +4527,10 @@ impl MvpAgent {
             bash: Some(bash_params_json),
             ask_user_question: ask_user_question_params_json,
         };
-        let backend_tools_enabled = {
-            let cfg = self.cfg.borrow();
-            cfg.resolve_backend_tools().value
-        };
+        let backend_tools_enabled = self
+            .cfg
+            .borrow()
+            .is_feature_enabled(crate::agent::config::Feature::BackendTools);
         let managed_mcp_proxy_url = self.cfg.borrow().endpoints.proxy_url();
         let init_meta = self
             .initialize_request
@@ -4578,6 +4641,11 @@ impl MvpAgent {
                 .as_ref()
                 .and_then(|m| m.get("x.ai/gitHeadChanged"))
                 .and_then(|v| v.as_bool());
+            let status_line_enabled = std::sync::Arc::new(
+                std::sync::atomic::AtomicBool::new(
+                    Self::resolve_status_line_capability(session_meta, init),
+                ),
+            );
             let session_cwd = std::path::Path::new(&session_info.cwd);
             let fs_watch_caps = crate::session::fs_watch::FsWatchCapabilities::resolve(crate::session::fs_watch::CapabilityInputs {
                 client_notify: fs_notify_config.is_some(),
@@ -4623,6 +4691,7 @@ impl MvpAgent {
                     self.codebase_indexes.clone(),
                     client_code_nav_enabled,
                     fs_watch_caps,
+                    status_line_enabled,
                     feedback_proxy_url,
                     feedback_user_token,
                     feedback_alpha_test_key,
@@ -4663,6 +4732,7 @@ impl MvpAgent {
                     subagents_enabled,
                     subagents_max_depth,
                     workflow_max_concurrent_agents,
+                    media_gen_batch_limits,
                     ask_user_question_enabled,
                     client_hooks,
                     prompt_display_cwd,
