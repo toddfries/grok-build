@@ -612,6 +612,7 @@ struct SettingsUpdateNotification {
     gate_url: Option<String>,
     gate_label: Option<String>,
     allow_access: Option<bool>,
+    consent_gate: Option<crate::util::config::ConsentGate>,
     subscription_tier_display: Option<String>,
     auto_permission_mode_enabled: Option<bool>,
     /// Soft-default permission mode for the pager (post-auth / `/new` refresh).
@@ -858,6 +859,9 @@ pub struct MvpAgent {
     /// LEADER-SAFE(shared): agent-level code-nav index manager, keyed by cwd,
     /// no per-client state.
     codebase_indexes: Arc<parking_lot::Mutex<CodebaseIndexManager>>,
+    /// LEADER-SAFE(init-once): one index for the process. Empty until
+    /// [`MvpAgent::start_search_index_once`] decides, so reading cannot decide.
+    search_index: crate::session::storage::search::SharedSearchIndex,
     /// Worktree creation type (resolved: local config > remote > default Linked).
     pub(crate) worktree_type: crate::util::config::WorktreeType,
     /// Restore codebase state on worktree resume (resolved: local config > remote > default false).
@@ -938,6 +942,13 @@ pub struct MvpAgent {
     /// Cleared by [`PostUnblockJwtRetryInFlightGuard`] on task exit (including
     /// panic/abort), not only on the normal post-backoff path.
     post_unblock_jwt_retry_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    /// Single-flight claim for [`MvpAgent::retry_subscription_check`] — the
+    /// tier re-check work itself, so the detached initialize re-check, the
+    /// awaited authenticate-path checks, and the pager's 5s poll can never
+    /// run it concurrently (a second concurrent check would double IdP/HTTP
+    /// traffic for the same verdict and race the gate writes). Cleared by
+    /// [`TierRecheckInFlightGuard`] on exit (including panic/abort).
+    tier_recheck_in_flight: Arc<std::sync::atomic::AtomicBool>,
     /// Local workspace ops, built lazily via [`Self::ensure_local_workspace_ops`].
     /// The agent never opens Computer Hub as a harness/client; remote cloud
     /// sandboxes are gateway-owned (`gateway_bridge` / `computer_sessions`).
@@ -1014,10 +1025,17 @@ pub struct MvpAgent {
     /// in-flight guard.
     #[cfg(test)]
     settings_reapply_spawn_count: std::cell::Cell<usize>,
+    /// Test-only: counts auto-GC runs spawned past the settled guard.
+    #[cfg(test)]
+    auto_gc_spawn_count: std::cell::Cell<usize>,
     /// Test-only: counts `spawn_post_auth_settings` tasks spawned past its
     /// own guard.
     #[cfg(test)]
     post_auth_settings_spawn_count: std::cell::Cell<usize>,
+    /// Test-only: counts tier re-checks that claimed the single-flight flag
+    /// (i.e. `retry_subscription_check` bodies that actually ran).
+    #[cfg(test)]
+    tier_recheck_run_count: std::cell::Cell<usize>,
 }
 /// Spawn a thread to warm the shared async HTTP client (`OnceLock`-cached).
 /// Loading TLS root certs is ~95ms; doing it here avoids a cold-start hit
@@ -1661,13 +1679,27 @@ impl MvpAgent {
     /// blocked on `/v1/models`. Without a matching claim, defers to
     /// `spawn_post_unblock_jwt_and_catalog_retry`.
     pub(crate) async fn retry_subscription_check(&self) {
+        use std::sync::atomic::Ordering;
+        if self
+            .tier_recheck_in_flight
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            tracing::debug!("tier re-check already in flight, skipping duplicate check");
+            return;
+        }
+        let _in_flight_guard = TierRecheckInFlightGuard {
+            flag: self.tier_recheck_in_flight.clone(),
+        };
+        #[cfg(test)]
+        self.tier_recheck_run_count.set(self.tier_recheck_run_count.get() + 1);
         let (proxy_base_url, alpha_test_key) = {
             let cfg = self.cfg.borrow();
             (cfg.endpoints.proxy_url(), cfg.endpoints.alpha_test_key.clone())
         };
         let user_id = self
             .auth_manager
-            .current()
+            .current_or_expired()
             .map(|a| a.user_id.clone())
             .unwrap_or_default();
         let result = super::subscription_check::single_check(
@@ -1677,6 +1709,13 @@ impl MvpAgent {
                 &user_id,
             )
             .await;
+        let canonical_user_id = result
+            .as_ref()
+            .map(|u| u.canonical_user_id.clone())
+            .filter(|c| !c.is_empty());
+        if self.tier_recheck_identity_changed(&user_id, canonical_user_id.as_deref()) {
+            return;
+        }
         if let Some(unblocked) = result {
             tracing::info!(
                 new_tier = %unblocked.new_tier,
@@ -1697,10 +1736,22 @@ impl MvpAgent {
                 && let Some(auth) = self.auth_manager.current()
                 && let Some(settings) = self.fetch_settings_resolving_gate(&auth).await
             {
+                if self
+                    .tier_recheck_identity_changed(
+                        &user_id,
+                        canonical_user_id.as_deref(),
+                    )
+                {
+                    return;
+                }
                 self.install_remote_settings(settings);
                 if remote_was_absent {
-                    self.spawn_auto_worktree_gc();
+                    self.run_deferred_remote_work();
                 }
+            }
+            if self.tier_recheck_identity_changed(&user_id, canonical_user_id.as_deref())
+            {
+                return;
             }
             if crate::util::config::resolve_remote_fetch_enabled()
                 && !settings_allow_access(self.cfg.borrow().remote_settings.as_ref())
@@ -1721,41 +1772,67 @@ impl MvpAgent {
                 );
                 return;
             }
-            self.tier_allowed.set(true);
-            let refresh_ok = match self
+            let claim_already_current = self
                 .auth_manager
-                .refresh_chain(
-                    crate::auth::token_type::TokenType::OidcSession,
-                    crate::auth::manager::RefreshReason::ServerRejected,
-                    crate::auth::manager::RefreshUrgency::UserFacing,
-                )
-                .await
-            {
-                Ok(_) => {
-                    tracing::info!("post-unblock: JWT refresh_chain succeeded");
-                    xai_grok_telemetry::unified_log::info(
-                        "paywall_check_jwt_refreshed",
-                        None,
-                        Some(serde_json::json!({ "user_id": user_id })),
-                    );
-                    true
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "post-unblock: JWT refresh failed, user may need to re-login on next restart");
-                    xai_grok_telemetry::unified_log::warn(
-                        "paywall_check_error",
-                        None,
-                        Some(
-                            serde_json::json!({
-                            "user_id": user_id,
-                            "kind": "post_unblock_refresh_failed",
-                            "detail": e.to_string(),
-                        }),
-                        ),
-                    );
-                    false
-                }
+                .current_or_expired()
+                .and_then(|auth| jwt_tier_claim(&auth.key))
+                .is_some_and(|claim| jwt_claim_matches_user_subscription_tier(
+                    &claim,
+                    &unblocked.new_tier,
+                ));
+            let refresh_ok = if claim_already_current {
+                true
+            } else if unblocked.refresh_deadline_hit {
+                tracing::info!(
+                    "post-unblock: skipping forced mint, single_check's bounded refresh still in flight"
+                );
+                xai_grok_telemetry::unified_log::info(
+                    "paywall_check_skip_redundant_mint",
+                    None,
+                    Some(serde_json::json!({ "user_id": user_id })),
+                );
+                false
+            } else {
+                match self
+                        .auth_manager
+                        .refresh_chain_bounded(
+                            crate::auth::token_type::TokenType::OidcSession,
+                            crate::auth::manager::RefreshReason::ServerRejected,
+                            crate::auth::manager::BEST_EFFORT_REFRESH_TIMEOUT,
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            tracing::info!("post-unblock: JWT refresh_chain succeeded");
+                            xai_grok_telemetry::unified_log::info(
+                                "paywall_check_jwt_refreshed",
+                                None,
+                                Some(serde_json::json!({ "user_id": user_id })),
+                            );
+                            true
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "post-unblock: JWT refresh failed, user may need to re-login on next restart");
+                            xai_grok_telemetry::unified_log::warn(
+                                "paywall_check_error",
+                                None,
+                                Some(
+                                    serde_json::json!({
+                                "user_id": user_id,
+                                "kind": "post_unblock_refresh_failed",
+                                "detail": e.to_string(),
+                            }),
+                                ),
+                            );
+                            false
+                        }
+                    }
             };
+            if self.tier_recheck_identity_changed(&user_id, canonical_user_id.as_deref())
+            {
+                return;
+            }
+            self.tier_allowed.set(true);
             let jwt_claim = self
                 .auth_manager
                 .current_or_expired()
@@ -1877,26 +1954,92 @@ impl MvpAgent {
             return;
         }
         let Some(auth) = self.auth_manager.current() else {
+            self.run_deferred_remote_work();
             return;
         };
         let Some(settings) = self.fetch_settings_resolving_gate(&auth).await else {
+            self.run_deferred_remote_work();
             return;
         };
         tracing::info!("post-auth remote_settings fetch succeeded");
         self.install_remote_settings(settings);
+        self.run_deferred_remote_work();
+    }
+    /// Remote settings are on the config, or they are never coming.
+    pub(super) fn remote_settings_settled(&self) -> bool {
+        let arrived = self.cfg.borrow().remote_settings.is_some();
+        arrived || !crate::util::config::resolve_remote_fetch_enabled()
+    }
+    /// The two switches `initialize` defers, which share no precondition:
+    /// auto-GC guards itself, the index decides on whatever has arrived.
+    pub(super) fn run_deferred_remote_work(&self) {
         self.spawn_auto_worktree_gc();
+        self.start_search_index_once();
+    }
+    /// Settles whether this process keeps an index. Touches no disk until
+    /// something bootstraps it.
+    fn decide_search_index(&self) {
+        self.search_index
+            .decide(|| {
+                crate::session::storage::search::start_if_enabled(&self.cfg.borrow())
+                    .started()
+                    .map(Arc::new)
+            });
+    }
+    /// Decides, then bootstraps. The first decision is kept: a later switch would
+    /// serve an index missing everything written meanwhile.
+    pub(super) fn start_search_index_once(&self) {
+        self.decide_search_index();
+        if let crate::session::storage::search::IndexDecision::On(index) = self
+            .search_index()
+        {
+            index.bootstrap_once(crate::util::grok_home::grok_home());
+        }
+    }
+    pub(crate) fn search_index(
+        &self,
+    ) -> crate::session::storage::search::IndexDecision<'_> {
+        self.search_index.decision()
+    }
+    /// For code that cannot borrow the agent, notably the persistence actor.
+    pub(crate) fn search_index_cell(
+        &self,
+    ) -> crate::session::storage::search::SharedSearchIndex {
+        self.search_index.clone()
     }
     /// Resolve current auto-GC policy and run it on the blocking pool.
     pub(super) fn spawn_auto_worktree_gc(&self) {
+        if !self.remote_settings_settled() {
+            static DEFERRED_ONCE: std::sync::Once = std::sync::Once::new();
+            DEFERRED_ONCE
+                .call_once(|| {
+                    tracing::info!(
+                    "worktree auto cleanup is waiting for the server to answer, and will not run \
+                     until it does or until remote_fetch is set to false"
+                );
+                });
+            return;
+        }
+        #[cfg(test)] self.auto_gc_spawn_count.set(self.auto_gc_spawn_count.get() + 1);
         let auto_gc_policy = self.cfg.borrow().resolve_worktree_auto_gc();
-        tokio::task::spawn_blocking(move || {
-            let opts = xai_fast_worktree::AutoGcOptions::from_resolved(auto_gc_policy);
-            if let Err(e) = xai_fast_worktree::WorktreeDb::open_default()
-                .and_then(|db| xai_fast_worktree::maybe_auto_gc(&db, &opts))
-            {
-                tracing::warn!(error = %e, "auto worktree gc failed");
-            }
-        });
+        let grok_home = xai_fast_worktree::resolve_grok_home();
+        tokio::task::spawn_blocking(move || Self::reclaim_worktrees(
+            grok_home,
+            auto_gc_policy,
+        ));
+    }
+    /// The caller resolves the home: read here, $GROK_HOME would be read when the
+    /// blocking thread starts, and this deletes worktrees under what it finds.
+    pub(super) fn reclaim_worktrees(
+        grok_home: anyhow::Result<std::path::PathBuf>,
+        policy: xai_fast_worktree::ResolvedWorktreeAutoGc,
+    ) {
+        if let Err(e) = grok_home
+            .and_then(|home| xai_fast_worktree::WorktreeDb::open(&home))
+            .and_then(|db| xai_fast_worktree::maybe_auto_gc(&db, &policy))
+        {
+            tracing::warn!(error = %e, "auto worktree gc failed");
+        }
     }
     /// Fire-and-forget `x.ai/settings/update` from the current remote snapshot.
     pub(super) fn emit_settings_update_notification(&self) {
@@ -1918,6 +2061,7 @@ impl MvpAgent {
                 gate_url: rs.and_then(|s| s.gate_url.clone()),
                 gate_label: rs.and_then(|s| s.gate_label.clone()),
                 allow_access: rs.and_then(|s| s.allow_access),
+                consent_gate: rs.and_then(|s| s.consent_gate.clone()),
                 subscription_tier_display: rs
                     .and_then(|s| s.subscription_tier_display.clone()),
                 auto_permission_mode_enabled: crate::util::config::remote_auto_mode_enabled(
@@ -1997,6 +2141,71 @@ impl MvpAgent {
                     registry,
                 });
         }
+    }
+    /// True when the live credential no longer belongs to the identity a
+    /// tier re-check started with. Every post-await write in
+    /// [`Self::retry_subscription_check`] runs behind this, so a detached
+    /// check that outlives an account switch discards its result instead of
+    /// gating/ungating the successor identity.
+    ///
+    /// `canonical_user_id` is the `/user` `userId` the check itself resolved
+    /// with the live bearer (see `UnblockResult`): the check's own mint
+    /// spawns a `/user` enrichment that can rewrite a seeded/stale user_id
+    /// to that canonical value mid-check, and that normalization is the same
+    /// account, not a switch. A real switch matches neither id.
+    fn tier_recheck_identity_changed(
+        &self,
+        started_user_id: &str,
+        canonical_user_id: Option<&str>,
+    ) -> bool {
+        let live = self.auth_manager.current_or_expired().map(|a| a.user_id);
+        if live.as_deref() == Some(started_user_id) {
+            return false;
+        }
+        if let Some(canonical) = canonical_user_id.filter(|c| !c.is_empty())
+            && live.as_deref() == Some(canonical)
+        {
+            return false;
+        }
+        xai_grok_telemetry::unified_log::info(
+            "tier re-check identity changed, discarding result",
+            None,
+            Some(
+                serde_json::json!({
+                "started_user_id": started_user_id,
+                "canonical_user_id": canonical_user_id,
+                "live_user_id": live,
+            }),
+            ),
+        );
+        true
+    }
+    /// Background the reconnect tier re-check so a gated initialize answers
+    /// immediately: the re-check can block for tens of seconds on the
+    /// subscription endpoint plus a refresh, and the pager already polls
+    /// "Check subscription" every 5s while the paywall shows, so a background
+    /// lift lands within one poll. No outer timeout: every await inside is
+    /// bounded (HTTP, bounded refresh), and a drop-at-deadline would abandon
+    /// an in-flight IdP exchange. Deduplication lives on the work itself —
+    /// `retry_subscription_check` claims `tier_recheck_in_flight` — so this
+    /// spawn, the awaited authenticate-path checks, and the pager's poll can
+    /// never run the re-check concurrently.
+    ///
+    /// Two deliberate user-visible consequences (also documented in
+    /// AUTH.md § "Reconnect tier re-check"): a subscribed user with a stale
+    /// cached verdict can see a paywall flash on reconnect that the detached
+    /// check clears within one poll, and the gate lift can land up to the
+    /// bounded refresh budget (`BEST_EFFORT_REFRESH_TIMEOUT`, 20s) later
+    /// than the pre-detached behavior because `tier_allowed` is set only
+    /// after that refresh returns and is identity-revalidated.
+    pub(super) fn spawn_tier_recheck(&self) {
+        let agent_ref = LocalRef::new(self);
+        tokio::task::spawn_local(async move {
+            let Some(auth) = agent_ref.get().auth_manager.current() else {
+                return;
+            };
+            agent_ref.get().enforce_grok_code_access(&auth).await;
+        });
     }
     /// Spawn a best-effort bundle sync. Re-fires on every call site (init,
     /// cached_token, grok.com/oidc); the cheap pre-checks below absorb repeats
@@ -2319,11 +2528,24 @@ impl Drop for PostUnblockJwtRetryInFlightGuard {
         self.flag.store(false, std::sync::atomic::Ordering::Release);
     }
 }
+/// Clears [`MvpAgent::tier_recheck_in_flight`] on scope exit — completion,
+/// early identity-changed bail, cancel/abort, or panic — so the single-flight
+/// flag cannot wedge `true` for the rest of the process.
+struct TierRecheckInFlightGuard {
+    flag: Arc<std::sync::atomic::AtomicBool>,
+}
+impl Drop for TierRecheckInFlightGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
 /// Background retry when post-unblock JWT lacks a tier claim that matches
-/// the live `/user` tier. Re-attempts `refresh_chain` and only treats an
-/// attempt as success when [`jwt_claim_matches_user_subscription_tier`]
-/// holds (bare refresh Ok, free token, or a *stale older* paid claim are
-/// all misses). Then refreshes the model catalog.
+/// the live `/user` tier. Each attempt first re-checks the current JWT (the
+/// bounded refresh's detached mint may have landed a matching claim already)
+/// and only then re-attempts `refresh_chain`; an attempt succeeds only when
+/// [`jwt_claim_matches_user_subscription_tier`] holds (bare refresh Ok, free
+/// token, or a *stale older* paid claim are all misses). Then refreshes the
+/// model catalog.
 ///
 /// Gate lift already happened; this only recovers the tier-targeted catalog.
 ///
@@ -2368,11 +2590,22 @@ fn spawn_post_unblock_jwt_and_catalog_retry(
                     let auth_manager = auth_manager.clone();
                     let new_tier = new_tier.clone();
                     async move {
+                        let pre_refresh_claim = auth_manager
+                            .current_or_expired()
+                            .and_then(|auth| jwt_tier_claim(&auth.key));
+                        let already_current = pre_refresh_claim
+                            .as_ref()
+                            .is_some_and(|claim| jwt_claim_matches_user_subscription_tier(
+                                claim,
+                                &new_tier,
+                            ));
+                        if already_current {
+                            return Ok(());
+                        }
                         let refresh_result = auth_manager
                             .refresh_chain(
                                 crate::auth::token_type::TokenType::OidcSession,
                                 crate::auth::manager::RefreshReason::ServerRejected,
-                                crate::auth::manager::RefreshUrgency::Background,
                             )
                             .await;
                         let jwt_claim = auth_manager

@@ -235,7 +235,7 @@ impl AuthProvider for LeaderAuthProvider {
                 let am = Arc::clone(&self.auth_manager);
                 handle.spawn(async move {
                     let _guard = guard;
-                    if let Err(e) = am.auth_background().await {
+                    if let Err(e) = am.auth().await {
                         tracing::debug!(error = %e, "leader hub auth: background refresh failed");
                     }
                 });
@@ -683,6 +683,10 @@ fn inject_session_request_context(
         && !has_model
         && client_type.is_empty()
         && !capabilities.code_nav_enabled
+        && !capabilities.terminal
+        && !capabilities.fs_read
+        && !capabilities.fs_write
+        && !capabilities.status_line
     {
         return false;
     }
@@ -750,6 +754,10 @@ fn inject_session_request_context(
             meta_obj.insert(
                 "clientFsWrite".to_string(),
                 serde_json::json!(capabilities.fs_write),
+            );
+            meta_obj.insert(
+                xai_grok_status_line::CLIENT_STATUS_LINE_META.to_string(),
+                serde_json::json!(capabilities.status_line),
             );
         }
     }

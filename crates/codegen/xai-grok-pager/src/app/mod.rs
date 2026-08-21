@@ -15,6 +15,7 @@ pub mod agent_view;
 pub mod app_view;
 pub mod bundle;
 pub mod cli;
+pub mod consent;
 pub use crate::link_opener;
 /// Off-thread full-file syntax highlight upgrade for edit diffs.
 pub mod edit_highlight_worker;
@@ -22,6 +23,7 @@ pub mod edit_highlight_worker;
 pub mod mermaid_worker;
 pub use xai_prompt_queue as prompt_queue;
 mod acp_handler;
+mod connect_timeout;
 mod csi_filter;
 mod dispatch;
 /// Display-refresh probe + motion cadence + terminal telemetry at startup.
@@ -32,6 +34,8 @@ pub mod roster;
 pub mod session_startup;
 pub(crate) mod session_title_resolve;
 pub mod status_blocks;
+pub(crate) mod status_line;
+mod status_line_policy;
 pub mod subagent;
 pub mod subscription;
 pub(crate) use effects::sanitize_user_error;
@@ -198,44 +202,36 @@ pub(crate) fn voice_keybind_enabled() -> bool {
 pub fn set_voice_keybind_enabled_for_test(on: bool) {
     VOICE_KEYBIND_ENABLED.store(on, Ordering::Release);
 }
+fn voice_mode_in(layer: &toml::Value) -> Option<bool> {
+    layer
+        .get("features")?
+        .get(xai_grok_shell::agent::config::Feature::VoiceMode.key())?
+        .as_bool()
+}
 /// `[features] voice_mode` from merged `requirements.toml`.
 pub(crate) fn voice_mode_requirement_pin() -> Option<bool> {
-    xai_grok_config::load_merged_requirements().and_then(|req| {
-        req.get("features")
-            .and_then(|f| f.get("voice_mode"))
-            .and_then(|v| v.as_bool())
-    })
+    voice_mode_in(&xai_grok_config::load_merged_requirements()?)
 }
 /// `[features] voice_mode` from effective config (user + managed).
 pub(crate) fn voice_mode_config_value() -> Option<bool> {
-    xai_grok_shell::config::load_effective_config()
-        .ok()
-        .and_then(|cfg| {
-            cfg.get("features")
-                .and_then(|f| f.get("voice_mode"))
-                .and_then(|v| v.as_bool())
-        })
+    voice_mode_in(&xai_grok_shell::config::load_effective_config().ok()?)
 }
-/// Resolve voice availability.
-///
-/// Precedence: requirements > `GROK_VOICE_MODE` > config/managed
-/// `[features] voice_mode` > remote `voice_mode_enabled` > default on.
-///
-/// When `is_api_key` and the only off-source is remote, force on. Requirement /
-/// env / config `false` still wins.
+/// The registry owns the precedence and the default. One rule has no row there:
+/// with `is_api_key`, a remote-only off is forced back on. A requirement, env,
+/// or config `false` still wins.
 pub(crate) fn resolve_voice_mode_enabled(
     requirement: Option<bool>,
     config: Option<bool>,
     remote: Option<bool>,
     is_api_key: bool,
 ) -> bool {
-    use xai_grok_shell::agent::config::{BoolFlag, ConfigSource};
-    let resolved = BoolFlag::env("GROK_VOICE_MODE")
-        .requirement(requirement)
-        .config(config)
-        .feature_flag(remote)
-        .default(true)
-        .resolve();
+    use xai_grok_shell::agent::config::{ConfigSource, Feature, FeatureSources};
+    let resolved = Feature::VoiceMode.resolve(FeatureSources {
+        pin: requirement,
+        config,
+        remote,
+        ..FeatureSources::from_process_env(Feature::VoiceMode)
+    });
     if resolved.value {
         return true;
     }
@@ -566,7 +562,7 @@ async fn bounded_connect(
         target,
         attempt,
         version: xai_grok_version::display_version_with_commit(
-            env!("VERSION_WITH_COMMIT"),
+            xai_grok_version::full_version(),
             xai_grok_update::channel_label(),
         ),
         log_path: xai_grok_telemetry::unified_log::path(),
@@ -797,7 +793,7 @@ pub async fn run(
         args.permission_mode_flag.as_deref(),
         remote_permission_mode,
     );
-    let connect_flags = crate::acp::ConnectFlags {
+    let mut connect_flags = crate::acp::ConnectFlags {
         subagents: !args.no_subagents,
         memory_enabled_override: args.memory_enabled_override(),
         memory_override_flag: args.memory_override_flag(),
@@ -824,6 +820,7 @@ pub async fn run(
         ),
         default_yolo_mode: launch_yolo.yolo,
         default_auto_mode: launch_auto && !launch_yolo.yolo,
+        status_line: false,
     };
     let mut config_watcher = crate::appearance::ConfigWatcher::start().await?;
     let alt_screen_config_mode = config_watcher.current().alt_screen;
@@ -856,6 +853,10 @@ pub async fn run(
         Ordering::Release,
     );
     let minimal = screen_mode.is_minimal();
+    connect_flags.status_line = status_line::draws_a_row(
+        screen_mode,
+        &event_loop::load_initial_ui_config().status_line,
+    );
     let relaunched_into_minimal = screen_mode_override == Some(ScreenMode::Minimal);
     let relaunched_into_fullscreen = screen_mode_override == Some(ScreenMode::Fullscreen);
     tracing::info!(
@@ -902,7 +903,17 @@ pub async fn run(
     if let Some(ref t) = session_title {
         set_terminal_title(t);
     }
-    const CONNECT_UI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    let connect_ui_timeout_env = std::env::var(connect_timeout::CONNECT_UI_TIMEOUT_ENV).ok();
+    let connect_ui_timeout = connect_timeout::resolve(connect_ui_timeout_env.as_deref());
+    if let Some(raw) = connect_ui_timeout_env {
+        crate::unified_log::write_direct_info(
+            "startup connect budget from env",
+            Some(serde_json::json!({
+                "raw": raw,
+                "timeout_secs": connect_ui_timeout.as_secs(),
+            })),
+        );
+    }
     let fallback_flags = use_leader.then(|| connect_flags.clone());
     let primary_target = if use_leader {
         crate::acp::AgentKind::Leader
@@ -912,7 +923,7 @@ pub async fn run(
     xai_grok_telemetry::external::init(
         xai_grok_shell::agent::config::resolve_external_otel_config(
             xai_grok_telemetry::external::config::ExternalClientInfo {
-                service_version: env!("VERSION_WITH_COMMIT").to_owned(),
+                service_version: xai_grok_version::full_version().to_owned(),
                 client_version: xai_grok_version::VERSION.to_owned(),
                 app_entrypoint: "tui".to_owned(),
             },
@@ -923,7 +934,7 @@ pub async fn run(
     let primary_started = std::time::Instant::now();
     let connect_result = bounded_connect(
         &cancel,
-        CONNECT_UI_TIMEOUT,
+        connect_ui_timeout,
         primary_target,
         startup_failure::ConnectAttempt::First,
         &timer,
@@ -945,7 +956,7 @@ pub async fn run(
             let target = crate::acp::AgentKind::Embedded;
             let fallback = bounded_connect(
                 &cancel,
-                CONNECT_UI_TIMEOUT,
+                connect_ui_timeout,
                 target,
                 startup_failure::ConnectAttempt::AfterFallback(startup_failure::EarlierAttempt {
                     target: primary_target,
@@ -1037,6 +1048,7 @@ pub async fn run(
     let restore_result = restore_terminal(terminal, writer_thread, screen_mode);
     drop(agent_guard);
     xai_tty_utils::global_process_scope().kill_all();
+    crate::app::status_line::metrics::global().report_health();
     if let Err(cleanup_error) = restore_result {
         match &result {
             Ok(_) => {

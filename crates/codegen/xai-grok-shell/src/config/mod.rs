@@ -293,49 +293,12 @@ impl SubagentsConfig {
     pub const ENV_MAX_CONCURRENT: &'static str = "GROK_MAX_CONCURRENT_SUBAGENTS";
     pub const ENV_LIMIT_BEHAVIOR: &'static str = "GROK_SUBAGENT_LIMIT_BEHAVIOR";
     pub const ENV_WORKFLOW_MAX_CONCURRENT: &'static str = "GROK_WORKFLOW_MAX_CONCURRENT_AGENTS";
-    /// Clamp to `1..`; a limit can be adjusted but never disabled.
-    fn clamp_count(value: i64, source: &str, name: &str) -> usize {
-        if value < 1 {
-            tracing::warn!(source, name, value, "subagent limit < 1; clamping to 1");
-            1
-        } else {
-            usize::try_from(value).unwrap_or(usize::MAX)
-        }
-    }
-    /// Precedence: env > TOML > remote > default; invalid layers warn and fall through.
-    fn resolve_count(
-        env_name: &str,
-        env: Option<&str>,
-        config: Option<i64>,
-        remote: Option<u32>,
-        default: usize,
-    ) -> usize {
-        if let Some(value) = env {
-            match xai_grok_tools::util::env::parse_positive(value.trim()) {
-                Some(parsed) => return usize::try_from(parsed).unwrap_or(usize::MAX),
-                None => {
-                    tracing::warn!(
-                        name = env_name,
-                        %value,
-                        "invalid env value (expected a positive whole number); ignoring"
-                    );
-                }
-            }
-        }
-        if let Some(v) = config {
-            return Self::clamp_count(v, "config", env_name);
-        }
-        if let Some(v) = remote {
-            return Self::clamp_count(i64::from(v), "remote", env_name);
-        }
-        default
-    }
     pub(crate) fn resolve_max_concurrent(
         env: Option<&str>,
         config: Option<i64>,
         remote: Option<u32>,
     ) -> usize {
-        Self::resolve_count(
+        resolve_positive_count(
             Self::ENV_MAX_CONCURRENT,
             env,
             config,
@@ -348,7 +311,7 @@ impl SubagentsConfig {
         config: Option<i64>,
         remote: Option<u32>,
     ) -> usize {
-        Self::resolve_count(
+        resolve_positive_count(
             Self::ENV_WORKFLOW_MAX_CONCURRENT,
             env,
             config,
@@ -658,6 +621,16 @@ impl ModelOverrideConfig {
         result
     }
 }
+/// Raw `[tools.media_gen]` counts; resolve via
+/// [`ToolsConfig::resolve_max_parallel_image_gen_calls`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct MediaGenToolsConfig {
+    #[serde(default)]
+    pub max_parallel_image_gen_calls: Option<i64>,
+    #[serde(default)]
+    pub max_parallel_video_gen_calls: Option<i64>,
+}
 /// Tool behavior configuration (`[tools]` in config.toml).
 ///
 /// Controls cross-cutting tool behavior such as `.gitignore` filtering.
@@ -665,6 +638,7 @@ impl ModelOverrideConfig {
 /// ```toml
 /// [tools]
 /// disable_zdr_incompatible_tools = true
+/// # [tools.media_gen] — see MediaGenToolsConfig
 /// # [tools.zdr_video_output_s3] — see ZdrVideoOutputS3Config
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -686,8 +660,11 @@ pub struct ToolsConfig {
     /// is `true`. Populated from `[tools.zdr_video_output_s3]` in config.
     pub zdr_video_output_s3:
         Option<xai_grok_tools::implementations::grok_build::video_gen::ZdrVideoOutputS3Config>,
+    pub media_gen: MediaGenToolsConfig,
 }
 impl ToolsConfig {
+    pub const ENV_MAX_PARALLEL_IMAGE_GEN_CALLS: &'static str = "GROK_MAX_PARALLEL_IMAGE_GEN_CALLS";
+    pub const ENV_MAX_PARALLEL_VIDEO_GEN_CALLS: &'static str = "GROK_MAX_PARALLEL_VIDEO_GEN_CALLS";
     /// Resolve the final tools config, in priority order:
     /// 1. Env vars `GROK_RESPECT_GITIGNORE` and
     ///    `GROK_DISABLE_ZDR_INCOMPATIBLE_TOOLS` (`0`/`false` off,
@@ -732,6 +709,16 @@ impl ToolsConfig {
                         None
                     }
                 }),
+            media_gen: MediaGenToolsConfig {
+                max_parallel_image_gen_calls: tools
+                    .and_then(|t| t.get("media_gen"))
+                    .and_then(|m| m.get("max_parallel_image_gen_calls"))
+                    .and_then(|v| v.as_integer()),
+                max_parallel_video_gen_calls: tools
+                    .and_then(|t| t.get("media_gen"))
+                    .and_then(|m| m.get("max_parallel_video_gen_calls"))
+                    .and_then(|v| v.as_integer()),
+            },
         };
         match std::env::var("GROK_RESPECT_GITIGNORE").as_deref() {
             Ok("0") | Ok("false") => {
@@ -752,6 +739,98 @@ impl ToolsConfig {
             _ => {}
         }
         result
+    }
+    pub(crate) fn resolve_max_parallel_image_gen_calls(
+        env: Option<&str>,
+        config: Option<i64>,
+        remote: Option<u32>,
+    ) -> usize {
+        resolve_clamped_count(
+            Self::ENV_MAX_PARALLEL_IMAGE_GEN_CALLS,
+            env,
+            config,
+            remote,
+            xai_grok_tools::media_gen_limits::DEFAULT_MAX_PARALLEL_IMAGE_GEN,
+        )
+    }
+    pub(crate) fn resolve_max_parallel_video_gen_calls(
+        env: Option<&str>,
+        config: Option<i64>,
+        remote: Option<u32>,
+    ) -> usize {
+        resolve_clamped_count(
+            Self::ENV_MAX_PARALLEL_VIDEO_GEN_CALLS,
+            env,
+            config,
+            remote,
+            xai_grok_tools::media_gen_limits::DEFAULT_MAX_PARALLEL_VIDEO_GEN,
+        )
+    }
+}
+/// Media-gen ladder: env > TOML > remote > default, with every numeric layer
+/// clamping `< 1` to `1`. Non-numeric env warns and falls through.
+fn resolve_clamped_count(
+    env_name: &str,
+    env: Option<&str>,
+    config: Option<i64>,
+    remote: Option<u32>,
+    default: usize,
+) -> usize {
+    if let Some(raw) = env {
+        match raw.trim().parse::<i64>() {
+            Ok(v) => return clamp_positive_count(v, "env", env_name),
+            Err(_) => {
+                tracing::warn!(
+                    name = env_name,
+                    %raw,
+                    "invalid env value (expected a whole number); ignoring"
+                );
+            }
+        }
+    }
+    if let Some(v) = config {
+        return clamp_positive_count(v, "config", env_name);
+    }
+    if let Some(v) = remote {
+        return clamp_positive_count(i64::from(v), "remote", env_name);
+    }
+    default
+}
+/// Positive whole-number ladder: env > TOML > remote > default.
+/// Invalid/non-positive env warns and falls through; TOML/remote `< 1` clamp to 1.
+pub(crate) fn resolve_positive_count(
+    env_name: &str,
+    env: Option<&str>,
+    config: Option<i64>,
+    remote: Option<u32>,
+    default: usize,
+) -> usize {
+    if let Some(value) = env {
+        match xai_grok_tools::util::env::parse_positive(value.trim()) {
+            Some(parsed) => return usize::try_from(parsed).unwrap_or(usize::MAX),
+            None => {
+                tracing::warn!(
+                    name = env_name,
+                    %value,
+                    "invalid env value (expected a positive whole number); ignoring"
+                );
+            }
+        }
+    }
+    if let Some(v) = config {
+        return clamp_positive_count(v, "config", env_name);
+    }
+    if let Some(v) = remote {
+        return clamp_positive_count(i64::from(v), "remote", env_name);
+    }
+    default
+}
+fn clamp_positive_count(value: i64, source: &str, name: &str) -> usize {
+    if value < 1 {
+        tracing::warn!(source, name, value, "positive count < 1; clamping to 1");
+        1
+    } else {
+        usize::try_from(value).unwrap_or(usize::MAX)
     }
 }
 /// Storage mode for session persistence.
@@ -953,26 +1032,15 @@ fn apply_managed_settings_features_inner(
         });
     }
     if features.disable_feedback == Some(true) {
-        config.features.feedback = Some(false);
+        use crate::agent::config::Feature;
+        config.feature_values.insert(Feature::Feedback, false);
         enforced.push(EnforcedField {
-            path: "features.feedback",
+            path: Feature::Feedback.path(),
             value: "false (DISABLE_FEEDBACK_COMMAND)".to_string(),
             source: source.clone(),
         });
     }
     enforced
-}
-/// Display text naming the setting that turned session search off, or `None` while it is on.
-/// One source of truth: the latch records the setting that closed it, which a later resolve of a
-/// lower tier cannot change.
-pub fn session_search_turned_off_by() -> Option<&'static str> {
-    let source = crate::session::storage::search_gate::closed_by()?;
-    Some(crate::session::storage::search_gate::session_search_off_reason(source))
-}
-/// Resolve the session search setting and latch it for the process. Call after every rewrite of
-/// `remote_settings`, and before anything can reach the index.
-pub fn apply_session_search_gate(config: &crate::agent::config::Config) {
-    crate::session::storage::search_gate::apply_gate(&config.resolve_session_search());
 }
 /// Load the on-disk config for a one-shot command and clamp it with policy. Without the clamp a
 /// pinned value reads as an ordinary config value, which the environment outranks.
@@ -997,7 +1065,7 @@ pub(crate) fn apply_policy(config: &mut crate::agent::config::Config) {
 /// Clamp `AgentConfig` fields per `requirements.toml`. No-op if absent.
 /// System pins win over user pins on conflict.
 pub(crate) fn apply_requirements(config: &mut crate::agent::config::Config) -> Vec<EnforcedField> {
-    requirements_layers()
+    let enforced: Vec<EnforcedField> = requirements_layers()
         .into_iter()
         .flat_map(|layer| {
             apply_requirements_inner(
@@ -1008,7 +1076,19 @@ pub(crate) fn apply_requirements(config: &mut crate::agent::config::Config) -> V
                 },
             )
         })
-        .collect()
+        .collect();
+    keep_the_deciding_layer(enforced)
+}
+/// Layers arrive user first, system last, and the last write is the pin that
+/// holds. Report that one, so an operator reading the log sees the file that
+/// decided rather than the first that asked. Keyed by value as well as path,
+/// because one layer can enforce the same path twice for different reasons.
+fn keep_the_deciding_layer(mut enforced: Vec<EnforcedField>) -> Vec<EnforcedField> {
+    let mut seen = std::collections::HashSet::new();
+    enforced.reverse();
+    enforced.retain(|field| seen.insert((field.path, field.value.clone())));
+    enforced.reverse();
+    enforced
 }
 fn apply_requirements_inner(
     config: &mut crate::agent::config::Config,
@@ -1016,7 +1096,17 @@ fn apply_requirements_inner(
     source: &RequirementSource,
 ) -> Vec<EnforcedField> {
     fn req_bool(req: &toml::Value, section: &str, key: &str) -> Option<bool> {
-        req.get(section)?.get(key)?.as_bool()
+        let value = req.get(section)?.get(key)?;
+        let parsed = value.as_bool();
+        if parsed.is_none() {
+            tracing::error!(
+                section,
+                key,
+                kind = value.type_str(),
+                "requirements value is not a boolean; the constraint is not applied"
+            );
+        }
+        parsed
     }
     fn req_str<'a>(req: &'a toml::Value, section: &str, key: &str) -> Option<&'a str> {
         req.get(section)?.get(key)?.as_str()
@@ -1033,10 +1123,11 @@ fn apply_requirements_inner(
         ($name:ident) => {
             if let Some(val) = req_bool(req, "features", stringify!($name)) {
                 config.requirements.$name.pin(val, source.clone());
-                if config.features.$name != Some(val) {
-                    config.features.$name = Some(val);
-                    push(concat!("features.", stringify!($name)), format!("{val}"));
-                }
+                config.features.$name = Some(val);
+                // Unconditional, like the registry loop: a later layer repeating
+                // the pin must report, or the dedupe keeps the first layer that
+                // asked instead of the one that decided.
+                push(concat!("features.", stringify!($name)), format!("{val}"));
             }
         };
     }
@@ -1079,17 +1170,33 @@ fn apply_requirements_inner(
             }
         };
     }
-    pin_feature!(feedback);
-    pin_feature!(lsp_tools);
-    pin_feature!(web_fetch);
-    pin_feature!(ask_user_question);
     pin_feature!(image_gen);
     pin_requirement_only!(image_edit);
     pin_feature!(video_gen);
-    pin_feature!(write_file);
-    pin_feature!(voice_mode);
-    pin_feature!(session_search);
+    for spec in crate::agent::config::FEATURES {
+        let Some(value) = req
+            .get("features")
+            .and_then(|features| features.get(spec.key))
+        else {
+            continue;
+        };
+        let Some(val) = value.as_bool() else {
+            tracing::error!(
+                path = spec.path,
+                kind = value.type_str(),
+                source = %source,
+                "requirements pin is not a boolean; the pin is ignored until the next launch, \
+                 which will refuse to start"
+            );
+            continue;
+        };
+        config
+            .requirements
+            .pin_feature(spec.id, val, source.clone());
+        push(spec.path, format!("{val}"));
+    }
     pin_requirement_only!(remote_fetch);
+    pin_requirement_only!(title_refresh);
     if let Some(val) = req_bool(req, "telemetry", "trace_upload") {
         config.requirements.trace_upload.pin(val, source.clone());
         if config.telemetry.trace_upload != Some(val) {

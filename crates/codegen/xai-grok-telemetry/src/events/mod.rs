@@ -296,6 +296,14 @@ pub enum PlanModeState {
     Active,
 }
 
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryRetrievalMode {
+    Disabled,
+    FtsOnly,
+    Hybrid,
+}
+
 #[derive(Serialize, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryFlushTrigger {
@@ -1067,6 +1075,7 @@ pub struct SessionHarness {
     pub hook_names: Vec<String>,
     pub agents_md_dir_names: Vec<String>,
     pub memory_enabled: bool,
+    pub memory_retrieval_mode: MemoryRetrievalMode,
     /// Whether the session cwd is inside a git repo (same value `SessionNew`
     /// carries). Additive analytics-visible field, added for the external
     /// `session_start` event (design ‡ footnote).
@@ -1317,10 +1326,25 @@ pub struct ShellTrueNoop {
     pub tool_name: String,
 }
 
+/// Harness nudged the model to break a run of identical tool calls. Pairs with
+/// [`ActionStationarityStop`]: the nudge fires first and once per run, the stop only
+/// if the run continues to the hard limit.
+///
+/// `problematically_repeating` splits the two threshold tiers (tools whose identical
+/// repeats are never productive versus everything else), so nudge and stop each break
+/// down by tier.
+#[derive(Serialize)]
+pub struct ActionStationarityNudge {
+    pub problematically_repeating: bool,
+    pub run_len: u32,
+    pub tool_name: String,
+}
+
 /// Harness hard-stopped a turn after identical tool thrash (silent EndTurn).
 #[derive(Serialize)]
 pub struct ActionStationarityStop {
     pub true_noop: bool,
+    pub problematically_repeating: bool,
     pub run_len: u32,
     pub tool_name: String,
 }
@@ -1819,6 +1843,39 @@ pub struct ExternalOtelExportHealth {
     pub export_successes: u64,
 }
 
+/// Once per session. Carries no `command` string or script output.
+#[derive(Serialize)]
+pub struct StatusLineConfigured {
+    /// `unset` when the config named no mode, which is adoption's denominator.
+    pub kind: &'static str,
+    /// Always `false` once the user wrote `type = "disabled"`, and reported even
+    /// by a client that draws no row.
+    pub row_shows_a_problem: bool,
+    pub items: String,
+    pub custom_items: bool,
+    /// `refresh_interval` was set, whether or not the mode lets it schedule.
+    pub custom_refresh_interval: bool,
+    /// The retired `refresh_interval_ms` key was still present, so the
+    /// retirement problem's audience is visible in adoption data.
+    pub has_retired_refresh_interval_ms: bool,
+}
+
+/// How the status line fared, at shutdown, for every session that enabled it.
+#[derive(Serialize)]
+pub struct StatusLineHealth {
+    pub kind: &'static str,
+    /// A run's error text counts, a config diagnostic does not, so `false` can
+    /// still mean a bar that showed one all session.
+    pub had_content: bool,
+    pub runs_ok: u64,
+    /// Shown on the row as `[status line: …]`.
+    pub runs_failed: u64,
+    pub runs_timed_out: u64,
+    /// Given up on; counted again under its outcome if it ever lands.
+    pub runs_abandoned: u64,
+    pub slowest_ms: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Credit limit
 // ---------------------------------------------------------------------------
@@ -2139,6 +2196,7 @@ telemetry_event!(
     external = crate::external::schema::map_turn_completed
 );
 telemetry_event!(ShellTrueNoop, "shell_true_noop");
+telemetry_event!(ActionStationarityNudge, "action_stationarity_nudge");
 telemetry_event!(ActionStationarityStop, "action_stationarity_stop");
 telemetry_event!(
     ToolCallCompleted,
@@ -2195,6 +2253,8 @@ telemetry_event!(CreditLimitHit, "credit_limit_hit");
 telemetry_event!(CreditLimitUpsellShown, "credit_limit_upsell_shown");
 telemetry_event!(CreditLimitUpsellClicked, "credit_limit_upsell_clicked");
 telemetry_event!(SubscriptionActivated, "subscription_activated");
+telemetry_event!(StatusLineConfigured, "status_line_configured");
+telemetry_event!(StatusLineHealth, "status_line_health");
 telemetry_event!(
     ApiError,
     "api_error",
@@ -2247,10 +2307,6 @@ telemetry_event!(
 );
 telemetry_event!(crate::memory_telemetry::MemorySearch, "memory_search");
 telemetry_event!(
-    crate::memory_telemetry::MemorySearchEmpty,
-    "memory_search_empty"
-);
-telemetry_event!(
     crate::memory_telemetry::MemoryFlushStart,
     "memory_flush_start"
 );
@@ -2296,6 +2352,19 @@ mod tests {
             clipboard_native_tool: "arboard".into(),
             clipboard_data_control: "n/a".into(),
         }
+    }
+
+    #[test]
+    fn memory_retrieval_mode_serializes_as_closed_snake_case_values() {
+        let modes = [
+            MemoryRetrievalMode::Disabled,
+            MemoryRetrievalMode::FtsOnly,
+            MemoryRetrievalMode::Hybrid,
+        ];
+        assert_eq!(
+            modes.map(|mode| serde_json::to_value(mode).unwrap()),
+            ["disabled", "fts_only", "hybrid"]
+        );
     }
 
     #[test]

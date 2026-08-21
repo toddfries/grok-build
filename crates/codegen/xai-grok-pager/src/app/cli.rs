@@ -410,7 +410,7 @@ pub struct LeaderArgs {
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "grok",
-    version = env!("VERSION_WITH_COMMIT"),
+    version = xai_grok_version::full_version(),
     about = "Grok Build TUI",
     disable_version_flag = true,
     next_display_order = None,

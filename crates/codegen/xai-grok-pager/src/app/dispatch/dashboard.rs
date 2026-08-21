@@ -136,6 +136,14 @@ pub(super) fn dispatch_open_dashboard(app: &mut AppView) -> Vec<Effect> {
         app.show_toast("Sign in to open the dashboard");
         return vec![];
     }
+    // Same for the terms notice: opening the dashboard would dismiss it unanswered.
+    if matches!(
+        app.consent_state,
+        crate::app::consent::ConsentState::Pending { .. }
+    ) {
+        app.show_toast("Answer the terms notice to open the dashboard");
+        return vec![];
+    }
     // Same rationale for folder trust: opening the dashboard would visually
     // dismiss the trust question with the folder still unanswered. Toast and
     // stay put (mirrors the auth gate above) so the question is resolved first.
@@ -2060,7 +2068,7 @@ fn stop_top_level_activity(agent: &mut crate::app::agent_view::AgentView) -> Opt
                 agent,
                 session_id.clone(),
                 /* cancel_subagents */ true,
-                /* rewind_if_no_output */ false,
+                /* rewind_prompt_id */ None,
             ));
         }
         let running: Vec<String> = agent

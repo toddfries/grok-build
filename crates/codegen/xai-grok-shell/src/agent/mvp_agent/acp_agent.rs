@@ -51,35 +51,27 @@ impl acp::Agent for MvpAgent {
         if self.cfg.borrow().remote_settings.is_none() {
             self.spawn_settings_reapply();
         }
-        let (auto_gc_policy, run_auto_gc) = {
-            let cfg = self.cfg.borrow();
-            let has_remote = cfg.remote_settings.is_some();
-            let run = has_remote || !crate::util::config::resolve_remote_fetch_enabled();
-            (cfg.resolve_worktree_auto_gc(), run)
-        };
-        if !run_auto_gc {
+        let remote_settled = self.remote_settings_settled();
+        let auto_gc_policy = self.cfg.borrow().resolve_worktree_auto_gc();
+        if !remote_settled {
             tracing::debug!(
-                "auto worktree gc deferred until remote_settings are available"
+                "auto worktree gc and session search deferred until remote_settings arrive"
             );
         }
+        let grok_home = xai_fast_worktree::resolve_grok_home();
         tokio::task::spawn_blocking(move || {
             crate::session::worktree_pool::cleanup_stale_pool_worktrees(None);
-            if !run_auto_gc {
+            if !remote_settled {
                 return;
             }
-            let opts = xai_fast_worktree::AutoGcOptions::from_resolved(auto_gc_policy);
-            if let Err(e) = xai_fast_worktree::WorktreeDb::open_default()
-                .and_then(|db| xai_fast_worktree::maybe_auto_gc(&db, &opts))
-            {
-                tracing::warn!(error = %e, "auto worktree gc failed");
-            }
+            Self::reclaim_worktrees(grok_home, auto_gc_policy);
         });
         tokio::task::spawn_blocking(|| {
             crate::session::persistence::cleanup_stale_sessions(None);
         });
-        self.apply_session_search_gate();
-        crate::session::storage::search::SEARCH_INDEX_MANAGER
-            .bootstrap_once(crate::util::grok_home::grok_home());
+        if remote_settled {
+            self.start_search_index_once();
+        }
         const PERMISSION_CLEANUP_TTL_DAYS: u64 = 30;
         static CLEANUP_PERMISSIONS_ONCE: std::sync::Once = std::sync::Once::new();
         CLEANUP_PERMISSIONS_ONCE
@@ -116,8 +108,8 @@ impl acp::Agent for MvpAgent {
                 );
             }
         }
-        if !self.tier_allowed.get() && let Some(auth) = self.auth_manager.current() {
-            self.enforce_grok_code_access(&auth).await;
+        if !self.tier_allowed.get() {
+            self.spawn_tier_recheck();
         }
         self.maybe_sync_bundle_in_background(false);
         let mut client_type = arguments
@@ -507,7 +499,10 @@ impl acp::Agent for MvpAgent {
                     "mcpApps": client_supports_mcp_apps,
                     "metadata": metadata,
                     "availableCommands": crate::session::slash_commands::builtin_commands(self.command_availability()),
-                    "cancelRewind": self.cfg.borrow().resolve_cancel_rewind().value,
+                    "cancelRewind": self
+                        .cfg
+                        .borrow()
+                        .is_feature_enabled(crate::agent::config::Feature::CancelRewind),
                     // Resolved session-recap state (remote settings / config / env;
                     // default ON). The client gates BOTH its automatic
                     // away-recap poll and the manual `/recap` on this so a
@@ -2093,6 +2088,19 @@ impl acp::Agent for MvpAgent {
                 })
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            let rewind_prompt_id = args
+                .meta
+                .as_ref()
+                .and_then(|m| m.get("promptId"))
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            let history = if rewind_if_no_output {
+                crate::session::CancelHistoryDisposition::RewindIfNoOutput {
+                    prompt_id: rewind_prompt_id,
+                }
+            } else {
+                crate::session::CancelHistoryDisposition::Keep
+            };
             let dispatch_lock = self.dispatch_lock(&args.session_id);
             let _dispatch_guard = dispatch_lock.lock().await;
             let _ = handle
@@ -2100,7 +2108,7 @@ impl acp::Agent for MvpAgent {
                 .send(
                     SessionCommand::Cancel(crate::session::CancelOptions {
                         cancel_subagents,
-                        rewind_if_no_output,
+                        history,
                         trigger: cancel_trigger,
                         user_initiated: true,
                         ..Default::default()
@@ -2215,7 +2223,7 @@ impl acp::Agent for MvpAgent {
                 crate::extensions::chat_conversation_history::handle(self, &args).await
             }
             "x.ai/session/search" => {
-                crate::extensions::session_search::handle(&args).await
+                crate::extensions::session_search::handle(self, &args).await
             }
             "x.ai/session/resolve_local_for_worktree_resume"
             | "x.ai/session/rehydrate" => {
@@ -2458,6 +2466,9 @@ impl acp::Agent for MvpAgent {
             "x.ai/share_session" => crate::extensions::share::handle(self, &args).await,
             "x.ai/privacy/setCodingDataRetention" => {
                 crate::extensions::privacy::handle(self, &args).await
+            }
+            "x.ai/consent/record" => {
+                crate::extensions::consent::handle(self, &args).await
             }
             "x.ai/rollout/survey" => {
                 crate::extensions::rollout::handle(self, &args).await
