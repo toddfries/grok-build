@@ -69,13 +69,14 @@ pub(super) fn pending_input(prompt_id: &str) -> (InputItem, oneshot::Receiver<Pr
         screen_mode: None,
         verbatim: false,
         json_schema: None,
-        origin: crate::session::PromptOrigin::User,
+        input_origin: InputOrigin::new(crate::session::PromptOrigin::User),
         task_wake_fallback: None,
         tool_overrides_update: None,
         respond_to,
         persist_ack: None,
         parsed_prompt_tx: None,
         queue_meta: None,
+        queue_mutation_policy: QueueMutationPolicy::hidden(),
         send_now: false,
     };
     (item, rx)
@@ -522,11 +523,11 @@ async fn no_output_rewind_cancel_emits_no_turn_completed() {
                 state.pending_inputs.push_back(item);
             }
 
-            // rewind_if_no_output = true on a rewindable turn takes the rewind
+            // A RewindIfNoOutput cancel on a rewindable turn takes the rewind
             // path: the turn is treated as UNSENT, so — in lock-step with the
             // legacy emit_turn_ended — NO durable terminal is emitted (else
             // replay would finalize a turn that was rewound, not completed).
-            let _ = actor.cancel_running_task(crate::session::CancelOptions { rewind_if_no_output: true, user_initiated: true, ..Default::default() }).await;
+            let _ = actor.cancel_running_task(crate::session::CancelOptions { history: crate::session::CancelHistoryDisposition::RewindIfNoOutput { prompt_id: None }, user_initiated: true, ..Default::default() }).await;
 
             let msgs = drain_persistence(&mut persistence_rx);
             assert!(

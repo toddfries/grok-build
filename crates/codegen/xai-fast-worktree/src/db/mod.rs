@@ -7,7 +7,6 @@ mod queries;
 mod schema;
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
@@ -442,7 +441,7 @@ impl WorktreeDb {
 ///
 /// The basename alone collides across repos, and `INSERT OR REPLACE` would then evict
 /// the other repo's record; hashing the full path keeps distinct worktrees distinct.
-pub fn id_from_path(path: &Path) -> String {
+pub(crate) fn id_from_path(path: &Path) -> String {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy())
@@ -452,7 +451,7 @@ pub fn id_from_path(path: &Path) -> String {
 }
 
 /// Extract the repo name (last component) from a source repo path.
-pub fn repo_name_from_path(source: &Path) -> String {
+pub(crate) fn repo_name_from_path(source: &Path) -> String {
     source
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -460,10 +459,7 @@ pub fn repo_name_from_path(source: &Path) -> String {
 }
 
 pub fn now_epoch_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
+    crate::time::epoch_secs()
 }
 
 /// Resolve the grok home: `$GROK_HOME`, else `<home>/.grok`.
@@ -510,6 +506,8 @@ impl GrokHomeFixture {
         // race fix.
         let _ = WorktreeDb::open(&home);
         let prev = std::env::var_os("GROK_HOME");
+        // SAFETY: the fixture holds the GROK_HOME env lock for its whole
+        // lifetime, so no other test thread reads or writes the environment.
         unsafe { std::env::set_var("GROK_HOME", &home) };
         Self {
             _lock: lock,
@@ -523,6 +521,8 @@ impl GrokHomeFixture {
 #[cfg(test)]
 impl Drop for GrokHomeFixture {
     fn drop(&mut self) {
+        // SAFETY: the fixture still holds the GROK_HOME env lock here, so no
+        // other test thread reads or writes the environment during restore.
         unsafe {
             match self.prev.take() {
                 Some(p) => std::env::set_var("GROK_HOME", p),

@@ -13,6 +13,7 @@ mod router;
 mod session;
 mod settings;
 mod status;
+mod status_line;
 mod task_result;
 mod transcript;
 mod turn;
@@ -95,6 +96,7 @@ fn test_app() -> AppView {
         scroll_config: crate::input::mouse::ScrollConfig::default(),
         appearance: crate::appearance::AppearanceConfig::default(),
         notification_service: crate::notifications::NotificationService::new(Default::default()),
+        status_line: Default::default(),
         pending_notification_escapes: None,
         deferred_notification: None,
         tracing_rx: None,
@@ -151,6 +153,11 @@ fn test_app() -> AppView {
         ))],
         auth_state: AuthState::Done,
         trust_state: TrustState::Done,
+        consent_state: crate::app::consent::ConsentState::Done,
+        account_email: None,
+        welcome_consent_link_rects: Vec::new(),
+        welcome_consent_hover_link: None,
+        consent_answered: None,
         login_label: None,
         login_method_id: None,
         auth_start_mode: AuthMode::Pending,
@@ -264,6 +271,7 @@ fn test_app() -> AppView {
         show_resolved_model: true,
         sharing_enabled: false,
         plugin_cta_enabled: false,
+        workspace_dashboard_enabled: false,
         usage_visible: true,
         has_external_auth_provider: false,
         tier_restricted_commands: Vec::new(),
@@ -788,6 +796,7 @@ fn make_picker_entry(id: &str, cwd: &str) -> crate::app::app_view::SessionPicker
         repo_name: "repo".into(),
         worktree_label: None,
         last_turn_summary: None,
+        last_recap: None,
         card_detail: None,
     }
 }

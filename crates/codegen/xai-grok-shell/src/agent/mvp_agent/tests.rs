@@ -1188,6 +1188,7 @@ fn make_test_handle(
         chat_state_handle: xai_chat_state::ChatStateHandle::noop(),
         signals_handle: crate::session::signals::SessionSignalsHandle::new(),
         gateway_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        status_line_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         mcp_servers: vec![],
         initial_client_mcp_servers: vec![],
         display_cwd: None,
@@ -2545,6 +2546,7 @@ fn find_model_by_id_prefers_key_then_falls_back_to_slug() {
         info: config::ModelInfo {
             user_selectable: true,
             id: None,
+            model_family: None,
             model: model.to_string(),
             base_url: String::new(),
             name: None,
@@ -3286,26 +3288,209 @@ async fn diagnostic_upload_skipped_after_mid_session_trace_upload_kill_switch() 
          trace-upload kill switch"
     );
 }
+use crate::session::storage::search::IndexDecision;
+/// A grok home of its own, with the switch left at its registered default.
+/// `decide_search_index` stops short of a session store, but do not reach
+/// `bootstrap_once`: it takes the process-cached `grok_home()`, which these
+/// guards cannot redirect, so it could index the developer's own store.
+fn search_index_env() -> (tempfile::TempDir, [xai_grok_test_support::EnvGuard; 2]) {
+    use xai_grok_test_support::EnvGuard;
+    let home = tempfile::tempdir().unwrap();
+    let guards = [
+        EnvGuard::set("GROK_HOME", home.path()),
+        EnvGuard::unset("GROK_SESSION_SEARCH"),
+    ];
+    (home, guards)
+}
 #[tokio::test]
 #[serial_test::serial]
-async fn session_search_stops_on_a_mid_session_kill_switch() {
-    use crate::session::storage::search_gate;
-    let _env = xai_grok_test_support::EnvGuard::unset("GROK_SESSION_SEARCH");
+async fn search_index_honors_the_session_search_feature() {
+    let (_home, _env) = search_index_env();
+    {
+        let _off = xai_grok_test_support::EnvGuard::set("GROK_SESSION_SEARCH", "0");
+        let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
+        agent.decide_search_index();
+        assert!(
+            matches!(agent.search_index(), IndexDecision::Off),
+            "the switch is off, so this process keeps no index"
+        );
+    }
     let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
-    let _gate = search_gate::IndexGateGuard::open();
-    agent.apply_session_search_gate();
+    agent.decide_search_index();
     assert!(
-        search_gate::is_index_enabled(),
-        "precondition: nothing has turned the index off"
+        matches!(agent.search_index(), IndexDecision::On(_)),
+        "the feature is on by default, so this process keeps an index"
+    );
+}
+/// Reclaiming is the one irreversible half of the deferred work, and the six hour
+/// throttle then hides the run that could have honored a remote veto.
+#[tokio::test]
+#[serial_test::serial]
+async fn auto_gc_declines_until_the_remote_answer_settles() {
+    let (_home, _env) = search_index_env();
+    let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
+    assert!(
+        !agent.remote_settings_settled(),
+        "precondition: remote fetch is on and no settings have arrived"
+    );
+    agent.spawn_auto_worktree_gc();
+    agent.decide_search_index();
+    assert_eq!(
+        agent.auto_gc_spawn_count.get(),
+        0,
+        "a host that never reaches the server must not reclaim under the default policy"
+    );
+    assert!(
+        matches!(agent.search_index(), IndexDecision::On(_)),
+        "the index still decides, since running without one is what cannot be undone; got {:?}",
+        agent.search_index(),
+    );
+    agent.cfg.borrow_mut().remote_settings = Some(crate::util::config::RemoteSettings::default());
+    agent.spawn_auto_worktree_gc();
+    assert_eq!(
+        agent.auto_gc_spawn_count.get(),
+        1,
+        "once the server has answered it reclaims, or the guard would just never run"
+    );
+}
+#[tokio::test]
+#[serial_test::serial]
+async fn search_before_the_decision_asks_the_caller_to_retry() {
+    let (_home, _env) = search_index_env();
+    let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
+    assert!(
+        matches!(agent.search_index(), IndexDecision::Pending),
+        "precondition: nothing has decided yet"
+    );
+    let resp = crate::session::storage::search::execute_search(
+        agent.search_index(),
+        &crate::util::grok_home::grok_home(),
+        &crate::session::storage::search::SessionSearchRequest {
+            query: "zzqqpending".to_string(),
+            cwd: None,
+            limit: 10,
+            offset: 0,
+            include_content: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        resp.bootstrapping,
+        "an undecided process must not answer final"
+    );
+    assert!(resp.results.is_empty());
+}
+/// A leader boots with no remote settings, so if the first reader resolved the
+/// feature the registered default would latch before the server could answer.
+#[tokio::test]
+#[serial_test::serial]
+async fn read_before_the_remote_settings_land_does_not_decide() {
+    let (_home, _env) = search_index_env();
+    let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
+    assert!(
+        !agent.remote_settings_settled(),
+        "precondition: remote fetch is on and no settings have arrived"
+    );
+    assert!(
+        matches!(agent.search_index(), IndexDecision::Pending),
+        "reading must not settle the question; got {:?}",
+        agent.search_index(),
     );
     agent.cfg.borrow_mut().remote_settings = Some(crate::util::config::RemoteSettings {
         session_search: Some(false),
         ..Default::default()
     });
-    agent.apply_session_search_gate();
+    assert!(agent.remote_settings_settled());
+    agent.decide_search_index();
     assert!(
-        !search_gate::is_index_enabled(),
-        "a remote kill switch must reach the indexer without a new session"
+        matches!(agent.search_index(), IndexDecision::Off),
+        "the remote kill switch decided, so this process keeps no index; got {:?}",
+        agent.search_index(),
+    );
+}
+/// A host with no identity to fetch with never receives remote settings, so
+/// waiting for them would cost it an index for the whole run.
+#[tokio::test]
+#[serial_test::serial]
+async fn exhausted_fetch_decides_on_the_local_layers() {
+    use crate::agent::config::Config as AgentConfig;
+    use crate::auth::{AuthManager, GrokComConfig};
+    use xai_grok_test_support::EnvGuard;
+    let (_home, _env) = search_index_env();
+    let _no_inline_auth = EnvGuard::unset("GROK_AUTH");
+    let _no_auth_path = EnvGuard::unset("GROK_AUTH_PATH");
+    let auth_dir = tempfile::tempdir().unwrap();
+    let auth_manager =
+        std::sync::Arc::new(AuthManager::new(auth_dir.path(), GrokComConfig::default()));
+    assert!(
+        auth_manager.current().is_none(),
+        "precondition: no identity to fetch with"
+    );
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let agent = MvpAgent::new(
+        GatewaySender::new(tx),
+        &AgentConfig::default(),
+        auth_manager,
+        None,
+    )
+    .expect("valid test config");
+    assert!(
+        !agent.remote_settings_settled(),
+        "precondition: remote fetch is on and no settings have arrived"
+    );
+    agent.maybe_fetch_post_auth_settings().await;
+    assert!(
+        matches!(agent.search_index(), IndexDecision::On(_)),
+        "a signed out host decides on its local layers rather than keeping no index"
+    );
+}
+/// Once decided, a later switch cannot take the index away: serving one that
+/// stopped absorbing writes is worse than keeping it until the next launch.
+#[tokio::test]
+#[serial_test::serial]
+async fn kill_switch_after_the_decision_leaves_the_index_up() {
+    let (_home, _env) = search_index_env();
+    let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
+    agent.cfg.borrow_mut().remote_settings = Some(crate::util::config::RemoteSettings {
+        session_search: Some(true),
+        ..Default::default()
+    });
+    agent.decide_search_index();
+    assert!(
+        matches!(agent.search_index(), IndexDecision::On(_)),
+        "precondition: indexing"
+    );
+    agent.cfg.borrow_mut().remote_settings = Some(crate::util::config::RemoteSettings {
+        session_search: Some(false),
+        ..Default::default()
+    });
+    agent.decide_search_index();
+    assert!(
+        matches!(agent.search_index(), IndexDecision::On(_)),
+        "a switch arriving after the decision must not tear down a live index"
+    );
+}
+/// Sessions hold the decision itself, not the answer as it stood when they
+/// opened, which would otherwise be `None` for the rest of their life.
+#[tokio::test]
+#[serial_test::serial]
+async fn session_opened_before_the_decision_sees_it_land() {
+    let (_home, _env) = search_index_env();
+    let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
+    let held_by_a_session = agent.search_index_cell();
+    assert!(
+        matches!(held_by_a_session.decision(), IndexDecision::Pending),
+        "precondition: the session opened before anything decided"
+    );
+    agent.cfg.borrow_mut().remote_settings = Some(crate::util::config::RemoteSettings {
+        session_search: Some(true),
+        ..Default::default()
+    });
+    agent.decide_search_index();
+    assert!(
+        matches!(held_by_a_session.decision(), IndexDecision::On(_)),
+        "the session indexes as soon as the decision lands"
     );
 }
 /// The live collection gate reads a `Send` mirror of the config-level
@@ -4641,11 +4826,17 @@ fn explicit_close_finalizes_the_replica() {
             (
                 options.cancel_subagents,
                 options.kill_background_tasks,
-                options.rewind_if_no_output,
+                options.history.clone(),
                 options.trigger.as_ref().map(|t| t.as_str()),
                 options.user_initiated
             ),
-            (true, true, false, Some("session_close"), false),
+            (
+                true,
+                true,
+                crate::session::CancelHistoryDisposition::Keep,
+                Some("session_close"),
+                false
+            ),
         );
         assert!(
             matches!(
@@ -4823,6 +5014,202 @@ fn post_auth_settings_not_coalesced_by_in_flight_reapply() {
             "post-auth must spawn on its own guard despite an in-flight reapply"
         );
         assert!(agent.post_auth_settings_in_flight.get());
+    });
+}
+/// The tier re-check work is single-flight across every caller: back-to-back
+/// gated initializes run at most one live check, and an awaited
+/// authenticate-path check skips — rather than doubles or waits out — a
+/// check already wedged on a stalled subscription endpoint. Drives the exact
+/// block `initialize` runs when `tier_allowed` is false (the full
+/// `initialize` fires once-per-process GROK_HOME cleanup work that a unit
+/// test must not run against the developer's real home).
+#[test]
+fn gated_reconnect_tier_recheck_is_single_flight() {
+    run_local_for_bridge_test(|| async {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking accept loop");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let accept_stop = stop.clone();
+        let accept_thread = std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while !accept_stop.load(std::sync::atomic::Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((stream, _)) => held.push(stream),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        let agent = build_minimal_agent_for_tests();
+        agent.cfg.borrow_mut().endpoints.cli_chat_proxy_base_url =
+            Some(format!("http://{addr}/v1"));
+        agent.cfg.borrow_mut().remote_settings = Some(crate::util::config::RemoteSettings {
+            allow_access: Some(false),
+            ..Default::default()
+        });
+        let auth = crate::auth::GrokAuth {
+            key: "gated-user-key".into(),
+            user_id: "user-gated".into(),
+            auth_mode: crate::auth::AuthMode::Oidc,
+            oidc_issuer: Some(crate::auth::XAI_OAUTH2_ISSUER.to_owned()),
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            ..crate::auth::GrokAuth::test_default()
+        };
+        agent.auth_manager.hot_swap(auth.clone());
+        *agent.allow_access_resolved_for.borrow_mut() = Some(auth.user_id.clone());
+        agent.tier_allowed.set(false);
+        for _ in 0..2 {
+            if !agent.tier_allowed.get() {
+                agent.spawn_tier_recheck();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            agent.tier_recheck_run_count.get(),
+            1,
+            "the second spawned check must skip the claimed re-check"
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            agent.enforce_grok_code_access(&auth),
+        )
+        .await
+        .expect("an awaited check must skip, not wait out, the wedged re-check");
+        assert_eq!(
+            agent.tier_recheck_run_count.get(),
+            1,
+            "the awaited check must not run a second concurrent re-check"
+        );
+        assert!(
+            !agent.tier_allowed.get(),
+            "the gate stays until a re-check resolves"
+        );
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        accept_thread.join().expect("accept loop joins");
+    });
+}
+/// The check's own mint spawns a `/user` enrichment that can rewrite the
+/// in-memory user_id to the proxy-canonical value mid-check; the identity
+/// guard must read that normalization as the same account (it is the id the
+/// check's own bearer resolved to), while a live id matching neither the
+/// started nor the canonical id is a real switch and still discards.
+#[test]
+fn tier_recheck_identity_guard_accepts_enrichment_canonical_user_id() {
+    run_local_for_bridge_test(|| async {
+        let agent = build_minimal_agent_for_tests();
+        let auth = crate::auth::GrokAuth {
+            key: "seeded-key".into(),
+            user_id: "canonical-user".into(),
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            ..crate::auth::GrokAuth::test_default()
+        };
+        agent.auth_manager.hot_swap(auth);
+        assert!(!agent.tier_recheck_identity_changed("seeded-user", Some("canonical-user")));
+        assert!(!agent.tier_recheck_identity_changed("canonical-user", None));
+        assert!(!agent.tier_recheck_identity_changed("canonical-user", Some("other-user")));
+        assert!(agent.tier_recheck_identity_changed("seeded-user", Some("other-user")));
+        assert!(agent.tier_recheck_identity_changed("seeded-user", None));
+        assert!(agent.tier_recheck_identity_changed("seeded-user", Some("")));
+    });
+}
+/// The other half of the reconnect paywall flash (the wedged test above
+/// locks the "gate holds while the check is in flight" half): a re-check
+/// that confirms a qualifying tier lifts `tier_allowed`, so the flash a
+/// subscribed user can see on a gated reconnect clears. Settings stay
+/// absent (the mock 404s `/settings`), modeling the remote-fetch-failed /
+/// disabled arm where the confirmed tier is the authority for the lift;
+/// the bearer's tier claim already matches the live tier, so the
+/// post-unblock mint is skipped and no refresher is needed.
+#[test]
+fn gated_reconnect_recheck_lifts_gate_clearing_paywall_flash() {
+    run_local_for_bridge_test(|| async {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking accept loop");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let accept_stop = stop.clone();
+        let accept_thread = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            while !accept_stop.load(std::sync::atomic::Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                        let mut head = Vec::new();
+                        let mut byte = [0u8; 1];
+                        while !head.ends_with(b"\r\n\r\n") {
+                            match stream.read(&mut byte) {
+                                Ok(1) => head.push(byte[0]),
+                                _ => break,
+                            }
+                        }
+                        let head = String::from_utf8_lossy(&head);
+                        let response = if head.contains("/user?include=subscription") {
+                            let body =
+                                r#"{"userId":"user-flash","subscriptionTier":"SuperGrokPro"}"#;
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            )
+                        } else {
+                            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\
+                             Connection: close\r\n\r\n"
+                                .to_owned()
+                        };
+                        let _ = stream.write_all(response.as_bytes());
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        let temp_dir = tempfile::tempdir().unwrap();
+        let auth_manager = std::sync::Arc::new(crate::auth::AuthManager::new(
+            temp_dir.path(),
+            crate::auth::GrokComConfig::default(),
+        ));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let gateway = GatewaySender::new(tx);
+        let cfg = crate::agent::config::Config::default();
+        let agent = MvpAgent::new(gateway, &cfg, auth_manager, None).expect("valid test config");
+        agent.cfg.borrow_mut().endpoints.cli_chat_proxy_base_url =
+            Some(format!("http://{addr}/v1"));
+        let auth = crate::auth::GrokAuth {
+            key: jwt_with_tier(5),
+            user_id: "user-flash".into(),
+            auth_mode: crate::auth::AuthMode::Oidc,
+            oidc_issuer: Some(crate::auth::XAI_OAUTH2_ISSUER.to_owned()),
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            ..crate::auth::GrokAuth::test_default()
+        };
+        agent.auth_manager.hot_swap(auth);
+        agent.tier_allowed.set(false);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            agent.retry_subscription_check(),
+        )
+        .await
+        .expect("re-check must finish well inside its bounded awaits");
+        assert!(
+            agent.tier_allowed.get(),
+            "a confirmed qualifying tier must lift the gate — the reconnect paywall flash clears"
+        );
+        assert_eq!(
+            agent.tier_recheck_run_count.get(),
+            1,
+            "the lift came from exactly one claimed re-check"
+        );
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        accept_thread.join().expect("accept loop joins");
     });
 }
 /// Agent with pre-loaded auth, a gateway receiver (to assert emitted
@@ -6288,3 +6675,129 @@ mod soft_default_settings_emit {
 }
 #[cfg(feature = "dhat-heap")]
 mod dhat_soak;
+/// A leader multiplexes many clients behind one `initialize`, so the answer
+/// has to travel with the session: without the session-meta read, one terminal
+/// with the row off decides for every other terminal sharing the leader.
+/// Silence means off, since the payload costs a git discovery and three round
+/// trips.
+#[test]
+fn session_meta_outranks_the_client_that_started_the_process() {
+    let says_nothing = || {
+        acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_capabilities(
+            acp::ClientCapabilities::new()
+                .fs(acp::FileSystemCapabilities::new())
+                .terminal(false),
+        )
+    };
+    let wants_a_row = |meta: Option<acp::Meta>, init: acp::InitializeRequest| {
+        MvpAgent::resolve_status_line_capability(meta.as_ref(), &init)
+    };
+    let on = init_advertising_status_line(true);
+    let off = init_advertising_status_line(false);
+    assert!(
+        wants_a_row(Some(status_line_meta(true)), off),
+        "a leader that wants a row outranks the client that started the process"
+    );
+    assert!(
+        !wants_a_row(Some(status_line_meta(false)), on),
+        "a `/minimal` client attaching to a leader a full-screen pager started \
+         was charged for a row it cannot draw"
+    );
+    assert!(
+        wants_a_row(None, init_advertising_status_line(true)),
+        "with no leader the client that initialized is the client that asked"
+    );
+    assert!(!wants_a_row(None, init_advertising_status_line(false)));
+    assert!(
+        !wants_a_row(Some(acp::Meta::new()), says_nothing()),
+        "a leader that injected nothing leaves a silent client off"
+    );
+    assert!(!wants_a_row(None, says_nothing()));
+}
+#[tokio::test(flavor = "current_thread")]
+async fn an_attach_that_draws_a_row_switches_it_on_and_asks_for_a_fill() {
+    let agent = build_minimal_agent_for_tests();
+    let session_id = acp::SessionId::new("status-line-attach");
+    let (cmd_tx, mut commands) =
+        tokio::sync::mpsc::unbounded_channel::<crate::session::SessionCommand>();
+    let mut handle = make_test_handle("test-model", false, None);
+    handle.cmd_tx = cmd_tx;
+    let row = handle.status_line_enabled.clone();
+    agent.insert_resident(&session_id, handle);
+    let init = init_advertising_status_line(false);
+    agent.attach_status_line(&session_id, Some(&status_line_meta(false)), &init);
+    assert!(
+        !row.load(std::sync::atomic::Ordering::Relaxed),
+        "an attach that cannot draw a row switched it on"
+    );
+    assert!(
+        commands.try_recv().is_err(),
+        "an attach that cannot draw a row asked the actor to build one"
+    );
+    agent.attach_status_line(&session_id, Some(&status_line_meta(true)), &init);
+    assert!(
+        row.load(std::sync::atomic::Ordering::Relaxed),
+        "the attach left the row off, so the emitter wakes and builds nothing"
+    );
+    assert!(
+        matches!(
+            commands.try_recv(),
+            Ok(crate::session::SessionCommand::EmitStatusSnapshot)
+        ),
+        "the attach never asked for a snapshot, so the transient row never fills"
+    );
+}
+/// A resident session outlives the client that drew its row, and the emitter
+/// re-reads the flag on every wake, so a latch that only ever rose would keep
+/// building payloads for a row nobody paints. Driven through the real
+/// disconnect, not the setter, since the wiring is the part that can rot.
+#[test]
+fn a_disconnect_switches_the_row_off_and_the_next_attach_switches_it_on() {
+    run_local_for_bridge_test(|| async {
+        let agent = build_minimal_agent_for_tests();
+        let sid = acp::SessionId::new("sess-status-line-busy");
+        let (handle, _tx, rx) = make_live_session_handle(&sid, None);
+        let row = handle.status_line_enabled.clone();
+        agent.insert_resident(&sid, handle);
+        let _actor = spawn_fake_actor(rx, true);
+        let init = init_advertising_status_line(true);
+        agent.attach_status_line(&sid, Some(&status_line_meta(true)), &init);
+        assert!(row.load(std::sync::atomic::Ordering::Relaxed));
+        drive_disconnect_many(&agent, &[&sid]).await;
+        assert!(
+            agent.is_resident(&sid),
+            "the busy session must stay resident"
+        );
+        assert!(
+            !row.load(std::sync::atomic::Ordering::Relaxed),
+            "the last client that could draw the row is gone, so the agent is \
+             still assembling payloads nobody paints"
+        );
+        agent.attach_status_line(&sid, Some(&status_line_meta(true)), &init);
+        assert!(
+            row.load(std::sync::atomic::Ordering::Relaxed),
+            "the row has to come back with the next client"
+        );
+    });
+}
+fn status_line_meta(enabled: bool) -> acp::Meta {
+    let mut meta = acp::Meta::new();
+    meta.insert(
+        xai_grok_status_line::CLIENT_STATUS_LINE_META.to_string(),
+        serde_json::json!(enabled),
+    );
+    meta
+}
+fn init_advertising_status_line(enabled: bool) -> acp::InitializeRequest {
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        xai_grok_status_line::STATUS_LINE_CAPABILITY.to_string(),
+        serde_json::json!(enabled),
+    );
+    acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_capabilities(
+        acp::ClientCapabilities::new()
+            .fs(acp::FileSystemCapabilities::new())
+            .terminal(false)
+            .meta(meta),
+    )
+}

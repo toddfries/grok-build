@@ -45,6 +45,7 @@ use xai_grok_tools::types::tool::ToolKind;
 use xai_grok_workspace::file_system::AsyncFileSystem;
 use xai_hunk_tracker::HunkTrackerHandle;
 mod attempt_runner;
+mod attempt_store;
 mod handle_request;
 pub(crate) use handle_request::run_shell_child;
 /// How the child session's initial context was bootstrapped.
@@ -132,6 +133,7 @@ pub(crate) struct SubagentSpawnContext {
     pub parent_depth: u32,
     pub subagents_max_depth: u32,
     pub workflow_max_concurrent_agents: usize,
+    pub media_gen_batch_limits: xai_grok_tools::media_gen_limits::MediaGenBatchLimits,
     /// Inference idle timeout (secs), resolved from the parent's model config at spawn-context creation time.
     pub inference_idle_timeout_secs: u64,
     /// Tier inputs for resolving `auto_compact_threshold_percent` at
@@ -192,12 +194,12 @@ pub(crate) struct SubagentSpawnContext {
     /// Whether goal mode (`/goal`) is enabled.
     pub goal_enabled: bool,
     pub background_workflows_enabled: bool,
-    /// Whether the `ask_user_question` tool is exposed to this subagent,
-    /// inherited from the parent session (see `build_subagent_spawn_context`).
+    /// Child policy for exposing `ask_user_question`. Always false; the
+    /// parent session's setting must not cross the subagent boundary.
     pub ask_user_question_enabled: bool,
     /// Whether the parent session is non-interactive (headless `-p` / SDK),
-    /// copied onto the child's `StartupHints` so its ask_user_question also
-    /// returns no-operator text instead of pretending a user declined.
+    /// copied onto the child's `StartupHints` so its prompt omits interactive
+    /// guidance.
     pub parent_non_interactive: bool,
     /// Parent session command channel. Carries lifecycle notifications the
     /// parent persists (`SubagentSpawned` / `SubagentFinished`) and — when
@@ -323,6 +325,9 @@ pub(crate) struct SubagentSpawnContext {
     /// doesn't derail the parent mid-`/goal`; surfaces 2/3 still drain it.
     pub goal_loop_active: Arc<std::sync::atomic::AtomicBool>,
 }
+pub(crate) fn strip_ask_user_question_tool(tools: &mut Vec<xai_grok_sampling_types::ToolSpec>) {
+    tools.retain(|tool| tool.name != "ask_user_question");
+}
 impl SubagentSpawnContext {
     /// Would installing a live bearer resolver strip this subagent's only
     /// credential? A wired resolver is the sampler's sole auth source, so
@@ -366,22 +371,19 @@ impl SubagentSpawnContext {
             cfg.cli_agent_overrides.apply_to_subagent_definition(def);
         }
     }
-    /// Subagent verbatim-input flag, mirroring `Config::resolve_compaction_verbatim_input` (env > config > remote settings > default `true`).
+    /// Not `Config::feature`: the parent's tiers resolve against the
+    /// subagent's own remote settings snapshot.
+    fn resolve_feature(&self, feature: crate::agent::config::Feature) -> bool {
+        use crate::agent::config::FeatureSources;
+        let mut sources = self.agent_config.as_ref().map_or_else(
+            || FeatureSources::from_process_env(feature),
+            |parent| parent.feature_sources(feature),
+        );
+        sources.remote = feature.remote_value(self.remote_settings.as_ref());
+        feature.resolve(sources).value
+    }
     pub(crate) fn resolve_compaction_verbatim_input(&self) -> bool {
-        crate::agent::config::BoolFlag::env("GROK_COMPACTION_VERBATIM_INPUT")
-            .config(
-                self.agent_config
-                    .as_ref()
-                    .and_then(|c| c.features.compaction_verbatim_input),
-            )
-            .feature_flag(
-                self.remote_settings
-                    .as_ref()
-                    .and_then(|r| r.compaction_verbatim_input),
-            )
-            .default(true)
-            .resolve()
-            .value
+        self.resolve_feature(crate::agent::config::Feature::CompactionVerbatimInput)
     }
     pub(crate) fn resolve_compaction_tool_choice(
         &self,
@@ -397,45 +399,10 @@ impl SubagentSpawnContext {
                 .and_then(|r| r.compaction_tool_choice.as_deref()),
         )
     }
-    /// Whether a completed subagent's worktree is snapshotted into a durable ref
-    /// and its directory deleted. Resolution mirrors the other subagent gates
-    /// (env > config > remote settings > default). Default `false` so it ships dark;
-    /// `managed_config.toml` `[features] subagent_worktree_snapshot` is the
-    /// per-deployment rollout lever.
+    /// Whether a completed subagent's working copy is saved into the repo as a
+    /// git ref and its directory deleted.
     pub(crate) fn resolve_subagent_worktree_snapshot_enabled(&self) -> bool {
-        crate::agent::config::BoolFlag::env("GROK_SUBAGENT_WORKTREE_SNAPSHOT")
-            .config(
-                self.agent_config
-                    .as_ref()
-                    .and_then(|c| c.features.subagent_worktree_snapshot),
-            )
-            .feature_flag(
-                self.remote_settings
-                    .as_ref()
-                    .and_then(|r| r.subagent_worktree_snapshot_enabled),
-            )
-            .default(false)
-            .resolve()
-            .value
-    }
-    /// Per-tool params for the child's spawn. The ask_user_question timeout is
-    /// session-level config, so it is resolved from the same tiers as the
-    /// parent (requirements/env/user/managed from disk; remote from the
-    /// parent's snapshot) and follows the session into subagents. Bash stays
-    /// on tool defaults, as before that knob existed.
-    pub(crate) fn resolve_tool_params_json(
-        &self,
-    ) -> crate::session::agent_rebuild::ResolvedToolParamsJson {
-        let params = crate::util::config::resolve_ask_user_question_params_from_disk(
-            self.remote_settings.as_ref(),
-        );
-        crate::session::agent_rebuild::ResolvedToolParamsJson {
-            bash: None,
-            ask_user_question: match serde_json::to_value(params) {
-                Ok(serde_json::Value::Object(map)) => Some(map),
-                _ => None,
-            },
-        }
+        self.resolve_feature(crate::agent::config::Feature::SubagentWorktreeSnapshot)
     }
 }
 /// Shell runtime handle retained while a child is active.

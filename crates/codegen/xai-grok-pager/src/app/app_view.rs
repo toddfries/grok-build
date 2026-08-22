@@ -6,6 +6,7 @@
 use super::ScreenMode;
 use crate::acp::model_state::ModelState;
 use crate::actions::{ActionId, ActionRegistry, When};
+use crate::app::consent::ConsentState;
 use crate::appearance::AppearanceConfig;
 use crate::input::KeyboardNormalizer;
 use crate::input::key::KeyShortcut;
@@ -227,6 +228,15 @@ pub enum ActiveView {
     /// The top-level Agent Dashboard. State lives in `AppView::dashboard`.
     AgentDashboard,
 }
+impl ActiveView {
+    /// The agent on screen, or `None` for a view that shows no single agent.
+    pub fn agent_id(self) -> Option<AgentId> {
+        match self {
+            ActiveView::Agent(id) => Some(id),
+            ActiveView::Welcome | ActiveView::AgentDashboard => None,
+        }
+    }
+}
 /// Target restored when leaving the dashboard (Ctrl+\ / Esc).
 /// Consumed by `dispatch_exit_dashboard`; dead agents fall back to
 /// insertion-order first / Welcome.
@@ -374,8 +384,12 @@ pub struct SessionPickerEntry {
     /// Human-readable worktree label (if the session was created in a named worktree).
     pub worktree_label: Option<String>,
     /// Per-turn secondary line (`lastTurnSummary` on the session/list wire).
-    /// Used for non-leader roster rows today; reserved for picker display later.
+    /// Shown as the "Last turn" line on the expanded resume card and used for
+    /// non-leader dashboard roster rows.
     pub last_turn_summary: Option<String>,
+    /// Latest session recap (`lastRecap` on the session/list wire), shown on the
+    /// expanded resume card whenever available. Distinct from `last_turn_summary`.
+    pub last_recap: Option<String>,
     /// Lazy-loaded detail for the expanded card view.
     pub card_detail: Option<CardDetail>,
 }
@@ -646,6 +660,8 @@ pub struct AppView {
     pub appearance: AppearanceConfig,
     /// Notification service (terminal bell, OSC sequences, title updates).
     pub notification_service: NotificationService,
+    /// The status row follows whichever agent is on screen, so the app owns it.
+    pub(crate) status_line: crate::app::status_line::StatusLineState,
     /// Escape sequences (title, progress bar) accumulated by the last
     /// `update_notifications()` tick. Consumed by `draw()` and appended
     /// to the frame's `post_flush_escapes` so they are written inside the
@@ -698,6 +714,7 @@ pub struct AppView {
     /// Whether the plugin marketplace CTA is enabled. Env `GROK_PLUGIN_CTA`
     /// overrides `RemoteSettings.plugin_cta` (remote settings); defaults to `false`.
     pub plugin_cta_enabled: bool,
+    pub workspace_dashboard_enabled: bool,
     /// Consumer billing surface (credit fetches / warnings). False for team
     /// and API-key auth. `/usage` itself stays available for session token/cost
     /// unless [`Self::has_external_auth_provider`].
@@ -863,6 +880,13 @@ pub struct AppView {
     pub welcome_refresh_rect: Option<ratatui::layout::Rect>,
     /// Hit-test rect for the gate URL link on the paywall CTA.
     pub welcome_gate_url_rect: Option<ratatui::layout::Rect>,
+    /// Rewritten by every welcome frame, so a resize leaves no stale click target.
+    pub welcome_consent_link_rects: Vec<(usize, ratatui::layout::Rect)>,
+    /// Consent link the mouse is over, so every run of a wrapped link brightens together.
+    pub welcome_consent_hover_link: Option<usize>,
+    /// The disk write is a spawned task, so a settings refresh that lands first would otherwise
+    /// re-arm a notice the user has already accepted.
+    pub consent_answered: Option<(String, i32)>,
     /// Hit-test rect for the welcome hero upgrade CTA `[label]` button
     /// (click → `AnnouncementsOpenCta(Welcome)`).
     pub welcome_upgrade_cta_rect: Option<ratatui::layout::Rect>,
@@ -1062,6 +1086,10 @@ pub struct AppView {
     /// when `Pending`, the welcome screen shows the trust question and session
     /// creation is deferred (gated after auth) until it is answered.
     pub trust_state: TrustState,
+    /// Resolves before folder trust: the account-level answer gates the workspace-level one.
+    pub consent_state: crate::app::consent::ConsentState,
+    /// Scopes the consent answer, the only identity the pager has for it.
+    pub account_email: Option<String>,
     /// Login button label from `AuthMethod.name` (e.g., "grok.com", "Acme Corp").
     pub login_label: Option<String>,
     /// The auth method ID to use for login.
@@ -1309,7 +1337,9 @@ impl AppView {
     /// startup sites; trust is gated AFTER auth so a pending trust question
     /// defers session creation until answered.
     pub fn session_startup_allowed(&self) -> bool {
-        matches!(self.auth_state, AuthState::Done) && matches!(self.trust_state, TrustState::Done)
+        matches!(self.auth_state, AuthState::Done)
+            && matches!(self.trust_state, TrustState::Done)
+            && matches!(self.consent_state, ConsentState::Done)
     }
     /// Whether startup type-ahead captured while the app was loading may be
     /// replayed into the input channel: every startup screen that consumes raw
@@ -1323,6 +1353,7 @@ impl AppView {
             && self.has_access()
             && !self.is_zdr_blocked()
             && matches!(self.trust_state, TrustState::Done)
+            && matches!(self.consent_state, ConsentState::Done)
     }
     /// Extract `GateInfo` from `RemoteSettings`.
     pub fn gate_from_settings(
@@ -1342,6 +1373,7 @@ impl AppView {
     pub fn apply_auth_meta(&mut self, meta: &xai_grok_shell::auth::AuthMeta) {
         self.pending_gate_verification = None;
         let was_gated = self.gate.is_some();
+        self.account_email = meta.email.clone();
         self.team_id = meta.team_id.clone();
         self.team_name = meta.team_name.clone();
         self.is_zdr = meta.is_zdr;
@@ -1456,6 +1488,7 @@ impl AppView {
             scroll_config: ScrollConfig::from_settings(),
             appearance: AppearanceConfig::default(),
             notification_service: NotificationService::new(Default::default()),
+            status_line: Default::default(),
             pending_notification_escapes: None,
             deferred_notification: None,
             tracing_rx: None,
@@ -1494,6 +1527,9 @@ impl AppView {
             welcome_auth_fallback_rect: None,
             welcome_refresh_rect: None,
             welcome_gate_url_rect: None,
+            welcome_consent_link_rects: Vec::new(),
+            welcome_consent_hover_link: None,
+            consent_answered: None,
             welcome_upgrade_cta_rect: None,
             welcome_privacy_banner_opt_in_rect: None,
             welcome_privacy_banner_opt_out_rect: None,
@@ -1571,6 +1607,8 @@ impl AppView {
             auth_methods: Vec::new(),
             auth_state: AuthState::Done,
             trust_state: TrustState::Done,
+            consent_state: crate::app::consent::ConsentState::Done,
+            account_email: None,
             login_label: None,
             login_method_id: None,
             auth_start_mode: AuthMode::Pending,
@@ -1620,6 +1658,7 @@ impl AppView {
             show_resolved_model: true,
             sharing_enabled: false,
             plugin_cta_enabled: false,
+            workspace_dashboard_enabled: false,
             usage_visible: true,
             has_external_auth_provider: false,
             tier_restricted_commands: Vec::new(),
@@ -2529,6 +2568,10 @@ impl AppView {
                 &mut WelcomeInputCtx {
                     auth_state: &self.auth_state,
                     trust_state: &self.trust_state,
+                    consent_state: &self.consent_state,
+                    consent_link_rects: &self.welcome_consent_link_rects,
+                    consent_hover_link: &mut self.welcome_consent_hover_link,
+                    arrived_at,
                     cwd: &self.cwd,
                     mid_session_login: self.auth_return_view.is_some(),
                     auth_code_input: &mut self.auth_code_input,
@@ -3144,6 +3187,11 @@ struct WelcomeInputCtx<'a> {
     /// Folder-trust state. When `Pending` (and auth is `Done`), the trust
     /// question intercepts keys and swallows the rest so no session starts.
     trust_state: &'a TrustState,
+    consent_state: &'a ConsentState,
+    consent_link_rects: &'a [(usize, ratatui::layout::Rect)],
+    consent_hover_link: &'a mut Option<usize>,
+    /// When this event reached the process, so a key typed before the notice painted is no answer.
+    arrived_at: Instant,
     /// Live working directory (tracks `Effect::SetWorkingDir`), used to pin
     /// the current repo's group to the top of the session picker.
     cwd: &'a std::path::Path,
@@ -3336,6 +3384,23 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
             NewWorktreeDialogOutcome::Changed => return InputOutcome::Changed,
             NewWorktreeDialogOutcome::Unchanged => return InputOutcome::Unchanged,
         }
+    }
+    if matches!(ctx.auth_state, AuthState::Done)
+        && ctx.has_access
+        && !ctx.is_zdr_blocked
+        && matches!(ctx.consent_state, ConsentState::Pending { .. })
+    {
+        return crate::app::consent::handle_answer(
+            ev,
+            &mut crate::app::consent::ConsentInputCtx {
+                state: ctx.consent_state,
+                arrived_at: ctx.arrived_at,
+                menu_rects: ctx.menu_rects,
+                link_rects: ctx.consent_link_rects,
+                menu_index: ctx.menu_index,
+                hover_link: ctx.consent_hover_link,
+            },
+        );
     }
     if matches!(ctx.auth_state, AuthState::Done)
         && ctx.has_access
@@ -3764,6 +3829,7 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
             return InputOutcome::ActionThenForward(Action::NewSession);
         }
         if *ctx.prompt_focused {
+            let had_highlight = ctx.prompt.textarea.selection_range().is_some();
             match ctx.prompt.handle_key(key) {
                 crate::views::prompt_widget::PromptEvent::Edited => {
                     return InputOutcome::Changed;
@@ -3771,6 +3837,9 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
                 crate::views::prompt_widget::PromptEvent::Ignored => {
                     if key!(Esc).matches(key) {
                         *ctx.prompt_focused = false;
+                        return InputOutcome::Changed;
+                    }
+                    if had_highlight && ctx.prompt.textarea.selection_range().is_none() {
                         return InputOutcome::Changed;
                     }
                 }
@@ -4472,6 +4541,7 @@ impl AppView {
                 &self.hidden_announcement_ids,
             );
         let agent_mouse_pos = self.last_mouse_pos;
+        let status_line_frame = self.status_line_frame();
         let Self {
             active_view,
             agents,
@@ -4566,6 +4636,8 @@ impl AppView {
                             cwd: &self.cwd,
                             auth_state: &self.auth_state,
                             trust_state: &self.trust_state,
+                            consent_state: &self.consent_state,
+                            consent_hover_link: self.welcome_consent_hover_link,
                             login_label: self.login_label.as_deref(),
                             auth_code_input: self.auth_code_input.text(),
                             auth_code_cursor_byte: self.auth_code_input.cursor_byte(),
@@ -4641,6 +4713,11 @@ impl AppView {
                         self.welcome_auth_fallback_rect = result.auth_fallback_rect;
                         self.welcome_refresh_rect = result.refresh_rect;
                         self.welcome_gate_url_rect = result.gate_url_rect;
+                        self.welcome_consent_link_rects = result.consent_link_rects;
+                        if self.welcome_consent_link_rects.is_empty() {
+                            self.welcome_consent_hover_link = None;
+                        }
+                        record_consent_paint(&mut self.consent_state, result.consent_legibility);
                         self.welcome_upgrade_cta_rect = result.upgrade_cta_rect;
                         self.welcome_privacy_banner_opt_in_rect = result.privacy_banner_opt_in_rect;
                         self.welcome_privacy_banner_opt_out_rect =
@@ -4881,6 +4958,7 @@ impl AppView {
                                     voice_listening,
                                     voice_interim: voice_interim.as_deref(),
                                     esc_owned_before_agent,
+                                    status_line: status_line_frame.clone(),
                                 },
                             );
                             if let Some(modal) = self.import_claude_modal.as_mut() {
@@ -5152,6 +5230,28 @@ impl AppView {
                 tracing::debug!(evicted, "scrollback.evicted_offscreen_render_caches");
             }
         }
+    }
+}
+/// The renderer is the only thing that knows whether the body fitted, and accept is gated on that.
+fn record_consent_paint(
+    state: &mut ConsentState,
+    reported: Option<crate::app::consent::ConsentLegibility>,
+) {
+    let ConsentState::Pending {
+        legibility,
+        painted_at,
+        ..
+    } = state
+    else {
+        return;
+    };
+    let Some(painted) = reported else {
+        *legibility = crate::app::consent::ConsentLegibility::Illegible;
+        return;
+    };
+    *legibility = painted;
+    if painted_at.is_none() {
+        *painted_at = Some(Instant::now());
     }
 }
 impl AppView {
@@ -5536,6 +5636,8 @@ impl AppView {
             }
         }
         needs_redraw |= self.tick_scroll();
+        self.update_status_line();
+        needs_redraw |= self.status_line.take_changed();
         needs_redraw
     }
     /// Flush pending scroll lines (stream gap detection, redraw cadence).
@@ -5682,6 +5784,9 @@ impl AppView {
     /// the ~12fps welcome logo shimmer and the macOS Cmd link-hover poll —
     /// so an app that *looks* idle doesn't spin a 30fps loop for them.
     pub fn tick_demand(&self) -> TickDemand {
+        self.view_tick_demand().max(self.status_line_tick_demand())
+    }
+    fn view_tick_demand(&self) -> TickDemand {
         if self.pending_action.is_some() {
             return TickDemand::Fast;
         }

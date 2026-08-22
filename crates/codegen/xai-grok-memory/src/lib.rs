@@ -28,9 +28,11 @@ pub mod compose;
 pub mod dream;
 pub mod dream_lock;
 pub mod embedding;
+pub mod flush;
 pub mod index;
 pub mod kind;
 pub mod mmr;
+pub mod observation;
 pub mod promote;
 pub mod query_expansion;
 pub mod schema;
@@ -49,6 +51,7 @@ pub use compose::{
 };
 pub use index::{MemoryIndex, init_sqlite_vec};
 pub use kind::{ChunkMeta, MemoryKind, classify_chunk};
+pub use observation::*;
 pub use promote::{
     CorePinConfig, CorePinSection, TypedEntry, age_days, extract_core_pins, forget_by_id,
     forget_matching, format_core_pin_injection, format_remember_note, is_session_stale,
@@ -57,6 +60,8 @@ pub use promote::{
 };
 pub use search::{SearchFilter, SearchResult, hybrid_search, hybrid_search_filtered};
 pub use storage::{MemoryScope, MemoryStorage};
+
+pub(crate) const MEMORY_LOG_TARGET: &str = "xai_memory";
 
 /// Embed all chunks that don't have embeddings yet.
 ///
@@ -74,7 +79,7 @@ pub async fn embed_missing_chunks(
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(
-                target: xai_grok_telemetry::memory_log::TARGET,
+                target: MEMORY_LOG_TARGET,
                 error = %e,
                 "failed to query chunks without embeddings"
             );
@@ -93,7 +98,7 @@ pub async fn embed_missing_chunks(
                 for ((chunk_id, _), embedding) in batch.iter().zip(embeddings.iter()) {
                     if let Err(e) = index.upsert_embedding(chunk_id, embedding) {
                         tracing::warn!(
-                            target: xai_grok_telemetry::memory_log::TARGET,
+                            target: MEMORY_LOG_TARGET,
                             chunk_id,
                             error = %e,
                             "failed to upsert embedding"
@@ -105,7 +110,7 @@ pub async fn embed_missing_chunks(
             }
             Err(e) => {
                 tracing::warn!(
-                    target: xai_grok_telemetry::memory_log::TARGET,
+                    target: MEMORY_LOG_TARGET,
                     error = %e,
                     batch_size = texts.len(),
                     "embedding batch failed, skipping"
@@ -116,7 +121,7 @@ pub async fn embed_missing_chunks(
 
     if embedded > 0 {
         tracing::info!(
-            target: xai_grok_telemetry::memory_log::TARGET,
+            target: MEMORY_LOG_TARGET,
             embedded,
             total,
             "embedded missing chunks"

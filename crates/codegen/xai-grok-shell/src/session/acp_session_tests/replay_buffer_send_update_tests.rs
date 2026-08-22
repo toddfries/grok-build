@@ -74,6 +74,7 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
     });
     let (event_tx, event_rx) = mpsc::unbounded_channel::<SessionEvent>();
     let actor = SessionActor {
+        status_wake: Default::default(),
         session_info: SessionInfo {
             id: acp::SessionId::new("test-session"),
             cwd: cwd.as_str().to_string(),
@@ -174,6 +175,7 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
         agent: std::cell::RefCell::new(test_agent_default().await),
         last_reported_branch: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         git_head_enabled: false,
+        status_line_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         models_manager: Default::default(),
         display_cwd: std::sync::OnceLock::new(),
         active_agent_type: parking_lot::Mutex::new(None),
@@ -250,7 +252,11 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
         recap_epoch: std::cell::Cell::new(0),
         turn_summary_task: std::cell::RefCell::new(None),
         turn_summary_generation: std::cell::Cell::new(0),
+        title_refresh_task: std::cell::RefCell::new(None),
+        title_refresh_generation: std::cell::Cell::new(0),
+        next_title_refresh_idx: std::cell::Cell::new(0),
         turn_summary_enabled: false,
+        title_refresh_enabled: false,
         session_turn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
         turn_stream_drained: parking_lot::Mutex::new(None),

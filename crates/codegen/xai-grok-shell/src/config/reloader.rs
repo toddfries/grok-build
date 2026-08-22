@@ -362,7 +362,7 @@ impl ConfigReloader {
                 Err(e) => {
                     error!(
                         error = %e,
-                        "failed to parse memory config, keeping previous memory config"
+                        "failed to parse the config, keeping the previous memory config"
                     );
                 }
             },

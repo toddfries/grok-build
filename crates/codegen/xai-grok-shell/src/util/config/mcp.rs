@@ -51,6 +51,7 @@ pub struct Config {
     pub ask_user_question: crate::tools::config::AskUserQuestionToolConfig,
     /// `[privacy]` — local banner ack (not auth-metadata).
     pub privacy: PrivacyConfig,
+    pub consent: super::consent::ConsentConfig,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]

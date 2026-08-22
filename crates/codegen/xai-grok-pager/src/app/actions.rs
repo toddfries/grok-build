@@ -7,6 +7,7 @@
 //! - [`Effect`] — produced by dispatch, consumed by the event loop (async).
 //! - [`TaskResult`] — produced by spawned tasks, fed back into dispatch.
 use super::agent::AgentId;
+use crate::app::status_line::StatusLineRun;
 use crate::scrollback::entry::EntryId;
 use agent_client_protocol as acp;
 use xai_grok_shell::sampling::types::ReasoningEffort;
@@ -684,6 +685,11 @@ pub enum Action {
     /// workspace, mark trust resolved, and replay any deferred session startup.
     /// (Declining quits via [`Action::Quit`]; there is no decline action.)
     TrustFolder,
+    /// Replays any session startup deferred behind the notice.
+    /// (Declining quits via [`Action::Quit`]; there is no decline action.)
+    AcceptConsent,
+    /// Opens the notice's nth link. The url is re-read from validated state, never carried here.
+    OpenConsentLink(usize),
     /// A spawned task completed.
     TaskComplete(TaskResult),
     /// Share the current session via URL.
@@ -1411,6 +1417,8 @@ pub enum AfterSessionDelete {
 /// [`TaskResult`] as `Action::TaskComplete`.
 #[derive(Debug)]
 pub enum Effect {
+    /// Run a `command` status line.
+    RunStatusLineCommand(StatusLineRun),
     /// Create a new ACP session.
     CreateSession {
         agent_id: AgentId,
@@ -1563,14 +1571,9 @@ pub enum Effect {
         /// `mid_turn_abort` telemetry can distinguish them. `None` for
         /// programmatic cancels (login/reauth flows).
         trigger: Option<CancelTrigger>,
-        /// Ask the shell to trim the in-flight prompt from session history when
-        /// the turn has produced no output yet, sent as
-        /// `_meta.rewindIfNoOutput`. Set true ONLY when the pager has locally
-        /// rewound the prompt back into the composer, so the shell's history
-        /// matches the UI. Without it the shell keeps the prompt plus an
-        /// interruption marker, and a later resend pairs the kept copy with the
-        /// resend — the send+Ctrl+C double-prompt bug.
-        rewind_if_no_output: bool,
+        /// `_meta.rewindIfNoOutput` + `_meta.promptId` of the locally rewound turn.
+        /// Set only when the pager restored the prompt into the composer.
+        rewind_prompt_id: Option<String>,
     },
     /// Run a manual `/compact` command.
     Compact {
@@ -1619,6 +1622,15 @@ pub enum Effect {
     },
     /// Persist `[privacy].privacy_banner_acked` (RFC 3339 dismiss time).
     PersistPrivacyBannerAcked { acked_at: String },
+    /// Persist the consent answer to `[consent]` in config.toml.
+    PersistConsentAnswer {
+        account: Option<String>,
+        notice_id: String,
+        version: i32,
+        acked: bool,
+    },
+    /// Files the acceptance server side; the local marker is what stops the re-prompt if it fails.
+    RecordConsentUpstream { notice_id: String, version: i32 },
     /// Persist memory modal fullscreen preference to `[hints]` in config.toml.
     PersistMemoryFullscreen { fullscreen: bool },
     /// Persist the dashboard's `[dashboard]` configuration to `~/.grok/config.toml`.
@@ -2280,6 +2292,11 @@ impl TaskResult {
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum TaskResult {
+    /// A `command` status line finished.
+    StatusLineCommandFinished {
+        id: crate::app::status_line::RunId,
+        outcome: crate::app::status_line::RunOutcome,
+    },
     /// Session was created successfully.
     SessionCreated {
         agent_id: AgentId,
@@ -2485,6 +2502,16 @@ pub enum TaskResult {
     /// Cancel notification was sent (fire-and-forget).
     /// The real turn end comes via PromptResponse.
     CancelComplete,
+    /// The marker can stop advertising itself as unsent.
+    ConsentRecorded {
+        notice_id: String,
+        version: i32,
+    },
+    /// The answer stands for this run, but nothing on disk holds it,
+    /// so the notice returns at the next launch.
+    ConsentPersistFailed {
+        error: String,
+    },
     /// Response to `x.ai/subagent/cancel`; see [`SubagentKillOutcome`].
     KillSubagentComplete {
         session_id: acp::SessionId,
