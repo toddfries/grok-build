@@ -730,6 +730,9 @@ impl MemoryConfig {
                         remote.and_then(|settings| settings.memory_initial_injection_min_score)
                     })
                     .or(defaults.initial_injection.min_score),
+                core_pin: initial_injection
+                    .and_then(|settings| settings.core_pin.clone())
+                    .unwrap_or_else(|| defaults.initial_injection.core_pin.clone()),
             },
             session: MemorySessionConfig {
                 save_on_end: session
