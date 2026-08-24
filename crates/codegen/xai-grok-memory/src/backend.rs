@@ -487,7 +487,7 @@ impl MemoryBackend for MemoryBackendImpl {
             )
             .map(|c| super::search::SearchMerge {
                 results: c.flat,
-                is_vector_degraded: query_embedding.embedding().is_none(),
+                is_vector_degraded: query_embedding.is_none(),
             })
         } else {
             super::compose::hybrid_search_sync(
@@ -499,16 +499,16 @@ impl MemoryBackend for MemoryBackendImpl {
             )
             .map(|results| super::search::SearchMerge {
                 results,
-                is_vector_degraded: query_embedding.embedding().is_none(),
+                is_vector_degraded: query_embedding.is_none(),
             })
         }
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
             Box::new(std::io::Error::other(e.to_string()))
         })?;
-        let mode = if merged.is_vector_degraded {
+        let mode = if merged.is_vector_degraded || query_embedding.is_none() {
             MemoryRetrievalMode::FtsOnly
         } else {
-            query_embedding.mode()
+            MemoryRetrievalMode::Hybrid
         };
         let error_class = select_search_error_class(None, merged.is_vector_degraded);
         let results = merged.results;
@@ -535,7 +535,7 @@ impl MemoryBackend for MemoryBackendImpl {
                 top_score: results.first().map_or(0.0, |result| result.score),
                 min_score_threshold: min_score,
                 duration_ms: search_start.elapsed().as_millis() as u64,
-                is_vector_available: query_embedding.mode() != MemoryRetrievalMode::FtsOnly,
+                is_vector_available: query_embedding.is_some(),
                 error_class,
             });
         self.search_counter
