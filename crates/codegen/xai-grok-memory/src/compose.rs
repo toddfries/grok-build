@@ -337,7 +337,14 @@ pub fn hybrid_search_sync(
         }
     }
 
-    super::search::hybrid_search_merge(index, fts_results, query_embedding, config, filter)
+    Ok(super::search::hybrid_search_merge(
+        index,
+        fts_results,
+        query_embedding,
+        config,
+        filter,
+    )?
+    .results)
 }
 
 /// Drop chunks that another returned chunk supersedes (by id fragment or slug).
