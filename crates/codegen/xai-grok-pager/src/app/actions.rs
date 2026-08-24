@@ -7,6 +7,7 @@
 //! - [`Effect`] — produced by dispatch, consumed by the event loop (async).
 //! - [`TaskResult`] — produced by spawned tasks, fed back into dispatch.
 use super::agent::AgentId;
+use crate::app::status_line::StatusLineRun;
 use crate::scrollback::entry::EntryId;
 use agent_client_protocol as acp;
 use xai_grok_shell::sampling::types::ReasoningEffort;
@@ -449,7 +450,8 @@ pub enum Action {
     /// time, mirroring how `AnnouncementsHide` resolves its target). The
     /// payload records which surface activated it, for telemetry.
     AnnouncementsOpenCta(xai_grok_telemetry::events::AnnouncementCtaSurface),
-    /// Cycle session mode (Shift+Tab): Normal → Plan → Always-Approve → Normal.
+    /// Cycle session mode (Shift+Tab): Normal → Plan → Auto → Always-Approve →
+    /// Normal (Auto skipped when the feature gate is off).
     /// Plan mode sends a signal to the shell; always-approve is local.
     CycleMode,
     /// Toggle YOLO mode (auto-approve all permissions). Ctrl+O.
@@ -684,6 +686,11 @@ pub enum Action {
     /// workspace, mark trust resolved, and replay any deferred session startup.
     /// (Declining quits via [`Action::Quit`]; there is no decline action.)
     TrustFolder,
+    /// Replays any session startup deferred behind the notice.
+    /// (Declining quits via [`Action::Quit`]; there is no decline action.)
+    AcceptConsent,
+    /// Opens the notice's nth link. The url is re-read from validated state, never carried here.
+    OpenConsentLink(usize),
     /// A spawned task completed.
     TaskComplete(TaskResult),
     /// Share the current session via URL.
@@ -725,10 +732,20 @@ pub enum Action {
     /// to config.toml). `/plan <desc>` uses `EnterPlanMode` instead
     /// because it also starts a turn.
     SetPlanMode(PlanModeKind),
-    /// Open the freeform feedback bottom pane (bare `/feedback`).
-    OpenFeedbackPane,
-    /// Submit feedback text (inline `/feedback <text>` or pane submit).
-    SendFeedback(String),
+    /// Open the freeform feedback card. `images` carries composer
+    /// attachments drained at slash-execution time (inline `/feedback`
+    /// composed alongside pasted images); the pane adopts them as chips.
+    OpenFeedbackPane {
+        prefill: Option<String>,
+        images: crate::views::prompt_widget::FeedbackImages,
+    },
+    /// Submit feedback (minimal inline `/feedback <text>`, or card
+    /// submit). `trace` is `None` when no trace-consent card was shown.
+    SendFeedback {
+        text: String,
+        images: crate::views::prompt_widget::FeedbackImages,
+        trace: Option<FeedbackTraceChoice>,
+    },
     /// Enter remember mode (visual prompt change, not a send).
     EnterRememberMode,
     /// Send a remember note from # mode. Routes through LLM rewrite when a
@@ -847,10 +864,11 @@ pub enum Action {
     /// Confirm permanent delete of the armed dashboard row.
     DashboardDelete,
     /// Cycle the dispatch input's mode for the next spawned agent
-    /// (Normal → Plan → Always-Approve → Normal). Bound to Shift+Tab.
+    /// (Normal → Plan → Auto → Always-Approve → Normal; Auto skipped when
+    /// gated off). Bound to Shift+Tab.
     DashboardCycleMode,
-    /// Cycle the PEEKED agent's live mode (Normal → Plan → Always-Approve
-    /// → Normal) — the peek-panel counterpart to [`Self::DashboardCycleMode`].
+    /// Cycle the PEEKED agent's live mode (same gated rotation as the agent
+    /// prompt) — the peek-panel counterpart to [`Self::DashboardCycleMode`].
     /// Unlike that staged dispatch mode, this changes the existing agent
     /// directly (same effect as Shift+Tab inside the agent's chat view).
     /// Emitted when Shift+Tab fires while the peek panel is open.
@@ -1133,6 +1151,16 @@ mod permission_mode_kind_tests {
         }
     }
 }
+/// What the user chose on the `/feedback` trace-consent question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedbackTraceChoice {
+    /// Upload with this report and persist `[telemetry] trace_upload = true`.
+    AlwaysUpload,
+    /// Send the report alone (also the Esc/skip outcome).
+    NoUpload,
+    /// Send the report alone and persist `[features] feedback_trace_card = false`.
+    NeverAsk,
+}
 /// Canonical on/off state for `plan_mode`. Binary today (single bit
 /// on `agent.plan_mode_active`); typed enum so a future third state
 /// can be added without churning dispatcher arms.
@@ -1207,6 +1235,11 @@ pub enum ClipboardPasteTarget {
     AgentPrompt {
         agent_id: AgentId,
         images_dir: Option<std::path::PathBuf>,
+        /// Enqueued while the `/feedback` report pane owned the composer. The
+        /// completion drops the attachment when that pane is gone, so a
+        /// screenshot pasted into the pane cannot land in the composer draft
+        /// an Esc restored.
+        from_feedback_pane: bool,
     },
     /// Dashboard new-session dispatch input.
     DashboardDispatch,
@@ -1411,6 +1444,8 @@ pub enum AfterSessionDelete {
 /// [`TaskResult`] as `Action::TaskComplete`.
 #[derive(Debug)]
 pub enum Effect {
+    /// Run a `command` status line.
+    RunStatusLineCommand(StatusLineRun),
     /// Create a new ACP session.
     CreateSession {
         agent_id: AgentId,
@@ -1420,6 +1455,9 @@ pub enum Effect {
         /// the correct model and agent type from the start — avoids a
         /// follow-up `SetSessionModel` roundtrip.
         model_id: Option<acp::ModelId>,
+        /// Per-create permission mode. Dashboard dispatches set this so their
+        /// staged mode overrides process-global defaults without persisting.
+        permission_mode_override: Option<PermissionModeKind>,
         /// Client-chosen session ID (`--session-id` / `meta.sessionId`).
         preferred_session_id: Option<String>,
         /// Gateway light-frontend for **this** session only (`/chat` one-shot
@@ -1443,6 +1481,9 @@ pub enum Effect {
         /// right model — mirrors [`Effect::CreateSession::model_id`]. `None`
         /// for the welcome / CLI / fork paths.
         model_id: Option<acp::ModelId>,
+        /// Per-create permission mode for a fresh worktree session. Ignored
+        /// when resuming an existing session.
+        permission_mode_override: Option<PermissionModeKind>,
         /// Client-chosen session ID (`--session-id` with `--worktree`) used as
         /// the worktree/session id and `meta.sessionId` on fresh create.
         /// Ignored when `load_session_id` is set (resume path owns the id).
@@ -1563,14 +1604,9 @@ pub enum Effect {
         /// `mid_turn_abort` telemetry can distinguish them. `None` for
         /// programmatic cancels (login/reauth flows).
         trigger: Option<CancelTrigger>,
-        /// Ask the shell to trim the in-flight prompt from session history when
-        /// the turn has produced no output yet, sent as
-        /// `_meta.rewindIfNoOutput`. Set true ONLY when the pager has locally
-        /// rewound the prompt back into the composer, so the shell's history
-        /// matches the UI. Without it the shell keeps the prompt plus an
-        /// interruption marker, and a later resend pairs the kept copy with the
-        /// resend — the send+Ctrl+C double-prompt bug.
-        rewind_if_no_output: bool,
+        /// `_meta.rewindIfNoOutput` + `_meta.promptId` of the locally rewound turn.
+        /// Set only when the pager restored the prompt into the composer.
+        rewind_prompt_id: Option<String>,
     },
     /// Run a manual `/compact` command.
     Compact {
@@ -1619,6 +1655,15 @@ pub enum Effect {
     },
     /// Persist `[privacy].privacy_banner_acked` (RFC 3339 dismiss time).
     PersistPrivacyBannerAcked { acked_at: String },
+    /// Persist the consent answer to `[consent]` in config.toml.
+    PersistConsentAnswer {
+        account: Option<String>,
+        notice_id: String,
+        version: i32,
+        acked: bool,
+    },
+    /// Files the acceptance server side; the local marker is what stops the re-prompt if it fails.
+    RecordConsentUpstream { notice_id: String, version: i32 },
     /// Persist memory modal fullscreen preference to `[hints]` in config.toml.
     PersistMemoryFullscreen { fullscreen: bool },
     /// Persist the dashboard's `[dashboard]` configuration to `~/.grok/config.toml`.
@@ -1943,6 +1988,12 @@ pub enum Effect {
         agent_id: AgentId,
         session_id: acp::SessionId,
         feedback_text: String,
+        images: Vec<xai_grok_shell::session::FeedbackImage>,
+    },
+    /// One-shot session archive for a feedback report (after the text POST).
+    UploadFeedbackTrace {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
     },
     /// Save a remember note to global MEMORY.md (async file write).
     SaveMemoryNote {
@@ -2280,6 +2331,11 @@ impl TaskResult {
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum TaskResult {
+    /// A `command` status line finished.
+    StatusLineCommandFinished {
+        id: crate::app::status_line::RunId,
+        outcome: crate::app::status_line::RunOutcome,
+    },
     /// Session was created successfully.
     SessionCreated {
         agent_id: AgentId,
@@ -2485,6 +2541,16 @@ pub enum TaskResult {
     /// Cancel notification was sent (fire-and-forget).
     /// The real turn end comes via PromptResponse.
     CancelComplete,
+    /// The marker can stop advertising itself as unsent.
+    ConsentRecorded {
+        notice_id: String,
+        version: i32,
+    },
+    /// The answer stands for this run, but nothing on disk holds it,
+    /// so the notice returns at the next launch.
+    ConsentPersistFailed {
+        error: String,
+    },
     /// Response to `x.ai/subagent/cancel`; see [`SubagentKillOutcome`].
     KillSubagentComplete {
         session_id: acp::SessionId,
@@ -2775,6 +2841,11 @@ pub enum TaskResult {
     FeedbackFailed {
         agent_id: AgentId,
         error: String,
+    },
+    /// One-shot feedback trace archive finished (or was skipped).
+    FeedbackTraceUploaded {
+        agent_id: AgentId,
+        error: Option<String>,
     },
     /// Memory note saved to global MEMORY.md.
     MemoryNoteSaved {

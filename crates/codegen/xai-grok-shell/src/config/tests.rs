@@ -1133,6 +1133,52 @@ fn subagent_limit_counts_resolve_env_over_toml_over_remote_over_default() {
         );
 }
 #[test]
+fn subagent_sampling_limit_applies_precedence_and_clamps() {
+    use crate::agent::subagent::MAX_SUBAGENT_SAMPLING_LIMIT;
+    use xai_grok_tools::implementations::grok_build::task::admission::DEFAULT_MAX_CONCURRENT;
+    let resolve = |env: Option<&str>, config: Option<i64>, remote: Option<u32>| SubagentsConfig::resolve_sampling_limit(
+        env,
+        config,
+        remote,
+        DEFAULT_MAX_CONCURRENT,
+    );
+    assert_eq!(resolve(None, None, None), DEFAULT_MAX_CONCURRENT);
+    assert_eq!(resolve(Some("24"), Some(8), Some(4)), 24);
+    for bad in ["0", "-1", "garbage"] {
+        assert_eq!(resolve(Some(bad), None, None), DEFAULT_MAX_CONCURRENT);
+    }
+    let huge = (MAX_SUBAGENT_SAMPLING_LIMIT as u64 + 1_000).to_string();
+    assert_eq!(resolve(Some(&huge), None, None), MAX_SUBAGENT_SAMPLING_LIMIT);
+    assert_eq!(
+            resolve(Some("999999999999999999999999999"), None, None),
+            DEFAULT_MAX_CONCURRENT
+        );
+    assert!(resolve(Some("0"), Some(0), Some(0)) > 0);
+}
+#[test]
+fn subagent_sampling_limit_env_override_beats_toml() {
+    let _lock = SUBAGENTS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = crate::env::EnvVarGuard::set(SubagentsConfig::ENV_SAMPLING_LIMIT, "24");
+    let raw: toml::Value = toml::from_str("[subagents]\nsampling_limit = 8\n").unwrap();
+    let mut config = crate::agent::config::Config::new_from_toml_cfg(&raw).unwrap();
+    config.resolve_subagents(false, &raw);
+    assert_eq!(config.subagents_sampling_limit, 24);
+}
+#[test]
+fn subagent_sampling_limit_defaults_to_resolved_subagents_max_concurrent() {
+    let _lock = SUBAGENTS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = crate::env::EnvVarGuard::remove(SubagentsConfig::ENV_SAMPLING_LIMIT)
+        .and_set(SubagentsConfig::ENV_MAX_CONCURRENT, "20");
+    let raw: toml::Value = toml::from_str("[subagents]\n").unwrap();
+    let mut config = crate::agent::config::Config::new_from_toml_cfg(&raw).unwrap();
+    config.resolve_subagents(false, &raw);
+    assert_eq!(config.subagents_max_concurrent, 20);
+    assert_eq!(
+            config.subagents_sampling_limit,
+            config.subagents_max_concurrent
+        );
+}
+#[test]
 fn subagent_limit_behavior_resolves_env_over_toml_over_remote_over_queue() {
     use xai_grok_tools::implementations::grok_build::task::admission::LimitBehavior;
     let resolve = SubagentsConfig::resolve_limit_behavior;
@@ -1153,11 +1199,12 @@ fn subagent_limit_behavior_resolves_env_over_toml_over_remote_over_queue() {
 fn subagents_config_parses_limits_from_toml() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str(
-                "[subagents]\nmax_concurrent = 4\nlimit_behavior = \"fail\"\nworkflow_max_concurrent = 8\n",
+                "[subagents]\nmax_concurrent = 4\nsampling_limit = 6\nlimit_behavior = \"fail\"\nworkflow_max_concurrent = 8\n",
             )
             .unwrap();
         let sa = SubagentsConfig::resolve(false, &config);
         assert_eq!(sa.max_concurrent, Some(4));
+        assert_eq!(sa.sampling_limit, Some(6));
         assert_eq!(sa.limit_behavior.as_deref(), Some("fail"));
         assert_eq!(sa.workflow_max_concurrent, Some(8));
     });
@@ -2233,6 +2280,30 @@ fn malformed_zdr_video_output_s3_preserves_zdr_flag() {
     });
 }
 #[test]
+fn media_gen_caps_resolve_env_over_toml_over_remote_over_default() {
+    use xai_grok_tools::media_gen_limits::{
+        DEFAULT_MAX_PARALLEL_IMAGE_GEN, DEFAULT_MAX_PARALLEL_VIDEO_GEN,
+    };
+    let config: toml::Value = toml::from_str(
+            "[tools.media_gen]\nmax_parallel_image_gen_calls = 2\nmax_parallel_video_gen_calls = 1\n",
+        )
+        .unwrap();
+    let tc = ToolsConfig::resolve(&config);
+    assert_eq!(tc.media_gen.max_parallel_image_gen_calls, Some(2));
+    assert_eq!(tc.media_gen.max_parallel_video_gen_calls, Some(1));
+    let image = ToolsConfig::resolve_max_parallel_image_gen_calls;
+    let video = ToolsConfig::resolve_max_parallel_video_gen_calls;
+    assert_eq!(image(Some("3"), Some(2), Some(4)), 3);
+    assert_eq!(image(None, Some(2), Some(4)), 2);
+    assert_eq!(image(None, None, Some(5)), 5);
+    assert_eq!(image(None, None, None), DEFAULT_MAX_PARALLEL_IMAGE_GEN);
+    assert_eq!(image(Some("not-a-number"), Some(2), None), 2);
+    assert_eq!(image(Some("0"), Some(2), None), 1);
+    assert_eq!(image(None, Some(0), Some(3)), 1);
+    assert_eq!(video(None, None, None), DEFAULT_MAX_PARALLEL_VIDEO_GEN);
+    assert_eq!(video(Some("9"), Some(1), Some(2)), 9);
+}
+#[test]
 fn roles_parse_from_toml() {
     let toml_str = r#"
             [roles.researcher]
@@ -3235,10 +3306,15 @@ fn apply_requirements_value_overrides_user_settings() {
             Some(crate::agent::config::TelemetryMode::Disabled),
             cfg.features.telemetry
         );
-    assert_eq!(Some(false), cfg.features.feedback);
-    assert_eq!(Some(false), cfg.features.lsp_tools);
-    assert_eq!(Some(false), cfg.features.web_fetch);
-    assert_eq!(Some(false), cfg.features.write_file);
+    assert!(!cfg.is_feature_enabled(crate::agent::config::Feature::Feedback));
+    assert!(!cfg.is_feature_enabled(crate::agent::config::Feature::LspTools));
+    assert!(!cfg.is_feature_enabled(crate::agent::config::Feature::WebFetch));
+    assert!(
+            enforced
+                .iter()
+                .any(|e| e.path == "features.lsp_tools" && e.value == "false")
+        );
+    assert!(!cfg.is_feature_enabled(crate::agent::config::Feature::WriteFile));
     assert_eq!(Some(false), cfg.requirements.remote_fetch.pinned());
     assert!(
             enforced
@@ -3346,9 +3422,83 @@ fn apply_requirements_pins_voice_mode_false() {
         path: std::path::PathBuf::from("/test/requirements.toml"),
     };
     apply_requirements_inner(&mut cfg, &req, &source);
-    assert_eq!(cfg.requirements.voice_mode.pinned(), Some(false));
-    assert_eq!(cfg.features.voice_mode, Some(false));
-    assert!(!cfg.resolve_voice_mode().value);
+    assert_eq!(
+            cfg.requirements
+                .pinned_feature(crate::agent::config::Feature::VoiceMode),
+            Some(false)
+        );
+    assert!(!cfg.is_feature_enabled(crate::agent::config::Feature::VoiceMode));
+}
+/// Two layers pinning one key alike must report the layer that decided, not
+/// the first that asked, or the operator log names a user's file for an
+/// administrator's pin. Layers apply user first, system last.
+#[test]
+fn a_repeated_pin_is_reported_against_the_layer_that_decided() {
+    let mut cfg = crate::agent::config::Config::default();
+    let req: toml::Value = toml::from_str("[features]\nsession_search = false\n")
+        .unwrap();
+    let user = RequirementSource::Requirements {
+        path: std::path::PathBuf::from("/home/dev/.grok/requirements.toml"),
+    };
+    let system = RequirementSource::Requirements {
+        path: std::path::PathBuf::from("/etc/grok/requirements.toml"),
+    };
+    let mut enforced = apply_requirements_inner(&mut cfg, &req, &user);
+    enforced.extend(apply_requirements_inner(&mut cfg, &req, &system));
+    let deduped = keep_the_deciding_layer(enforced);
+    let reported: Vec<_> = deduped
+        .iter()
+        .filter(|field| field.path == "features.session_search")
+        .collect();
+    assert_eq!(reported.len(), 1, "one row per pinned key");
+    assert_eq!(reported[0].source, system);
+}
+/// Not a registry row, so the loop that pins those does not reach it. An
+/// administrator pinning the title off must still outrank a user's
+/// GROK_TITLE_REFRESH, which a config-tier value would lose to.
+#[test]
+#[serial_test::serial]
+fn apply_requirements_pins_title_refresh_over_the_environment() {
+    use xai_grok_test_support::EnvGuard;
+    let _env = EnvGuard::set("GROK_TITLE_REFRESH", "1");
+    let mut cfg = crate::agent::config::Config::default();
+    let req: toml::Value = toml::from_str("[features]\ntitle_refresh = false\n")
+        .unwrap();
+    let source = RequirementSource::Requirements {
+        path: std::path::PathBuf::from("/test/requirements.toml"),
+    };
+    let enforced = apply_requirements_inner(&mut cfg, &req, &source);
+    let resolved = cfg.resolve_title_refresh();
+    assert!(!resolved.value, "the pin lost to GROK_TITLE_REFRESH");
+    assert_eq!(
+            resolved.source,
+            crate::agent::config::ConfigSource::Requirement
+        );
+    assert!(
+            enforced
+                .iter()
+                .any(|field| field.path == "features.title_refresh"),
+            "the pin is reported to the operator log"
+        );
+}
+/// A non-boolean pin reaches the applier only when a higher layer supplied a
+/// valid value, so ignoring it leaves that winning layer standing.
+#[test]
+fn malformed_requirements_pin_is_ignored() {
+    use crate::agent::config::Feature;
+    let mut cfg = crate::agent::config::Config::default();
+    let req: toml::Value = toml::from_str("[features]\nweb_fetch = 1\n").unwrap();
+    let source = RequirementSource::Requirements {
+        path: std::path::PathBuf::from("/home/dev/.grok/requirements.toml"),
+    };
+    let enforced = apply_requirements_inner(&mut cfg, &req, &source);
+    assert_eq!(cfg.requirements.pinned_feature(Feature::WebFetch), None);
+    assert!(
+            !enforced
+                .iter()
+                .any(|e| e.path == Feature::WebFetch.path()),
+            "an ignored pin enforces nothing"
+        );
 }
 /// Requirements enforcement beats a campaign-supplied default. The on-disk
 /// `Config` arrives campaign-overlaid (`models.default` = a campaign value);
@@ -3449,10 +3599,11 @@ fn validate_hooks_path_accepts_grok_hooks_subdir() {
 }
 #[test]
 fn managed_settings_disables_features_and_requirements_overrides() {
+    use crate::agent::config::Feature;
     use xai_grok_workspace::permission::resolution::ManagedSettingsFeatures;
     let mut cfg = crate::agent::config::Config::default();
     cfg.features.telemetry = Some(crate::agent::config::TelemetryMode::Enabled);
-    cfg.features.feedback = Some(true);
+    cfg.feature_values.insert(Feature::Feedback, true);
     cfg.default_yolo_mode = true;
     let features = ManagedSettingsFeatures {
         disable_telemetry: Some(true),
@@ -3465,7 +3616,7 @@ fn managed_settings_disables_features_and_requirements_overrides() {
             cfg.features.telemetry,
             Some(crate::agent::config::TelemetryMode::Disabled)
         );
-    assert_eq!(cfg.features.feedback, Some(false));
+    assert_eq!(cfg.feature_values.get(&Feature::Feedback), Some(&false));
     assert!(cfg.default_yolo_mode);
     assert_eq!(enforced.len(), 2);
     assert!(!enforced.iter().any(|e| e.path == "ui.yolo"));
@@ -3481,17 +3632,18 @@ fn managed_settings_disables_features_and_requirements_overrides() {
             cfg.features.telemetry,
             Some(crate::agent::config::TelemetryMode::Enabled)
         );
-    assert_eq!(cfg.features.feedback, Some(true));
+    assert!(cfg.is_feature_enabled(Feature::Feedback));
     assert!(cfg.ui.yolo);
 }
 /// REGRESSION: external managed-settings.json is advisory, not authoritative.
 /// disableBypassPermissionsMode (-> features.disable_yolo) must NOT clamp the user's own grok yolo.
 #[test]
 fn managed_settings_does_not_override_user_yolo() {
+    use crate::agent::config::Feature;
     use xai_grok_workspace::permission::resolution::ManagedSettingsFeatures;
     let mut cfg = crate::agent::config::Config::default();
     cfg.features.telemetry = Some(crate::agent::config::TelemetryMode::Enabled);
-    cfg.features.feedback = Some(true);
+    cfg.feature_values.insert(Feature::Feedback, true);
     cfg.ui.yolo = true;
     cfg.default_yolo_mode = true;
     let features = ManagedSettingsFeatures {
@@ -3507,7 +3659,7 @@ fn managed_settings_does_not_override_user_yolo() {
             cfg.features.telemetry,
             Some(crate::agent::config::TelemetryMode::Disabled)
         );
-    assert_eq!(cfg.features.feedback, Some(false));
+    assert_eq!(cfg.feature_values.get(&Feature::Feedback), Some(&false));
     assert!(cfg.ui.yolo);
     assert!(cfg.default_yolo_mode);
     assert_eq!(enforced.len(), 2);

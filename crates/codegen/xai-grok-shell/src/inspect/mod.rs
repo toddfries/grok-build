@@ -318,8 +318,11 @@ async fn build_report(cwd: &Path) -> InspectReport {
     if let Some(table) = config_without_compat.as_table_mut() {
         table.remove("compat");
     }
-    let parsed_config =
-        crate::agent::config::Config::new_from_toml_cfg(&config_without_compat).ok();
+    let parsed_config = crate::agent::config::Config::new_from_toml_cfg(&config_without_compat);
+    // A config that does not parse is the answer `inspect` exists to give, so
+    // keep the reason rather than reporting an empty config as a clean one.
+    let config_parse_error = parsed_config.as_ref().err().cloned();
+    let parsed_config = parsed_config.ok();
 
     let git_root = git2::Repository::discover(cwd)
         .ok()
@@ -395,10 +398,19 @@ async fn build_report(cwd: &Path) -> InspectReport {
     }
     let lsp = list_lsp_servers(cwd, &discovered_plugins);
     let configs = list_config_sources(cwd);
-    let config_warnings = parsed_config
+    let mut config_warnings = parsed_config
         .as_ref()
         .map(|c| c.config_warnings.clone())
         .unwrap_or_default();
+    if let Some(error) = config_parse_error {
+        config_warnings.push(
+            crate::agent::config_model_override_parse::ConfigWarning::config_key(
+                "config".to_owned(),
+                crate::agent::config_model_override_parse::ConfigWarningKind::InvalidValue,
+                format!("the config does not load: {error}"),
+            ),
+        );
+    }
     let mcp_config_problems = crate::util::config::load_mcp_server_problems_with_project(cwd);
 
     InspectReport {

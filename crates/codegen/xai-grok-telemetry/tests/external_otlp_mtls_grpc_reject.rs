@@ -60,6 +60,7 @@ fn external_stream_grpc_mtls_fails_without_client_identity() {
         hook_names: vec![],
         agents_md_dir_names: vec![],
         memory_enabled: false,
+        memory_retrieval_mode: xai_grok_telemetry::events::MemoryRetrievalMode::Disabled,
         is_git_repo: true,
         auto_update: None,
     });

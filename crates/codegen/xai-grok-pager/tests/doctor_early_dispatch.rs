@@ -220,10 +220,14 @@ fn doctor_tmux_fix_kills_term_ignoring_redirected_descendants() {
     std::fs::create_dir_all(&fake_bin).unwrap();
     let tmux = fake_bin.join("tmux");
     let pid_file = temp.path().join("descendant.pid");
+    // Publish the descendant pid from the leader *before* it exits. Writing
+    // `echo $$ > pid` inside the redirected child races doctor teardown:
+    // `>` truncates first, then SIGKILL can land before the digits are written,
+    // leaving an empty file (`ParseIntError { kind: Empty }`).
     std::fs::write(
         &tmux,
         format!(
-            "#!/bin/sh\n( trap '' TERM; echo $$ > '{}'; exec sleep 30 ) >/dev/null 2>&1 &\nexit 0\n",
+            "#!/bin/sh\n( trap '' TERM; exec sleep 30 ) >/dev/null 2>&1 &\necho $! > '{}'\nexit 0\n",
             pid_file.display()
         ),
     )
@@ -246,11 +250,10 @@ fn doctor_tmux_fix_kills_term_ignoring_redirected_descendants() {
             ],
         );
         assert!(output.status.success() || output.status.code() == Some(1));
-        let pid: i32 = std::fs::read_to_string(&pid_file)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+        let pid_raw = std::fs::read_to_string(&pid_file).unwrap_or_default();
+        let pid: i32 = pid_raw.trim().parse().unwrap_or_else(|_| {
+            panic!("descendant pid was not published before fake tmux exited: {pid_raw:?}")
+        });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
             // SAFETY: kill(pid, 0) only probes liveness for the positive child PID.
@@ -315,10 +318,9 @@ fn doctor_irrelevant_unsafe_byobu_does_not_break_ssh_or_plain_tmux() {
 #[test]
 #[ignore = "spawns the real pager binary; CI/Bazel provides PAGER_BINARY"]
 fn doctor_hostile_home_and_byobu_create_no_config_files() {
-    let binary = pager_binary()
-        .expect("real pager binary is required when selected")
-        .canonicalize()
-        .unwrap();
+    let binary =
+        dunce::canonicalize(pager_binary().expect("real pager binary is required when selected"))
+            .unwrap();
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     let grok_home = temp.path().join("qhome");

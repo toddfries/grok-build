@@ -36,7 +36,7 @@ pub(super) fn task_model_override_error(
 pub(crate) async fn run_shell_child(
     run: grok_build::task::coordinator::ChildRunRequest<ShellChildRuntime>,
     mut ctx: SubagentSpawnContext,
-    gateway: &GatewaySender,
+    gateway: GatewaySender,
 ) -> ChildRunOutput<ShellCompletionData> {
     let grok_build::task::coordinator::ChildRunRequest {
         mut request,
@@ -46,6 +46,11 @@ pub(crate) async fn run_shell_child(
         session_running,
     } = run;
     let start = std::time::Instant::now();
+    let spawn_timer = xai_grok_telemetry::subagent_spawn::SubagentSpawnTimer::new_shared();
+    use xai_grok_telemetry::subagent_spawn::SubagentSpawnPhase;
+    if let Some(queued) = queued_for {
+        spawn_timer.record(SubagentSpawnPhase::QueueWait, queued);
+    }
     let mut completion_data = ShellCompletionData::from_context(&ctx);
     if request.owner.is_workflow() && cancel_token.is_cancelled() {
         return child_run_output(
@@ -585,7 +590,7 @@ pub(crate) async fn run_shell_child(
         depth: child_depth,
     };
     emit_subagent_notification(
-        gateway,
+        &gateway,
         &ctx.parent_session_id,
         SessionUpdate::SubagentSpawned {
             subagent_id: subagent_id.clone(),
@@ -938,6 +943,11 @@ pub(crate) async fn run_shell_child(
         );
     }
     let mcp_owned_count = agent_mcp_servers.len() as u32;
+    let _active = xai_grok_telemetry::activity::SUBAGENTS_ACTIVE.enter();
+    debug_assert!(
+        xai_grok_telemetry::activity::SUBAGENTS_ACTIVE.get() >= 1,
+        "SubagentLaunched must stamp a self-inclusive count"
+    );
     xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::SubagentLaunched {
         subagent_id: request.id.clone(),
         parent_session_id: request.parent_session_id.clone(),
@@ -963,6 +973,9 @@ pub(crate) async fn run_shell_child(
             agent_name: Some(definition.name.clone()),
             reasoning_effort: Some(effective_sampling_config.reasoning_effort),
         });
+    crate::waterfall::mark(&request.id, crate::waterfall::stage::SESSION_SPAWN);
+    spawn_timer.record(SubagentSpawnPhase::SpawnPrepare, start.elapsed());
+    let bootstrap_started_at = std::time::Instant::now();
     let spawn_result = session::spawn_session_on_thread(
         child_session_info,
         gateway.clone(),
@@ -1008,6 +1021,7 @@ pub(crate) async fn run_shell_child(
         )),
         false,
         subagent_fs_watch,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
         None,
         None,
@@ -1062,6 +1076,7 @@ pub(crate) async fn run_shell_child(
         None,
         ctx.inference_idle_timeout_secs,
         None,
+        ctx.resolve_subagent_rate_limit_max_attempts(&subagent_model_id),
         ctx.web_search_sampling_config.clone(),
         ctx.web_fetch_config.clone(),
         ctx.image_gen_config.clone(),
@@ -1073,6 +1088,7 @@ pub(crate) async fn run_shell_child(
         true,
         ctx.subagents_max_depth,
         ctx.workflow_max_concurrent_agents,
+        ctx.media_gen_batch_limits,
         ctx.ask_user_question_enabled,
         ctx.client_hooks.clone(),
         None,
@@ -1085,7 +1101,7 @@ pub(crate) async fn run_shell_child(
         ctx.backend_tools_enabled,
         ctx.respect_gitignore,
         ctx.path_not_found_hints,
-        ctx.resolve_tool_params_json(),
+        Default::default(),
         ctx.plugin_registry.clone(),
         None,
         ctx.models_manager.clone(),
@@ -1112,8 +1128,16 @@ pub(crate) async fn run_shell_child(
             None
         },
         false,
+        Some(spawn_timer.clone()),
+        Some(ctx.subagent_sampling_semaphore.clone()),
     )
     .await;
+    crate::waterfall::mark(&request.id, crate::waterfall::stage::SESSION_UP);
+    spawn_timer.record(
+        SubagentSpawnPhase::SessionBootstrap,
+        bootstrap_started_at.elapsed(),
+    );
+    let session_ready_at = std::time::Instant::now();
     let (child_handle, mut permission_rx, _system_prompt, child_thread) = match spawn_result {
         Ok(r) => r,
         Err(e) => {
@@ -1162,7 +1186,7 @@ pub(crate) async fn run_shell_child(
         .await;
         return child_run_output(result, completion_data, None);
     }
-    spawn_progress_publisher(
+    let _progress_publisher = spawn_progress_publisher(
         child_handle.signals_handle.clone(),
         gateway.clone(),
         ctx.parent_session_id.clone(),
@@ -1171,6 +1195,10 @@ pub(crate) async fn run_shell_child(
         start,
         cancel_token.clone(),
         goal_tick_cmd_tx(ctx.goal_enabled, ctx.parent_cmd_tx.as_ref()),
+    );
+    spawn_timer.record(
+        SubagentSpawnPhase::ReadyToFirstTurn,
+        session_ready_at.elapsed(),
     );
     let attempt = run_one_turn_attempt(OneTurnAttemptInput {
         child_handle: &child_handle,
@@ -1434,7 +1462,7 @@ pub(crate) async fn run_shell_child(
     } else {
         xai_grok_telemetry::events::Outcome::Error
     };
-    xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::SubagentCompleted {
+    let mut completed = xai_grok_telemetry::events::SubagentCompleted {
         subagent_id: request.id.clone(),
         parent_session_id: request.parent_session_id.clone(),
         owner: telemetry_owner_kind(&request),
@@ -1447,7 +1475,15 @@ pub(crate) async fn run_shell_child(
         } else {
             None
         },
-    });
+        queue_wait_ms: None,
+        spawn_prepare_ms: None,
+        session_bootstrap_ms: None,
+        agent_build_ms: None,
+        tool_setup_ms: None,
+        ready_to_first_turn_ms: None,
+    };
+    spawn_timer.write_event_phases(&mut completed);
+    xai_grok_telemetry::session_ctx::log_event(completed);
     match (
         &ctx.parent_terminal_backend,
         &ctx.parent_notification_handle,
@@ -1533,58 +1569,16 @@ pub(crate) async fn run_shell_child(
     let mut worktree_removed = false;
     if let Some(ref wt_path) = worktree_path {
         if snapshot_dispose_enabled {
-            let ref_name = format!("refs/grok/subagents/{}", request.id);
-            let source_repo = resolve_subagent_source_repo(&ctx);
-            match crate::session::worktree::snapshot_subagent_worktree(
+            let disposal = dispose_worktree_after_completion(
                 wt_path,
-                &source_repo,
-                &ref_name,
+                &resolve_subagent_source_repo(&ctx),
+                &subagent_meta_dir,
+                &final_status,
+                &request.id,
             )
-            .await
-            {
-                Ok(snapshot_ref) => {
-                    let persisted = update_subagent_meta_snapshot_ref(
-                        &subagent_meta_dir,
-                        &snapshot_ref,
-                        &final_status,
-                    );
-                    if persisted {
-                        disposed_snapshot_ref = Some(snapshot_ref);
-                        match crate::session::worktree::remove_subagent_worktree(wt_path).await {
-                            Ok(()) => {
-                                worktree_removed = true;
-                                tracing::info!(
-                                    subagent_id = %request.id,
-                                    worktree_path = %wt_path.display(),
-                                    "snapshotted and removed subagent worktree"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    subagent_id = %request.id,
-                                    worktree_path = %wt_path.display(),
-                                    error = %e,
-                                    "snapshotted subagent worktree but removal failed; ref persisted for resume"
-                                )
-                            }
-                        }
-                    } else {
-                        tracing::warn!(
-                            subagent_id = %request.id,
-                            worktree_path = %wt_path.display(),
-                            "snapshot_ref not persisted; preserving worktree for resume"
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        subagent_id = %request.id,
-                        worktree_path = %wt_path.display(),
-                        error = %e,
-                        "Failed to snapshot subagent worktree; preserving for review"
-                    );
-                }
-            }
+            .await;
+            worktree_removed = disposal.worktree_removed();
+            disposed_snapshot_ref = disposal.snapshot_ref().map(str::to_owned);
         } else {
             tracing::info!(
                 subagent_id = %request.id,
@@ -1624,4 +1618,142 @@ pub(crate) async fn run_shell_child(
         })),
     );
     child_run_output(result, completion_data, disposed_snapshot_ref)
+}
+/// What the completion path did with a subagent worktree.
+pub(crate) enum Disposal {
+    /// The gate kept it, or something before the pointer failed. No resume
+    /// pointer on purpose: a pointer sends resume down the rehydrate path,
+    /// which deletes the directory to rebuild it from a snapshot that lacks
+    /// whatever kept it. The snapshot ref stays durable either way.
+    Kept,
+    /// The pointer reached disk. Whether the removal then succeeded is a
+    /// separate question, and resume works in both cases.
+    Snapshotted {
+        snapshot_ref: String,
+        worktree_removed: bool,
+    },
+}
+impl Disposal {
+    pub(crate) fn worktree_removed(&self) -> bool {
+        matches!(
+            self,
+            Disposal::Snapshotted {
+                worktree_removed: true,
+                ..
+            }
+        )
+    }
+    pub(crate) fn snapshot_ref(&self) -> Option<&str> {
+        match self {
+            Disposal::Kept => None,
+            Disposal::Snapshotted { snapshot_ref, .. } => Some(snapshot_ref),
+        }
+    }
+}
+/// Capture the worktree into a durable ref, ask whether deleting it would lose
+/// anything, and only then persist the resume pointer and remove the directory.
+/// Capture first and persist before removing, so a crash mid-disposal never
+/// strands a snapshot the resume path cannot find.
+///
+/// The other removal path, `cancel_pending_shell_child`, skips all of this:
+/// there the child never ran, so the directory is the one the checkout made.
+pub(crate) async fn dispose_worktree_after_completion(
+    worktree: &std::path::Path,
+    source_repo: &std::path::Path,
+    meta_dir: &std::path::Path,
+    final_status: &str,
+    subagent_id: &str,
+) -> Disposal {
+    let ref_name = format!("refs/grok/subagents/{subagent_id}");
+    let snapshot_ref = match crate::session::worktree::snapshot_subagent_worktree(
+        worktree,
+        source_repo,
+        &ref_name,
+    )
+    .await
+    {
+        Ok(snapshot_ref) => snapshot_ref,
+        Err(e) => {
+            tracing::warn!(
+                subagent_id = %subagent_id,
+                worktree_path = %worktree.display(),
+                error = %e,
+                "Failed to snapshot subagent worktree; preserving for review"
+            );
+            return Disposal::Kept;
+        }
+    };
+    let checked_path = worktree.to_path_buf();
+    let checked_source_repo = source_repo.to_path_buf();
+    let checked_snapshot = snapshot_ref.clone();
+    let reclaim = tokio::task::spawn_blocking(move || {
+        xai_fast_worktree::reclaimable_after_snapshot(
+            &checked_path,
+            Some(&checked_source_repo),
+            &checked_snapshot,
+        )
+    })
+    .await;
+    match reclaim {
+        Ok(xai_fast_worktree::Reclaim::Now { .. }) => {}
+        Ok(xai_fast_worktree::Reclaim::Keep(reason)) => {
+            tracing::info!(
+                subagent_id = %subagent_id,
+                worktree_path = %worktree.display(),
+                %reason,
+                "subagent worktree kept: removal would not preserve every byte"
+            );
+            return Disposal::Kept;
+        }
+        Ok(xai_fast_worktree::Reclaim::Unnamed(error)) => {
+            tracing::warn!(
+                subagent_id = %subagent_id,
+                worktree_path = %worktree.display(),
+                %error,
+                "the discarded commits were not named; preserving the worktree"
+            );
+            return Disposal::Kept;
+        }
+        Err(error) => {
+            tracing::warn!(
+                subagent_id = %subagent_id,
+                worktree_path = %worktree.display(),
+                %error,
+                "the safety check did not finish; preserving the worktree"
+            );
+            return Disposal::Kept;
+        }
+    }
+    if !update_subagent_meta_snapshot_ref(meta_dir, &snapshot_ref, final_status) {
+        tracing::warn!(
+            subagent_id = %subagent_id,
+            worktree_path = %worktree.display(),
+            "snapshot_ref not persisted; preserving worktree for resume"
+        );
+        return Disposal::Kept;
+    }
+    let worktree_removed = match crate::session::worktree::remove_subagent_worktree(worktree).await
+    {
+        Ok(()) => {
+            tracing::info!(
+                subagent_id = %subagent_id,
+                worktree_path = %worktree.display(),
+                "snapshotted and removed subagent worktree"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                subagent_id = %subagent_id,
+                worktree_path = %worktree.display(),
+                error = %e,
+                "snapshotted subagent worktree but removal failed; ref persisted for resume"
+            );
+            false
+        }
+    };
+    Disposal::Snapshotted {
+        snapshot_ref,
+        worktree_removed,
+    }
 }

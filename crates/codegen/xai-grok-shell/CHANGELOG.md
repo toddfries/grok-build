@@ -1,5 +1,97 @@
 # Changelog
 
+# 1.0.8 — 2026-08-20
+
+## Features
+
+- MCP servers can now ask for form input or URL consent through the same popup used for questions.
+- Ctrl+S now stashes the current prompt draft so you can send something else and restore it later.
+- ** /workflow** now autocompletes saved workflow names and shows only valid runs for pause/resume/stop/save.
+
+## Bug Fixes
+
+- Downloading a folder that contains only one file now produces a zip that still extracts as a folder.
+- Failed tool calls for tools the model invented now clearly state the tool does not exist.
+- **Status line** refresh timer now uses consistent naming and no longer shows errors on deliberately hidden rows.
+- **Workflow agent rows** now display current context usage instead of cumulative token counts.
+- **Follow-up messages** now send immediately while waiting on a subagent or task, including after using /btw.
+
+## Performance
+
+- Opening many subagents at once no longer freezes the interface while loading their history.
+- **Concurrent subagents** now start much faster and no longer freeze the parent session.
+
+
+# 1.0.7 — 2026-08-19
+
+## Features
+
+- Users hitting startup timeouts can now raise the connect budget with the `GROK_CONNECT_UI_TIMEOUT_SECS` environment variable.
+- Permission prompts now show "Always allow" and "Never allow" options by default.
+- Users can now delete scheduled background loops directly from the tray.
+- **Status line command** scripts can now run on a timer via refresh_interval in config.toml.
+- **Permission prompts** now offer a 'Never allow' choice for MCP tools and web-fetch domains that persists per project.
+- **Workflows tab** added to the extensions modal (Ctrl+L or /plugins) listing installed workflows with name, source, and description.
+- **New /workflows** command opens the Workflows catalog tab; use **/workflow runs** to view live workflow runs.
+- **Bare /workflow** (or /workflow runs) now lists active and recent workflow runs with status and progress instead of usage help.
+- **Workflows** row added to the Ctrl+P command palette, opening the Workflows catalog tab.
+
+## Bug Fixes
+
+- **MCP server connections** in non-interactive sessions no longer incorrectly require authentication for tokenless servers.
+- Fixed startup timeouts caused by concurrent auth refreshes across multiple sessions.
+- **Tool call loops** are interrupted earlier to avoid wasting time on repeated identical actions.
+- **Subagents** no longer receive the ask-user-question tool.
+- Bare email addresses are now turned into clickable mailto links in the pager.
+
+
+# 1.0.6 — 2026-08-18
+
+## Breaking Changes
+
+- **Subagent spawning** no longer accepts capability_mode; tool access is now controlled only by agent type.
+
+## Features
+
+- **Shift+arrow keys** now extend text selections in the prompt like a standard text field.
+- **Optional status line** can now display live session info or script output at the bottom of the pager.
+- **grok clone** can now fetch a repo into a content store and mount a projected working tree.
+
+## Bug Fixes
+
+- **Fixed session startup hangs** on large or unhealthy git repositories.
+- **Queued messages** during goals no longer starve, and editing queued prompts works reliably.
+- **Consent notice** on first launch now shows clickable links and handles keyboard/mouse correctly.
+- **Ctrl+C then edit** a prompt now correctly removes the original text from the conversation.
+- **Double-clicking** a terminal command result now shows the complete output instead of a preview.
+- **Consent notice links** are now stricter and more reliable on all terminals.
+- **Video generation** now surfaces a clear ZDR error instead of raw API responses when output storage is required.
+- **Project hooks** on Windows now correctly expand $CLAUDE_PROJECT_DIR when invoking PowerShell scripts.
+
+
+# 1.0.5 — 2026-08-15
+
+## Features
+
+- **GROK_CONFIG** and **GROK_CONFIG_PATH** environment variables now let launchers override selected config settings without editing config.toml.
+- **Worktrees** under ~/.grok/worktrees are now automatically reclaimed when safe, with strong safeguards that never delete a user's last copy.
+- **Hook policy blocks** now correctly report "Turn blocked by a hook" instead of "Turn cancelled by user."
+- **Image and video generation** now limits how many calls the model can request in one step to avoid overload.
+- **Arabic and Persian text** can now be reordered correctly in the terminal UI. Turn on in /settings.
+- **Reasoning effort** can now be supplied when an ACP client opens or resumes a session.
+- **Session titles** now refresh early in the conversation and stay stable; /resume shows a recap and last-turn summary when available.
+- **GROK_FORCE_LOGIN_TEAM_ID** environment variable now lets launchers restrict interactive login to one or more teams.
+- **Preparing spinner** now shows readable labels such as "Writing file…" and "Writing edit…" for common tools.
+
+## Bug Fixes
+
+- **Tool calls** (shell, grep, list_dir) no longer fail for the rest of a session if /dev/null is removed.
+- **Agent skill discovery** now resolves the user's home directory correctly on Windows.
+- **MCP tool calls** now show clearer spinner text instead of the raw wire name while arguments are still arriving.
+- **grok inspect** no longer crashes when its output is piped into a command that closes the pipe early.
+- **Minimal mode** no longer truncates a still-streaming assistant reply when thinking blocks are interleaved.
+
+
 # 1.0.4 — 2026-08-13
 
 ## Features

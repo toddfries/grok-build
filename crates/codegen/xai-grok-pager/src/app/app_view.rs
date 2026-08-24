@@ -6,6 +6,7 @@
 use super::ScreenMode;
 use crate::acp::model_state::ModelState;
 use crate::actions::{ActionId, ActionRegistry, When};
+use crate::app::consent::ConsentState;
 use crate::appearance::AppearanceConfig;
 use crate::input::KeyboardNormalizer;
 use crate::input::key::KeyShortcut;
@@ -227,6 +228,15 @@ pub enum ActiveView {
     /// The top-level Agent Dashboard. State lives in `AppView::dashboard`.
     AgentDashboard,
 }
+impl ActiveView {
+    /// The agent on screen, or `None` for a view that shows no single agent.
+    pub fn agent_id(self) -> Option<AgentId> {
+        match self {
+            ActiveView::Agent(id) => Some(id),
+            ActiveView::Welcome | ActiveView::AgentDashboard => None,
+        }
+    }
+}
 /// Target restored when leaving the dashboard (Ctrl+\ / Esc).
 /// Consumed by `dispatch_exit_dashboard`; dead agents fall back to
 /// insertion-order first / Welcome.
@@ -374,8 +384,12 @@ pub struct SessionPickerEntry {
     /// Human-readable worktree label (if the session was created in a named worktree).
     pub worktree_label: Option<String>,
     /// Per-turn secondary line (`lastTurnSummary` on the session/list wire).
-    /// Used for non-leader roster rows today; reserved for picker display later.
+    /// Shown as the "Last turn" line on the expanded resume card and used for
+    /// non-leader dashboard roster rows.
     pub last_turn_summary: Option<String>,
+    /// Latest session recap (`lastRecap` on the session/list wire), shown on the
+    /// expanded resume card whenever available. Distinct from `last_turn_summary`.
+    pub last_recap: Option<String>,
     /// Lazy-loaded detail for the expanded card view.
     pub card_detail: Option<CardDetail>,
 }
@@ -589,6 +603,15 @@ pub struct ScreenModeRelaunch {
     /// Active session to reopen via `--resume`.
     pub session_id: String,
 }
+/// A consented `/feedback` trace upload deferred until the coding-data
+/// sharing opt-in write claimed at `seq` resolves.
+#[derive(Debug, Clone)]
+pub struct PendingFeedbackTraceUpload {
+    /// The `coding_data_write_seq` generation this upload waits on.
+    pub seq: u64,
+    pub agent_id: AgentId,
+    pub session_id: acp::SessionId,
+}
 /// Root view component — owns all application state.
 pub struct AppView {
     /// Taken by whichever path reaches a usable session (or interactive idle) first.
@@ -646,6 +669,8 @@ pub struct AppView {
     pub appearance: AppearanceConfig,
     /// Notification service (terminal bell, OSC sequences, title updates).
     pub notification_service: NotificationService,
+    /// The status row follows whichever agent is on screen, so the app owns it.
+    pub(crate) status_line: crate::app::status_line::StatusLineState,
     /// Escape sequences (title, progress bar) accumulated by the last
     /// `update_notifications()` tick. Consumed by `draw()` and appended
     /// to the frame's `post_flush_escapes` so they are written inside the
@@ -698,6 +723,11 @@ pub struct AppView {
     /// Whether the plugin marketplace CTA is enabled. Env `GROK_PLUGIN_CTA`
     /// overrides `RemoteSettings.plugin_cta` (remote settings); defaults to `false`.
     pub plugin_cta_enabled: bool,
+    /// Marketplace source name the plugin CTA draws candidates from, when
+    /// `[marketplace].plugin_cta_marketplace` is set in the effective config.
+    /// `None` keeps the default xAI Official source.
+    pub plugin_cta_marketplace: Option<String>,
+    pub workspace_dashboard_enabled: bool,
     /// Consumer billing surface (credit fetches / warnings). False for team
     /// and API-key auth. `/usage` itself stays available for session token/cost
     /// unless [`Self::has_external_auth_provider`].
@@ -778,6 +808,16 @@ pub struct AppView {
     /// resolved by the shell and advertised on ACP initialize (`sessionRecap`).
     /// When false, the pager must not request recaps (zero `x.ai/recap` traffic).
     pub session_recap_available: bool,
+    /// Shell-advertised eligibility for the `/feedback` trace-upload offer,
+    /// exactly as received (initialize meta / auth-meta refreshes). Read it
+    /// through [`Self::feedback_trace_offer`], which subtracts the latch.
+    pub shell_feedback_trace_offer: bool,
+    /// A persisted card answer was made this session; keeps auth-meta
+    /// refreshes from re-offering before the async config write lands.
+    pub feedback_trace_choice_latched: bool,
+    /// Trace upload parked until the same card answer's sharing opt-in write
+    /// confirms (the storage proxy rejects uploads while opted out).
+    pub feedback_trace_upload_pending: Option<PendingFeedbackTraceUpload>,
     /// Stateful prompt widget rendered on the welcome screen (persists input across frames).
     pub welcome_prompt: PromptWidget,
     /// The single slash-command MRU/recency store. Owned here and injected
@@ -863,6 +903,13 @@ pub struct AppView {
     pub welcome_refresh_rect: Option<ratatui::layout::Rect>,
     /// Hit-test rect for the gate URL link on the paywall CTA.
     pub welcome_gate_url_rect: Option<ratatui::layout::Rect>,
+    /// Rewritten by every welcome frame, so a resize leaves no stale click target.
+    pub welcome_consent_link_rects: Vec<(usize, ratatui::layout::Rect)>,
+    /// Consent link the mouse is over, so every run of a wrapped link brightens together.
+    pub welcome_consent_hover_link: Option<usize>,
+    /// The disk write is a spawned task, so a settings refresh that lands first would otherwise
+    /// re-arm a notice the user has already accepted.
+    pub consent_answered: Option<(String, i32)>,
     /// Hit-test rect for the welcome hero upgrade CTA `[label]` button
     /// (click → `AnnouncementsOpenCta(Welcome)`).
     pub welcome_upgrade_cta_rect: Option<ratatui::layout::Rect>,
@@ -1062,6 +1109,10 @@ pub struct AppView {
     /// when `Pending`, the welcome screen shows the trust question and session
     /// creation is deferred (gated after auth) until it is answered.
     pub trust_state: TrustState,
+    /// Resolves before folder trust: the account-level answer gates the workspace-level one.
+    pub consent_state: crate::app::consent::ConsentState,
+    /// Scopes the consent answer, the only identity the pager has for it.
+    pub account_email: Option<String>,
     /// Login button label from `AuthMethod.name` (e.g., "grok.com", "Acme Corp").
     pub login_label: Option<String>,
     /// The auth method ID to use for login.
@@ -1173,8 +1224,11 @@ pub struct AppView {
     /// Doc viewer overlay for the welcome screen (release notes via Ctrl+L).
     pub welcome_doc_viewer: Option<crate::views::modal::ActiveModal>,
     /// Whether the pager uses fullscreen (alt-screen) or inline mode.
-    /// Set from the resolved terminal state at startup.
+    /// Set from the resolved terminal state at startup; updated by the
+    /// in-process `/minimal` ⇄ `/fullscreen` switch (`mode_switch`).
     pub(crate) screen_mode: super::ScreenMode,
+    /// Pending in-process mode-switch target, consumed by the event loop.
+    pub(crate) pending_screen_mode_switch: Option<super::ScreenMode>,
     /// Onboarding tutorial overlay, if open. Top-level (not per-agent) so it
     /// works over both the welcome screen and an agent session. Opened by
     /// `/tutorial` (also in the command palette).
@@ -1265,6 +1319,12 @@ impl AppView {
                 .as_deref()
                 .is_some_and(|r| r.eq_ignore_ascii_case("admin"))
     }
+    /// Whether `/feedback` may offer the trace-consent card: the shell
+    /// advertised the offer and no card answer latched it off this session.
+    /// Derived so no code path can fabricate an offer the shell never made.
+    pub fn feedback_trace_offer(&self) -> bool {
+        self.shell_feedback_trace_offer && !self.feedback_trace_choice_latched
+    }
     /// Why `coding_data_sharing` is locked for this user (`None` = editable).
     /// Mirrors the dispatch guards in `set_coding_data_sharing`.
     pub fn coding_data_sharing_lock(&self) -> Option<crate::settings::CodingDataSharingLock> {
@@ -1309,7 +1369,9 @@ impl AppView {
     /// startup sites; trust is gated AFTER auth so a pending trust question
     /// defers session creation until answered.
     pub fn session_startup_allowed(&self) -> bool {
-        matches!(self.auth_state, AuthState::Done) && matches!(self.trust_state, TrustState::Done)
+        matches!(self.auth_state, AuthState::Done)
+            && matches!(self.trust_state, TrustState::Done)
+            && matches!(self.consent_state, ConsentState::Done)
     }
     /// Whether startup type-ahead captured while the app was loading may be
     /// replayed into the input channel: every startup screen that consumes raw
@@ -1323,6 +1385,7 @@ impl AppView {
             && self.has_access()
             && !self.is_zdr_blocked()
             && matches!(self.trust_state, TrustState::Done)
+            && matches!(self.consent_state, ConsentState::Done)
     }
     /// Extract `GateInfo` from `RemoteSettings`.
     pub fn gate_from_settings(
@@ -1342,11 +1405,13 @@ impl AppView {
     pub fn apply_auth_meta(&mut self, meta: &xai_grok_shell::auth::AuthMeta) {
         self.pending_gate_verification = None;
         let was_gated = self.gate.is_some();
+        self.account_email = meta.email.clone();
         self.team_id = meta.team_id.clone();
         self.team_name = meta.team_name.clone();
         self.is_zdr = meta.is_zdr;
         self.team_role = meta.team_role.clone();
         self.coding_data_retention_opt_out = meta.coding_data_retention_opt_out;
+        self.shell_feedback_trace_offer = meta.feedback_trace_offer;
         self.gate = meta.gate.clone();
         if was_gated && self.gate.is_none() {
             self.paywall_check_started = None;
@@ -1456,6 +1521,7 @@ impl AppView {
             scroll_config: ScrollConfig::from_settings(),
             appearance: AppearanceConfig::default(),
             notification_service: NotificationService::new(Default::default()),
+            status_line: Default::default(),
             pending_notification_escapes: None,
             deferred_notification: None,
             tracing_rx: None,
@@ -1494,6 +1560,9 @@ impl AppView {
             welcome_auth_fallback_rect: None,
             welcome_refresh_rect: None,
             welcome_gate_url_rect: None,
+            welcome_consent_link_rects: Vec::new(),
+            welcome_consent_hover_link: None,
+            consent_answered: None,
             welcome_upgrade_cta_rect: None,
             welcome_privacy_banner_opt_in_rect: None,
             welcome_privacy_banner_opt_out_rect: None,
@@ -1571,6 +1640,8 @@ impl AppView {
             auth_methods: Vec::new(),
             auth_state: AuthState::Done,
             trust_state: TrustState::Done,
+            consent_state: crate::app::consent::ConsentState::Done,
+            account_email: None,
             login_label: None,
             login_method_id: None,
             auth_start_mode: AuthMode::Pending,
@@ -1617,9 +1688,12 @@ impl AppView {
             import_claude_modal: None,
             welcome_doc_viewer: None,
             screen_mode: ScreenMode::Inline,
+            pending_screen_mode_switch: None,
             show_resolved_model: true,
             sharing_enabled: false,
             plugin_cta_enabled: false,
+            plugin_cta_marketplace: None,
+            workspace_dashboard_enabled: false,
             usage_visible: true,
             has_external_auth_provider: false,
             tier_restricted_commands: Vec::new(),
@@ -1637,6 +1711,9 @@ impl AppView {
             scheduler_background_loops_seed: true,
             cancel_rewind_enabled: true,
             session_recap_available: false,
+            shell_feedback_trace_offer: false,
+            feedback_trace_choice_latched: false,
+            feedback_trace_upload_pending: None,
             tutorial: None,
             dashboard: None,
             dashboard_return: None,
@@ -2529,6 +2606,10 @@ impl AppView {
                 &mut WelcomeInputCtx {
                     auth_state: &self.auth_state,
                     trust_state: &self.trust_state,
+                    consent_state: &self.consent_state,
+                    consent_link_rects: &self.welcome_consent_link_rects,
+                    consent_hover_link: &mut self.welcome_consent_hover_link,
+                    arrived_at,
                     cwd: &self.cwd,
                     mid_session_login: self.auth_return_view.is_some(),
                     auth_code_input: &mut self.auth_code_input,
@@ -3144,6 +3225,11 @@ struct WelcomeInputCtx<'a> {
     /// Folder-trust state. When `Pending` (and auth is `Done`), the trust
     /// question intercepts keys and swallows the rest so no session starts.
     trust_state: &'a TrustState,
+    consent_state: &'a ConsentState,
+    consent_link_rects: &'a [(usize, ratatui::layout::Rect)],
+    consent_hover_link: &'a mut Option<usize>,
+    /// When this event reached the process, so a key typed before the notice painted is no answer.
+    arrived_at: Instant,
     /// Live working directory (tracks `Effect::SetWorkingDir`), used to pin
     /// the current repo's group to the top of the session picker.
     cwd: &'a std::path::Path,
@@ -3336,6 +3422,23 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
             NewWorktreeDialogOutcome::Changed => return InputOutcome::Changed,
             NewWorktreeDialogOutcome::Unchanged => return InputOutcome::Unchanged,
         }
+    }
+    if matches!(ctx.auth_state, AuthState::Done)
+        && ctx.has_access
+        && !ctx.is_zdr_blocked
+        && matches!(ctx.consent_state, ConsentState::Pending { .. })
+    {
+        return crate::app::consent::handle_answer(
+            ev,
+            &mut crate::app::consent::ConsentInputCtx {
+                state: ctx.consent_state,
+                arrived_at: ctx.arrived_at,
+                menu_rects: ctx.menu_rects,
+                link_rects: ctx.consent_link_rects,
+                menu_index: ctx.menu_index,
+                hover_link: ctx.consent_hover_link,
+            },
+        );
     }
     if matches!(ctx.auth_state, AuthState::Done)
         && ctx.has_access
@@ -3736,7 +3839,7 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
             if key!('w', CONTROL).matches(key) && ctx.cwd_has_git_ancestor {
                 return InputOutcome::Action(Action::OpenNewWorktreeDialog);
             }
-            if key!('s', CONTROL).matches(key) {
+            if key!(F(3)).matches(key) {
                 return InputOutcome::Action(Action::FetchSessionList);
             }
             if ctx.has_pending_update && key!('u', CONTROL).matches(key) {
@@ -3764,6 +3867,7 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
             return InputOutcome::ActionThenForward(Action::NewSession);
         }
         if *ctx.prompt_focused {
+            let had_highlight = ctx.prompt.textarea.selection_range().is_some();
             match ctx.prompt.handle_key(key) {
                 crate::views::prompt_widget::PromptEvent::Edited => {
                     return InputOutcome::Changed;
@@ -3771,6 +3875,9 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
                 crate::views::prompt_widget::PromptEvent::Ignored => {
                     if key!(Esc).matches(key) {
                         *ctx.prompt_focused = false;
+                        return InputOutcome::Changed;
+                    }
+                    if had_highlight && ctx.prompt.textarea.selection_range().is_none() {
                         return InputOutcome::Changed;
                     }
                 }
@@ -4407,13 +4514,9 @@ impl AppView {
         }
     }
     /// Render the current view to the terminal.
-    ///
-    /// Delegates to [`crate::render::draw::draw_frame`] which handles the
-    /// low-level terminal interaction (bypassing ratatui's `try_draw`,
-    /// synchronized output, cursor blink preservation). See that module's
-    /// docs for the full rationale.
     pub fn draw(&mut self, terminal: &mut PagerTerminal) {
         self.draw_inner(terminal);
+        xai_grok_telemetry::startup::record_first_frame();
         crate::memory_release::run_deferred_release();
     }
     fn draw_inner(&mut self, terminal: &mut PagerTerminal) {
@@ -4472,6 +4575,7 @@ impl AppView {
                 &self.hidden_announcement_ids,
             );
         let agent_mouse_pos = self.last_mouse_pos;
+        let status_line_frame = self.status_line_frame();
         let Self {
             active_view,
             agents,
@@ -4566,6 +4670,8 @@ impl AppView {
                             cwd: &self.cwd,
                             auth_state: &self.auth_state,
                             trust_state: &self.trust_state,
+                            consent_state: &self.consent_state,
+                            consent_hover_link: self.welcome_consent_hover_link,
                             login_label: self.login_label.as_deref(),
                             auth_code_input: self.auth_code_input.text(),
                             auth_code_cursor_byte: self.auth_code_input.cursor_byte(),
@@ -4641,6 +4747,11 @@ impl AppView {
                         self.welcome_auth_fallback_rect = result.auth_fallback_rect;
                         self.welcome_refresh_rect = result.refresh_rect;
                         self.welcome_gate_url_rect = result.gate_url_rect;
+                        self.welcome_consent_link_rects = result.consent_link_rects;
+                        if self.welcome_consent_link_rects.is_empty() {
+                            self.welcome_consent_hover_link = None;
+                        }
+                        record_consent_paint(&mut self.consent_state, result.consent_legibility);
                         self.welcome_upgrade_cta_rect = result.upgrade_cta_rect;
                         self.welcome_privacy_banner_opt_in_rect = result.privacy_banner_opt_in_rect;
                         self.welcome_privacy_banner_opt_out_rect =
@@ -4881,6 +4992,7 @@ impl AppView {
                                     voice_listening,
                                     voice_interim: voice_interim.as_deref(),
                                     esc_owned_before_agent,
+                                    status_line: status_line_frame.clone(),
                                 },
                             );
                             if let Some(modal) = self.import_claude_modal.as_mut() {
@@ -5152,6 +5264,28 @@ impl AppView {
                 tracing::debug!(evicted, "scrollback.evicted_offscreen_render_caches");
             }
         }
+    }
+}
+/// The renderer is the only thing that knows whether the body fitted, and accept is gated on that.
+fn record_consent_paint(
+    state: &mut ConsentState,
+    reported: Option<crate::app::consent::ConsentLegibility>,
+) {
+    let ConsentState::Pending {
+        legibility,
+        painted_at,
+        ..
+    } = state
+    else {
+        return;
+    };
+    let Some(painted) = reported else {
+        *legibility = crate::app::consent::ConsentLegibility::Illegible;
+        return;
+    };
+    *legibility = painted;
+    if painted_at.is_none() {
+        *painted_at = Some(Instant::now());
     }
 }
 impl AppView {
@@ -5456,6 +5590,17 @@ impl AppView {
                     .any(|c| c.name == "workflow")
                     || !agent.workflow_runs.is_empty(),
             );
+            agent.prompt.slash_controller.set_workflow_runs(
+                agent
+                    .workflow_runs
+                    .iter()
+                    .map(|run| crate::slash::command::WorkflowRunChoice {
+                        name: run.name.clone(),
+                        status: run.status.clone(),
+                        builtin: run.builtin,
+                    })
+                    .collect(),
+            );
             if agent.acp_synced_generation != agent.session.available_commands_generation {
                 agent.prompt.sync_acp_commands(
                     &agent.session.available_commands,
@@ -5536,6 +5681,8 @@ impl AppView {
             }
         }
         needs_redraw |= self.tick_scroll();
+        self.update_status_line();
+        needs_redraw |= self.status_line.take_changed();
         needs_redraw
     }
     /// Flush pending scroll lines (stream gap detection, redraw cadence).
@@ -5682,6 +5829,9 @@ impl AppView {
     /// the ~12fps welcome logo shimmer and the macOS Cmd link-hover poll —
     /// so an app that *looks* idle doesn't spin a 30fps loop for them.
     pub fn tick_demand(&self) -> TickDemand {
+        self.view_tick_demand().max(self.status_line_tick_demand())
+    }
+    fn view_tick_demand(&self) -> TickDemand {
         if self.pending_action.is_some() {
             return TickDemand::Fast;
         }
