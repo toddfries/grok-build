@@ -97,7 +97,7 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
         mcp_state: Arc::new(TokioMutex::new(McpState::new(vec![]))),
         mcp_strategy: std::cell::Cell::new(McpInitStrategy::Blocking),
         delivery_tools: std::cell::RefCell::new(Vec::new()),
-        attach_non_interactive: std::cell::Cell::new(false),
+        attach_non_interactive: std::rc::Rc::new(std::cell::Cell::new(false)),
         chat_state_handle: xai_chat_state::ChatStateHandle::noop(),
         unattributed_background_usage: std::sync::atomic::AtomicBool::new(false),
         current_prompt_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -155,6 +155,7 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
         session_start: std::time::Instant::now(),
         inference_idle_timeout: Duration::from_secs(300),
         max_retries: 3,
+        rate_limit_waits: crate::session::acp_session::RateLimitWaitConfig::default(),
         max_turns: None,
         pending_interjections: InterjectionBuffer::new(),
         pending_skill_reminders: Mutex::new(Vec::new()),
@@ -262,6 +263,7 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
         turn_stream_drained: parking_lot::Mutex::new(None),
         pending_image_strip: parking_lot::Mutex::new(None),
         sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
+        sampling_gate: None,
         rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
         image_description_model: crate::test_support::TEST_MODEL.to_owned(),
         image_describe_cache: Arc::new(crate::session::image_describe::ImageDescribeCache::new()),
@@ -1261,7 +1263,7 @@ async fn reasoning_only_doomloop_turn_captures_every_generation_as_segments() {
                     error: error.clone(),
                 })
                 .await;
-            let Err(_terminal) = actor.handle_sampling_failure(error).await else {
+            let Err(_terminal) = actor.handle_sampling_failure(error, 0).await else {
                 panic!("a reasoning_only empty response must be a terminal error, not recoverable");
             };
             let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<SessionCommand>();

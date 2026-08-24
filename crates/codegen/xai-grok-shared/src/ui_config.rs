@@ -83,7 +83,7 @@ pub struct UiConfig {
     /// Hunk-tracker mode the pager advertises to the agent (`agent_only` |
     /// `all_dirty` | `off`). Written by the pager's settings modal; read at
     /// connect time (CLI `--hunk-tracker-mode` / `GROK_HUNK_TRACKER` override
-    /// it). `off` disables hunk tracking entirely.
+    /// it). Unset defaults to `off`, which disables hunk tracking entirely.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hunk_tracker_mode: Option<String>,
     /// Voice capture chord behavior: `toggle` or `hold` (hold-to-talk; needs a
@@ -182,16 +182,11 @@ pub struct UiConfig {
     /// `None` inherits remote/default; skipped when untouched.
     #[serde(default, skip_serializing_if = "DisplayRefreshSettings::is_default")]
     pub display_refresh: DisplayRefreshSettings,
-    /// `[ui.status_line]`. Not drawn in minimal mode; disabled by default.
+    /// `[ui.status_line]`. Disabled by default.
     #[serde(default, skip_serializing_if = "status_line_should_not_be_saved")]
     pub status_line: StatusLineConfig,
 }
 
-/// The status-line parse drops what it could not read and settings writes merge
-/// per key, so saving a section we misread would delete the user's own text.
-/// The retired `refresh_interval_ms` problem deliberately suppresses the
-/// write-back too: its value is no longer parsed, so a save would silently
-/// drop the key from the user's file.
 fn status_line_should_not_be_saved(status_line: &StatusLineConfig) -> bool {
     status_line.is_default() || status_line.problem().is_some()
 }

@@ -56,6 +56,7 @@ pub fn to_system_reminder_sync(
     skills: &[xai_grok_tools::implementations::skills::types::SkillInfo],
     subagent_tool_names: Option<&SubagentToolNames>,
     mcp_tool_names: Option<&McpToolNames>,
+    workflow_listing: Option<&str>,
 ) -> Option<String> {
     to_system_reminder_inner(
         ctx,
@@ -65,6 +66,7 @@ pub fn to_system_reminder_sync(
         None,
         subagent_tool_names,
         mcp_tool_names,
+        workflow_listing,
     )
 }
 
@@ -81,6 +83,7 @@ pub async fn to_system_reminder(
     memory_backend: Option<&dyn xai_grok_tools::types::memory_backend::MemoryBackend>,
     subagent_tool_names: Option<&SubagentToolNames>,
     mcp_tool_names: Option<&McpToolNames>,
+    workflow_listing: Option<&str>,
 ) -> Option<String> {
     // Fetch memory results first (async), then pass to sync inner method
     let mut memory_results = Vec::new();
@@ -108,6 +111,7 @@ pub async fn to_system_reminder(
         core_pin.as_deref(),
         subagent_tool_names,
         mcp_tool_names,
+        workflow_listing,
     )
 }
 
@@ -136,6 +140,7 @@ fn to_system_reminder_inner(
     core_pin: Option<&str>,
     subagent_tool_names: Option<&SubagentToolNames>,
     mcp_tool_names: Option<&McpToolNames>,
+    workflow_listing: Option<&str>,
 ) -> Option<String> {
     let mut sections = Vec::new();
 
@@ -177,6 +182,10 @@ fn to_system_reminder_inner(
         xai_grok_tools::types::skill_discovery_tracker::format_compaction_skill_listing(skills)
     {
         sections.push(format!("## Available Skills\n{listing}"));
+    }
+
+    if let Some(listing) = workflow_listing.filter(|text| !text.is_empty()) {
+        sections.push(format!("## Available Workflows\n{listing}"));
     }
 
     // Common sections (BG → TODO → subagents) via shared formatter. Borrow
@@ -294,7 +303,7 @@ mod tests {
             poll: "get_command_or_subagent_output".into(),
             cancel: "kill_command_or_subagent".into(),
         };
-        let result = to_system_reminder_sync(&ctx, &[], &[], Some(&names), None);
+        let result = to_system_reminder_sync(&ctx, &[], &[], Some(&names), None, None);
         let text = result.expect("should produce a reminder");
         assert!(
             text.contains("Running Subagents"),
@@ -330,7 +339,7 @@ mod tests {
             running_subagents: vec![],
             todos: vec![],
         };
-        let result = to_system_reminder_sync(&ctx, &[], &[], None, None);
+        let result = to_system_reminder_sync(&ctx, &[], &[], None, None, None);
         let text = result.expect("should produce a reminder");
         let expected = "\
 <system-reminder>
@@ -364,8 +373,8 @@ mod tests {
             connected_mcp_servers: vec![],
             todos: vec![],
         };
-        let text =
-            to_system_reminder_sync(&ctx, &[], &[], None, None).expect("should produce a reminder");
+        let text = to_system_reminder_sync(&ctx, &[], &[], None, None, None)
+            .expect("should produce a reminder");
         assert!(
             text.contains("- \"019ea7f0-cb66-7aa2-9a09-488a3a795795\": `cargo test`"),
             "task ID must be quoted verbatim: {text}"
@@ -379,7 +388,7 @@ mod tests {
     #[test]
     fn system_reminder_skips_subagent_section_when_tool_names_none() {
         let ctx = ctx_with_running_subagents();
-        let result = to_system_reminder_sync(&ctx, &[], &[], None, None);
+        let result = to_system_reminder_sync(&ctx, &[], &[], None, None, None);
         if let Some(text) = result {
             assert!(
                 !text.contains("Running Subagents"),
@@ -421,8 +430,8 @@ mod tests {
             todo("3", TodoSummaryStatus::Completed, "read the code"),
             todo("4", TodoSummaryStatus::Cancelled, "abandoned idea"),
         ]);
-        let text =
-            to_system_reminder_sync(&ctx, &[], &[], None, None).expect("should produce a reminder");
+        let text = to_system_reminder_sync(&ctx, &[], &[], None, None, None)
+            .expect("should produce a reminder");
         assert!(
             text.contains("## TODO List"),
             "missing TODO section: {text}"
@@ -458,8 +467,8 @@ mod tests {
             status: "running".into(),
             tool_name: Some("run_terminal_command".into()),
         }];
-        let text =
-            to_system_reminder_sync(&ctx, &[], &[], None, None).expect("should produce a reminder");
+        let text = to_system_reminder_sync(&ctx, &[], &[], None, None, None)
+            .expect("should produce a reminder");
         let tasks_pos = text
             .find("## Running Background Tasks")
             .expect("tasks section");
@@ -470,6 +479,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn system_reminder_places_workflows_below_skills() {
+        let ctx = CompactionStateContext {
+            cwd_generation: 0,
+            destination_project_instructions: None,
+            agent_message_anchor: None,
+            recent_messages: vec![],
+            last_user_query: None,
+            agent_edited_paths: vec![],
+            running_tasks: vec![],
+            running_subagents: vec![],
+            connected_mcp_servers: vec![],
+            todos: vec![],
+        };
+        let skills = [xai_grok_tools::implementations::skills::types::SkillInfo {
+            name: "commit".into(),
+            description: "Create a git commit.".into(),
+            path: "/skills/commit/SKILL.md".into(),
+            ..Default::default()
+        }];
+        let workflows =
+            "The following workflows are available:\n\n- review-pr: Review a PR.\n  Source: user";
+        let text = to_system_reminder_sync(&ctx, &[], &skills, None, None, Some(workflows))
+            .expect("should produce a reminder");
+        let skills_at = text.find("## Available Skills").expect("skills section");
+        let workflows_at = text
+            .find("## Available Workflows")
+            .expect("workflows section");
+        assert!(
+            skills_at < workflows_at,
+            "workflows must sit under skills:\n{text}"
+        );
+        assert!(text.contains("review-pr"), "{text}");
+    }
+
     /// No actionable items (all completed/cancelled) → no TODO section.
     #[test]
     fn system_reminder_omits_todos_when_none_active() {
@@ -477,7 +521,7 @@ mod tests {
             todo("1", TodoSummaryStatus::Completed, "done"),
             todo("2", TodoSummaryStatus::Cancelled, "scrapped"),
         ]);
-        let result = to_system_reminder_sync(&ctx, &[], &[], None, None);
+        let result = to_system_reminder_sync(&ctx, &[], &[], None, None, None);
         if let Some(text) = result {
             assert!(
                 !text.contains("## TODO List"),

@@ -84,7 +84,7 @@ impl Advice {
             let _ = write!(
                 explanation,
                 " On a slow machine or network filesystem, a larger startup \
-                 budget can help — set it with the command below."
+                 budget can help. Set it with the command below."
             );
         }
         explanation
@@ -174,12 +174,12 @@ impl NextStep {
 fn step_advice(phase: StartupPhase) -> (&'static str, NextStep) {
     use NextStep::{CheckNetworkThenRetry as Network, RestartSharedLeader, Retry};
     match phase {
-        StartupPhase::LoadConfig => ("reading your local configuration", Retry),
+        StartupPhase::ConfigLoad => ("reading your local configuration", Retry),
         StartupPhase::ManagedPolicy => ("checking your organization's managed policy", Network),
         StartupPhase::Bootstrap => ("loading your account settings", Network),
         // A disk cache read; the network fetch is the background refresh.
         StartupPhase::ModelCatalog => ("reading the list of available models", Retry),
-        StartupPhase::SpawnWorker => ("starting the local agent", Retry),
+        StartupPhase::WorkerSpawn => ("starting the local agent", Retry),
         // A Unix socket and a local spawn, never the network.
         StartupPhase::LeaderConnect => ("connecting to the shared leader", RestartSharedLeader),
         StartupPhase::AcpInitialize => ("waiting for the agent to respond", Retry),
