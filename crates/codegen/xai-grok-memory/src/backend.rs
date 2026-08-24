@@ -485,7 +485,7 @@ impl MemoryBackend for MemoryBackendImpl {
                 query,
                 &search_config,
             )
-            .map(|c| SearchMerge {
+            .map(|c| super::search::SearchMerge {
                 results: c.flat,
                 is_vector_degraded: query_embedding.embedding().is_none(),
             })
@@ -497,7 +497,7 @@ impl MemoryBackend for MemoryBackendImpl {
                 &search_config,
                 &super::search::SearchFilter::active_only(),
             )
-            .map(|results| SearchMerge {
+            .map(|results| super::search::SearchMerge {
                 results,
                 is_vector_degraded: query_embedding.embedding().is_none(),
             })
