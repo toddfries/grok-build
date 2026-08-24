@@ -322,7 +322,7 @@ async fn run(
     oom_protection: std::io::Result<()>,
     oom_protect_applied: Option<bool>,
 ) -> anyhow::Result<()> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    xai_grok_extra_ca::ensure_default_crypto_provider();
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -399,7 +399,13 @@ async fn run(
             );
         }
     }
-    let auth_provider = xai_grok_workspace::hub_auth::provider(&url, args.auth_config.as_deref())?;
+    let mut status_config = xai_grok_workspace::StatusConfig::from_env();
+    status_config.preview_control_port = args.preview.preview_control_port;
+    let auth_provider = xai_grok_workspace::hub_auth::provider(
+        &url,
+        args.auth_config.as_deref(),
+        &status_config.oidc_refresh,
+    )?;
     tracing::info!(
         hub_url = %url,
         cwd = %cwd.display(),
@@ -451,8 +457,6 @@ async fn run(
         "Workspace server starting — sessions created dynamically via server bind"
     );
     let server_id = args.server_id.clone();
-    let mut status_config = xai_grok_workspace::StatusConfig::from_env();
-    status_config.preview_control_port = args.preview.preview_control_port;
     let preview_shutdown = if args.preview.preview_enabled {
         let control_port = args.preview.preview_control_port;
         let cfg = args
