@@ -106,7 +106,7 @@ impl SearchFilter {
     }
 }
 
-pub(super) struct SearchMerge {
+pub struct SearchMerge {
     pub results: Vec<SearchResult>,
     pub is_vector_degraded: bool,
 }
