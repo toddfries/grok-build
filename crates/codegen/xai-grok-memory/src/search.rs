@@ -270,13 +270,14 @@ pub async fn hybrid_search_filtered(
         resolve_query_embedding(embedding_provider, index.vec_available(), query).await;
 
     // Phase 3 (sync): vector search + scoring + merge
-    hybrid_search_merge(
+    Ok(hybrid_search_merge(
         index,
         fts_results,
         query_embedding.embedding(),
         config,
         filter,
-    )
+    )?
+    .results)
 }
 
 /// Synchronous merge phase: vector search (if embedding provided), score
