@@ -1,21 +1,16 @@
-//! Parent-side construction of the parent→child snapshots the subagent seam
-//! consumes. These builders read `MvpAgent`'s private state directly (they are
-//! a co-located child of `mvp_agent`, `use super::*`); the seam
-//! (`crate::agent::subagent::spawn`) then orchestrates the lifecycle by calling
-//! them through the narrow `pub(crate)` surface below.
+//! Builds the snapshots of parent state that `crate::agent::subagent::spawn` hands to a child.
 //!
-//! - `start_subagent_coordinator`: takes the event receiver + presentation
-//!   state and hands coordinator wiring to `subagent::spawn`.
-//! - `build_subagent_validation_context` / `try_build_subagent_spawn_context`:
-//!   snapshot config + the parent handle into the context the seam forwards to
-//!   the child.
+//! These builders live inside `mvp_agent` (`use super::*`) so they can read `MvpAgent`'s private state directly.
+//! `crate::agent::subagent::spawn` drives the child's lifecycle and reaches back in only through the `pub(crate)` functions below.
+//!
+//! - `start_subagent_coordinator`: takes the event receiver and presentation state and starts the coordinator via `spawn_subagent_coordinator`.
+//! - `build_subagent_validation_context` and `try_build_subagent_spawn_context`: snapshot config and the parent handle for the child.
 use super::*;
 use crate::session::repo_changes::UploadMethod;
 impl MvpAgent {
-    /// Start the shared coordinator actor. Takes the event receiver and the
-    /// concurrency limits off private state, then hands coordinator/runner
-    /// wiring to the seam (`subagent::spawn::spawn_subagent_coordinator`);
-    /// `LocalRef` lets the `!Send` runner touch `self`. Idempotent.
+    /// Starts the shared coordinator actor; idempotent.
+    /// Takes the event receiver and the concurrency limits off private state and passes them to `spawn_subagent_coordinator`.
+    /// `LocalRef` lets the `!Send` runner touch `self`.
     pub(super) fn start_subagent_coordinator(&self) {
         let Some(rx) = self.subagent_event_rx.borrow_mut().take() else {
             return;
@@ -44,8 +39,8 @@ impl MvpAgent {
             }
         });
     }
-    /// Lightweight context for the `SubagentEvent::ValidateType` drain arm;
-    /// tolerates evicted parent sessions (returns built-in defaults + warns).
+    /// Lightweight context for the `SubagentEvent::ValidateType` drain arm.
+    /// Tolerates an evicted parent session: returns built-in defaults and warns.
     pub(crate) fn build_subagent_validation_context(
         &self,
         parent_session_id: &str,
@@ -85,12 +80,10 @@ impl MvpAgent {
         self.try_build_subagent_spawn_context(parent_session_id)
             .expect("parent session must exist when spawning subagents")
     }
-    /// Build a `SubagentSpawnContext` from agent state and the parent's
-    /// shared resources; `None` when the parent handle is gone.
+    /// Build a `SubagentSpawnContext` from agent state and the parent's shared resources; `None` when the parent handle is gone.
     ///
-    /// The many short-lived `self.cfg.borrow()` calls below MUST stay separate:
-    /// the `prepare_*`/`resolve_*` helpers borrow `self.cfg` internally, so
-    /// hoisting them under one outer borrow double-borrow-panics at runtime.
+    /// The many short-lived `self.cfg.borrow()` calls below MUST stay separate.
+    /// The `prepare_*` and `resolve_*` helpers borrow `self.cfg` internally, so hoisting them under one outer borrow panics with a double borrow.
     pub(crate) fn try_build_subagent_spawn_context(
         &self,
         parent_session_id: &str,
@@ -217,7 +210,7 @@ impl MvpAgent {
         let inherited_tool_overrides = parent_handle
             .as_ref()
             .and_then(|ps| ps.resolved_tool_overrides.load_full().map(|o| (*o).clone()));
-        Some(crate::agent::subagent::SubagentSpawnContext {
+        let mut ctx = crate::agent::subagent::SubagentSpawnContext {
             lsp: parent_lsp,
             process_scope: parent_process_scope,
             client_hooks: Default::default(),
@@ -235,14 +228,20 @@ impl MvpAgent {
             auth: self.current_or_buffered_auth(),
             parent_cwd: parent_cwd.clone(),
             parent_session_id: parent_session_id.to_string(),
+            active_message_parent_prompt_index: parent_handle
+                .as_ref()?
+                .tool_context
+                .active_message_parent_prompt_index
+                .clone(),
             inherited_tool_overrides,
             yolo_mode,
-            subagent_event_tx: self.subagent_event_tx.clone(),
+            subagent_event_tx: self.subagent_event_tx.event_sender().0,
             parent_depth,
             subagents_max_depth: self.cfg.borrow().subagents_max_depth,
             workflow_max_concurrent_agents: self.cfg.borrow().workflow_max_concurrent_agents,
             media_gen_batch_limits: self.cfg.borrow().media_gen_batch_limits,
             inference_idle_timeout_secs,
+            parent_compaction: crate::session::CompactionPins::default(),
             auto_compact_threshold_tiers:
                 crate::agent::subagent::AutoCompactThresholdTiers::capture(&self.cfg.borrow()),
             hunk_tracker_handle,
@@ -339,6 +338,9 @@ impl MvpAgent {
                 .unwrap_or_else(|| {
                     xai_grok_tools::reminders::task_completion::DEFAULT_TASK_OUTPUT_TOOL.to_string()
                 }),
+            scheduler_delete_tool_name: parent_handle
+                .as_ref()
+                .and_then(|h| h.tool_context.scheduler_delete_tool_name.clone()),
             auto_wake_enabled: self
                 .cfg
                 .borrow()
@@ -351,6 +353,15 @@ impl MvpAgent {
             parent_notification_handle: parent_notification_handle.clone(),
             parent_scheduler_handle: parent_scheduler_handle.clone(),
             subagent_sampling_semaphore: self.subagent_sampling_semaphore.clone(),
-        })
+        };
+        ctx.parent_compaction =
+            crate::agent::subagent::SubagentSpawnContext::snapshot_parent_compaction_pins(
+                ctx.resolve_compaction_mode(),
+                ctx.resolve_feature(crate::agent::config::Feature::TwoPassCompaction),
+                ctx.parent_agent_name.as_deref(),
+                ctx.parent_model_agent_type.as_deref(),
+                &ctx.parent_cwd,
+            );
+        Some(ctx)
     }
 }

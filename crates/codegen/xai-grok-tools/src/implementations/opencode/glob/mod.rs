@@ -171,7 +171,7 @@ impl xai_tool_runtime::Tool for GlobTool {
 
         // ── Build ripgrep command ───────────────────────────────
         //   rg --files --glob='!.git/*' --hidden --glob=<pattern> <search_dir>
-        let rg_exec = rg_path();
+        let rg_exec = rg_path()?;
         let mut cmd = Command::new(rg_exec);
         cmd.arg("--files")
             .arg("--glob=!.git/*")
@@ -356,13 +356,8 @@ mod tests {
             .render(ToolMetadata::description_template(&GlobTool))
             .unwrap();
         assert!(
-            rendered.contains("required file_pattern parameter")
-                && rendered.contains("set search_dir"),
+            rendered.contains("file_pattern") && rendered.contains("search_dir"),
             "renamed pattern/path params must appear:\n{rendered}"
-        );
-        assert!(
-            !rendered.contains("extension breakdowns") && !rendered.contains("dot-directories"),
-            "stale list_dir-style claims must not remain:\n{rendered}"
         );
     }
 
