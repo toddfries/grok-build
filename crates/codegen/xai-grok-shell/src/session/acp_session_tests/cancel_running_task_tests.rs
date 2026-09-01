@@ -112,6 +112,11 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 tokio_util::sync::CancellationToken::new(),
             );
             let actor = Arc::new(SessionActor {
+                repo_status_prefetch:
+                    crate::session::repo_status_prefix::RepoStatusPrefetchState::default(),
+                transient_retry_enabled: true,
+                transient_retries_prompt_total: std::cell::Cell::new(0),
+                transient_episode_start: std::cell::Cell::new(None),
                 status_wake: Default::default(),
                 session_info,
                 auth_method_id: test_auth_method_id("test-auth"),
@@ -121,12 +126,14 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 is_chat_kind: false,
                 state: TokioMutex::new(State {
                     running_task: None,
+                    finalization_gate: Default::default(),
                     pending_inputs: VecDeque::new(),
                     edit_holds: HashMap::new(),
                     pending_notifications: Vec::new(),
                     notifications_suppressed: false,
                     rewindable: false,
                     front_message_committed: false,
+                    hook_block_hold: Default::default(),
                     nudges_used_this_session: 0,
                 }),
                 notifications: NotificationSender {
@@ -267,7 +274,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 managed_mcp_handle: Default::default(),
                 initial_client_mcp_servers: vec![],
                 tool_metadata_snapshot: Arc::new(std::sync::Mutex::new(Default::default())),
-                mcp_announced_servers: Mutex::new(HashMap::new()),
+                mcp_announcements: Default::default(),
                 mcp_reminder_mode: McpReminderMode::Delta,
                 mcp_reminder_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 mcp_connecting_reminder_injected: std::cell::Cell::new(false),
@@ -306,8 +313,9 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 title_refresh_enabled: false,
                 session_turn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
-                turn_stream_drained: parking_lot::Mutex::new(None),
-                pending_image_strip: parking_lot::Mutex::new(None),
+                turn_stream_drained: parking_lot::Mutex::new(std::collections::HashMap::new()),
+                pending_image_strip: parking_lot::Mutex::new(std::collections::HashMap::new()),
+                image_strip_rewrite_barrier: ImageStripRewriteBarrier::new(),
                 sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
                 sampling_gate: None,
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
@@ -358,6 +366,82 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 "loaded chat history should contain the just-persisted prompt"
             );
             let _ = prompt_task.await.expect("prompt task should complete");
+        })
+        .await;
+}
+#[tokio::test(flavor = "current_thread")]
+async fn plain_user_prompt_without_persist_ack_still_sends_flush_barrier_behind_its_echo() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) =
+                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, mut persistence_rx) =
+                tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+            let observed = std::rc::Rc::new(std::cell::RefCell::new(Vec::<&'static str>::new()));
+            let recorder = observed.clone();
+            tokio::task::spawn_local(async move {
+                while let Some(msg) = persistence_rx.recv().await {
+                    match msg {
+                        PersistenceMsg::FlushAndAck { respond_to } => {
+                            recorder.borrow_mut().push("flush_and_ack");
+                            let _ = respond_to.send(Ok(()));
+                        }
+                        PersistenceMsg::Update(crate::session::storage::SessionUpdate::Acp(n))
+                            if matches!(n.update, acp::SessionUpdate::UserMessageChunk(_)) =>
+                        {
+                            recorder.borrow_mut().push("user_message_chunk");
+                        }
+                        _ => {}
+                    }
+                }
+            });
+            let actor = std::sync::Arc::new(
+                create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await,
+            );
+            let actor_for_prompt = actor.clone();
+            let turn = tokio::task::spawn_local(async move {
+                actor_for_prompt
+                    .handle_prompt(
+                        "plain-user-prompt",
+                        vec![acp::ContentBlock::Text(acp::TextContent::new("hello"))],
+                        PromptMode::Agent,
+                        None,
+                        None,
+                        None,
+                        None,
+                        true,
+                        false,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if observed.borrow().contains(&"flush_and_ack") {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("a plain user prompt (no persist_ack) must send a FlushAndAck barrier");
+            turn.abort();
+            let observed = observed.borrow();
+            let echo_index = observed
+                .iter()
+                .position(|kind| *kind == "user_message_chunk")
+                .expect("the prompt's UserMessageChunk echo must reach persistence");
+            let barrier_index = observed
+                .iter()
+                .position(|kind| *kind == "flush_and_ack")
+                .expect("barrier observed above");
+            assert!(
+                echo_index < barrier_index,
+                "the flush barrier must land FIFO-behind the prompt's persisted echo"
+            );
         })
         .await;
 }
@@ -602,6 +686,11 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
             };
             let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
             let actor = Arc::new(SessionActor {
+                repo_status_prefetch:
+                    crate::session::repo_status_prefix::RepoStatusPrefetchState::default(),
+                transient_retry_enabled: true,
+                transient_retries_prompt_total: std::cell::Cell::new(0),
+                transient_episode_start: std::cell::Cell::new(None),
                 status_wake: Default::default(),
                 session_info: session_info.clone(),
                 auth_method_id: test_auth_method_id("test-auth"),
@@ -611,12 +700,14 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 is_chat_kind: false,
                 state: TokioMutex::new(State {
                     running_task: None,
+                    finalization_gate: Default::default(),
                     pending_inputs: VecDeque::new(),
                     edit_holds: HashMap::new(),
                     pending_notifications: Vec::new(),
                     notifications_suppressed: false,
                     rewindable: false,
                     front_message_committed: false,
+                    hook_block_hold: Default::default(),
                     nudges_used_this_session: 0,
                 }),
                 notifications: NotificationSender {
@@ -761,7 +852,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 managed_mcp_handle: Default::default(),
                 initial_client_mcp_servers: vec![],
                 tool_metadata_snapshot: Arc::new(std::sync::Mutex::new(Default::default())),
-                mcp_announced_servers: Mutex::new(HashMap::new()),
+                mcp_announcements: Default::default(),
                 mcp_reminder_mode: McpReminderMode::Delta,
                 mcp_reminder_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 mcp_connecting_reminder_injected: std::cell::Cell::new(false),
@@ -800,8 +891,9 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 title_refresh_enabled: false,
                 session_turn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
-                turn_stream_drained: parking_lot::Mutex::new(None),
-                pending_image_strip: parking_lot::Mutex::new(None),
+                turn_stream_drained: parking_lot::Mutex::new(std::collections::HashMap::new()),
+                pending_image_strip: parking_lot::Mutex::new(std::collections::HashMap::new()),
+                image_strip_rewrite_barrier: ImageStripRewriteBarrier::new(),
                 sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
                 sampling_gate: None,
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
@@ -814,7 +906,13 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 trace_config_template: std::cell::RefCell::new(None),
             });
             let _ = actor
-                .process_conversation_turn_with_recovery("disabled-memory", None, None, None)
+                .process_conversation_turn_with_recovery(
+                    "disabled-memory",
+                    None,
+                    None,
+                    None,
+                    &mut length_salvage::LengthSalvage::new(None),
+                )
                 .await;
             let (flush_tx, flush_rx) = tokio::sync::oneshot::channel();
             persistence
@@ -845,10 +943,9 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
         })
         .await;
 }
-/// Hard teardown (`kill_background_tasks = true`, the subagent-shutdown path)
-/// aborts the running turn AND drains every queued prompt, responding
-/// `Cancelled` to each. Interactive cancel preserves the queue instead — see
-/// `cancel_running_task_interactive_preserves_queued_work`.
+/// Hard teardown (`kill_background_tasks = true`, the subagent-shutdown path) aborts the running turn AND drains every queued prompt.
+/// Each drained prompt gets a `Cancelled` response.
+/// Interactive cancel preserves the queue instead; see `cancel_running_task_interactive_preserves_queued_work`.
 #[tokio::test(flavor = "current_thread")]
 async fn cancel_running_task_teardown_clears_running_and_pending_work() {
     let local = tokio::task::LocalSet::new();
@@ -883,12 +980,14 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
             );
             let state = TokioMutex::new(State {
                 running_task: None,
+                finalization_gate: Default::default(),
                 pending_inputs: VecDeque::new(),
                 edit_holds: HashMap::new(),
                 pending_notifications: Vec::new(),
                 notifications_suppressed: false,
                 rewindable: false,
                 front_message_committed: false,
+                hook_block_hold: Default::default(),
                 nudges_used_this_session: 0,
             });
             let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<
@@ -904,6 +1003,10 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 )
                 .await;
             let actor = SessionActor {
+                repo_status_prefetch: crate::session::repo_status_prefix::RepoStatusPrefetchState::default(),
+                transient_retry_enabled: true,
+                transient_retries_prompt_total: std::cell::Cell::new(0),
+                transient_episode_start: std::cell::Cell::new(None),
                 status_wake: Default::default(),
                 session_info: SessionInfo {
                     id: acp::SessionId::new("test-cancel"),
@@ -1076,7 +1179,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 tool_metadata_snapshot: Arc::new(
                     std::sync::Mutex::new(Default::default()),
                 ),
-                mcp_announced_servers: Mutex::new(HashMap::new()),
+                mcp_announcements: Default::default(),
                 mcp_reminder_mode: McpReminderMode::Delta,
                 mcp_reminder_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 mcp_connecting_reminder_injected: std::cell::Cell::new(false),
@@ -1123,8 +1226,13 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 streaming_turn_capture: parking_lot::Mutex::new(
                     StreamingTurnCapture::default(),
                 ),
-                turn_stream_drained: parking_lot::Mutex::new(None),
-                pending_image_strip: parking_lot::Mutex::new(None),
+                turn_stream_drained: parking_lot::Mutex::new(
+                    std::collections::HashMap::new(),
+                ),
+                pending_image_strip: parking_lot::Mutex::new(
+                    std::collections::HashMap::new(),
+                ),
+                image_strip_rewrite_barrier: ImageStripRewriteBarrier::new(),
                 sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
                 sampling_gate: None,
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
@@ -1140,17 +1248,20 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
             let bridge = actor.agent.borrow().tool_bridge().clone();
             {
                 let mut state = actor.state.lock().await;
-                state.running_task = Some(AgentTask {
-                    prompt_id: "running".into(),
-                    handle: tokio::task::spawn_local(async move {
-                            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                        })
-                        .abort_handle(),
-                });
+                state.running_task = Some(
+                    AgentTask::new(
+                        "running",
+                        tokio::task::spawn_local(async move {
+                                tokio::time::sleep(std::time::Duration::from_secs(60))
+                                    .await;
+                            })
+                            .abort_handle(),
+                    ),
+                );
                 state
                     .pending_inputs
                     .push_back(InputItem {
-                        prompt_id: "queued".into(),
+                        prompt_id: "running".into(),
                         prompt_blocks: vec![],
                         prompt_mode: PromptMode::Agent,
                         trace_gcs_config: None,
@@ -1167,9 +1278,11 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                         respond_to: tx,
                         persist_ack: None,
                         parsed_prompt_tx: None,
+                        initial_child_prompt_ready: None,
                         queue_meta: None,
                         queue_mutation_policy: QueueMutationPolicy::hidden(),
                         send_now: false,
+                        traceparent: None,
                     });
             }
             let _ = actor
@@ -1206,23 +1319,19 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
         })
         .await;
 }
-/// Interactive cancel (`kill_background_tasks = false`, the Ctrl+C path) aborts
-/// the running turn and removes ONLY the running prompt (the front of
-/// `pending_inputs`). Every queued prompt is PRESERVED so the `Cancel`
-/// handler's follow-up `maybe_start_running_task` promotes the new front (the
-/// user's next queued prompt) and rebroadcasts `x.ai/queue/changed`. The
-/// cancelling client never pulls a queued prompt back into its input — the
-/// server queue is the single source of truth for what runs next.
+/// Interactive cancel (`kill_background_tasks = false`, the Ctrl+C path) aborts the running turn.
+/// It removes ONLY the running prompt, the front of `pending_inputs`.
+/// Every queued prompt is PRESERVED; the new front is the user's next queued prompt.
+/// The `Cancel` handler's follow-up `maybe_start_running_task` promotes the new front and rebroadcasts `x.ai/queue/changed`.
+/// The cancelling client never pulls a queued prompt back into its input; the server queue is the single source of truth for what runs next.
 ///
-/// Regression for two bugs: (1) every cancel did `std::mem::take` on the queue,
-/// silently discarding all queued prompts (which only surfaced to clients on
-/// the next prompt's empty broadcast); (2) the running prompt stays at
-/// `pending_inputs.front()` while running, so naively preserving the queue
-/// would re-run the cancelled turn.
-/// A Ctrl+C / ESC cancel (`session/cancel` → `cancel_running_task`) records a
-/// `MidTurnAbort` interrupt cause on the EventTracker so the *next* real user
-/// prompt gets tagged `PriorTurnInterrupt::MidTurnAbort`. Guards the cancel →
-/// next-message marking contract and the one-shot (consumed-once) semantics.
+/// Regression for two bugs.
+/// (1) Every cancel did `std::mem::take` on the queue, silently discarding all queued prompts.
+/// The loss only surfaced to clients on the next prompt's empty broadcast.
+/// (2) The running prompt stays at `pending_inputs.front()` while running, so naively preserving the queue would re-run the cancelled turn.
+/// A Ctrl+C / ESC cancel (`session/cancel` calls `cancel_running_task`) records a `MidTurnAbort` interrupt cause on the EventTracker.
+/// The *next* real user prompt then gets tagged `PriorTurnInterrupt::MidTurnAbort`.
+/// This guards that a cancel marks the next message and that the marker is consumed exactly once.
 #[tokio::test(flavor = "current_thread")]
 async fn cancel_records_mid_turn_abort_interrupt_marker() {
     let local = tokio::task::LocalSet::new();
@@ -1239,13 +1348,40 @@ async fn cancel_records_mid_turn_abort_interrupt_marker() {
                 .expect("current_prompt_id mutex poisoned") = Some("running".to_string());
             {
                 let mut state = actor.state.lock().await;
-                state.running_task = Some(AgentTask {
-                    prompt_id: "running".into(),
-                    handle: tokio::task::spawn_local(async {
+                state.running_task = Some(AgentTask::new(
+                    "running",
+                    tokio::task::spawn_local(async {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     })
                     .abort_handle(),
-                });
+                ));
+                state.pending_inputs.push_back(user_item("running", "test"));
+            }
+            let cancelled_strip = xai_grok_sampler::RequestId::from("cancelled-strip");
+            let timed_out_strip = xai_grok_sampler::RequestId::from("older-timeout-strip");
+            let (stream_tx, _stream_rx) = tokio::sync::oneshot::channel();
+            actor
+                .turn_stream_drained
+                .lock()
+                .insert(cancelled_strip.clone(), Some(stream_tx));
+            {
+                let mut pending = actor.pending_image_strip.lock();
+                pending.insert(
+                    cancelled_strip.clone(),
+                    PendingImageStrip {
+                        urls: vec![std::sync::Arc::from("data:image/png;base64,cancelled")],
+                        timed_out: false,
+                        applying: false,
+                    },
+                );
+                pending.insert(
+                    timed_out_strip.clone(),
+                    PendingImageStrip {
+                        urls: vec![std::sync::Arc::from("data:image/png;base64,timed-out")],
+                        timed_out: true,
+                        applying: false,
+                    },
+                );
             }
             assert_eq!(actor.events.take_prior_interrupt_category(), None);
             let _ = actor
@@ -1262,10 +1398,26 @@ async fn cancel_records_mid_turn_abort_interrupt_marker() {
                 "cancel must record a MidTurnAbort interrupt marker"
             );
             assert_eq!(actor.events.take_prior_interrupt_category(), None);
+            assert!(
+                !actor
+                    .turn_stream_drained
+                    .lock()
+                    .contains_key(&cancelled_strip),
+                "cancel must revoke normal stream ownership"
+            );
+            let pending = actor.pending_image_strip.lock();
+            assert!(
+                !pending.contains_key(&cancelled_strip),
+                "cancel must drop its turn's deferred image-strip state"
+            );
+            assert!(
+                pending.contains_key(&timed_out_strip),
+                "cancel must preserve timeout-owned work from an older turn"
+            );
         })
         .await;
 }
-/// No assistant text → do not arm the interrupt reminder.
+/// With no assistant text, the cancel does not arm the interrupt reminder.
 #[tokio::test(flavor = "current_thread")]
 async fn cancel_without_assistant_text_skips_interrupt_reminder() {
     let local = tokio::task::LocalSet::new();
@@ -1282,13 +1434,14 @@ async fn cancel_without_assistant_text_skips_interrupt_reminder() {
                 .expect("current_prompt_id mutex poisoned") = Some("running".to_string());
             {
                 let mut state = actor.state.lock().await;
-                state.running_task = Some(AgentTask {
-                    prompt_id: "running".into(),
-                    handle: tokio::task::spawn_local(async {
+                state.running_task = Some(AgentTask::new(
+                    "running",
+                    tokio::task::spawn_local(async {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     })
                     .abort_handle(),
-                });
+                ));
+                state.pending_inputs.push_back(user_item("running", "test"));
             }
             assert!(!actor.events.has_active_tool());
             assert!(!actor.events.take_pending_interrupt_reminder());
@@ -1307,11 +1460,9 @@ async fn cancel_without_assistant_text_skips_interrupt_reminder() {
         })
         .await;
 }
-/// Send-now is a silent cancel-and-send — the user is continuing, not
-/// aborting. Its cancel must arm NEITHER the interrupt envelope (no
-/// interrupt lead-in on the continuation turn) NOR the
-/// zombie wait guard from the aborted turn can't auto-send-now-cancel (and
-/// drop) the next user prompt.
+/// Send-now is a silent cancel-and-send: the user is continuing, not aborting.
+/// Its cancel must arm neither the interrupt envelope (no interrupt lead-in on the continuation turn) nor the MidTurnAbort marker.
+/// It must reset the blocking-wait depth so a zombie wait guard from the aborted turn can't auto-send-now-cancel (and drop) the next user prompt.
 #[tokio::test(flavor = "current_thread")]
 async fn send_now_cancel_arms_no_interrupt_signals_and_resets_wait_depth() {
     let local = tokio::task::LocalSet::new();
@@ -1328,20 +1479,21 @@ async fn send_now_cancel_arms_no_interrupt_signals_and_resets_wait_depth() {
                 .expect("current_prompt_id mutex poisoned") = Some("running".to_string());
             {
                 let mut state = actor.state.lock().await;
-                state.running_task = Some(AgentTask {
-                    prompt_id: "running".into(),
-                    handle: tokio::task::spawn_local(async {
+                state.running_task = Some(AgentTask::new(
+                    "running",
+                    tokio::task::spawn_local(async {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     })
                     .abort_handle(),
-                });
+                ));
+                state.pending_inputs.push_back(user_item("running", "test"));
             }
             let zombie_guard = crate::tools::tool_context::BlockingWaitGuard::enter(
                 actor.tool_context.blocking_wait_depth.clone(),
             );
             assert!(!actor.events.has_active_tool());
             let mut replay_buffer = ReplayBuffer::new(None);
-            actor.cancel_turn_for_send_now(&mut replay_buffer).await;
+            let _ = actor.cancel_turn_for_send_now(&mut replay_buffer).await;
             assert!(
                 !actor.events.take_pending_interrupt_reminder(),
                 "send-now must not arm the interrupt reminder"
@@ -1362,13 +1514,11 @@ async fn send_now_cancel_arms_no_interrupt_signals_and_resets_wait_depth() {
         })
         .await;
 }
-/// When the aborted turn left a committed-but-unanswered tool call, the
-/// next-turn dangling repair already emits a "cancelled" tool-result, so arming
-/// the reminder too would double-signal. This covers a tool mid-execution AND —
-/// critically — a turn parked on a permission prompt, where the tool-call is
-/// committed but NO tool is marked active yet (`has_active_tool()` is false).
-/// Gating on the dangling state rather than `had_active_tool` keeps both cases
-/// covered.
+/// When the aborted turn left a committed-but-unanswered tool call, the next turn's dangling repair already emits a "cancelled" tool-result.
+/// Arming the reminder too would signal the abort twice.
+/// This covers a tool mid-execution AND a turn parked on a permission prompt.
+/// During a permission prompt the tool-call is committed but NO tool is marked active yet (`has_active_tool()` is false).
+/// Gating on the dangling state rather than `had_active_tool` keeps both cases covered.
 #[tokio::test(flavor = "current_thread")]
 async fn cancel_with_dangling_tool_call_skips_interrupt_reminder() {
     let local = tokio::task::LocalSet::new();
@@ -1392,13 +1542,14 @@ async fn cancel_with_dangling_tool_call_skips_interrupt_reminder() {
                 .expect("current_prompt_id mutex poisoned") = Some("running".to_string());
             {
                 let mut state = actor.state.lock().await;
-                state.running_task = Some(AgentTask {
-                    prompt_id: "running".into(),
-                    handle: tokio::task::spawn_local(async {
+                state.running_task = Some(AgentTask::new(
+                    "running",
+                    tokio::task::spawn_local(async {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     })
                     .abort_handle(),
-                });
+                ));
+                state.pending_inputs.push_back(user_item("running", "test"));
             }
             assert!(!actor.events.has_active_tool());
             let _ = actor
@@ -1417,8 +1568,7 @@ async fn cancel_with_dangling_tool_call_skips_interrupt_reminder() {
         })
         .await;
 }
-/// Once armed, `maybe_apply_interrupt_envelope` frames the next user query
-/// with the interjection envelope exactly once (one-shot).
+/// Once armed, `maybe_apply_interrupt_envelope` frames the next user query with the interjection envelope exactly once (one-shot).
 #[tokio::test(flavor = "current_thread")]
 async fn maybe_apply_interrupt_envelope_is_one_shot() {
     let local = tokio::task::LocalSet::new();
@@ -1435,9 +1585,8 @@ async fn maybe_apply_interrupt_envelope_is_one_shot() {
         })
         .await;
 }
-/// Headless `--verbatim` / ACP `_meta.verbatim` owns the exact prompt. Framing
-/// would break that contract; the one-shot still fires so it cannot leak onto
-/// a later non-verbatim user turn.
+/// Headless `--verbatim` / ACP `_meta.verbatim` owns the exact prompt.
+/// Framing would break that contract; the one-shot still fires so it cannot leak onto a later non-verbatim user turn.
 #[tokio::test(flavor = "current_thread")]
 async fn maybe_apply_interrupt_envelope_skips_verbatim() {
     let local = tokio::task::LocalSet::new();
@@ -1455,12 +1604,10 @@ async fn maybe_apply_interrupt_envelope_skips_verbatim() {
         })
         .await;
 }
-/// Integration: with the one-shot armed, a real user turn driven through
-/// `handle_prompt` frames the query in the same envelope as an interjection
-/// (lead-in + `<user_query>` + unfinished-task trailer) instead of a
-/// preceding `<system-reminder>`. Synchronizes on the persist-ack (fires
-/// after the user item is pushed, before the model call), then aborts the
-/// turn so the dead-URL model call can't hang.
+/// Integration: with the one-shot armed, a real user turn driven through `handle_prompt` frames the query in the same envelope as an interjection.
+/// The envelope is a lead-in, the `<user_query>` block, and an unfinished-task trailer, rather than a preceding `<system-reminder>`.
+/// The test synchronizes on the persist-ack, which fires after the user item is pushed and before the model call.
+/// It then aborts the turn so the dead-URL model call can't hang.
 #[tokio::test(flavor = "current_thread")]
 async fn handle_prompt_frames_interrupt_on_user_message() {
     let local = tokio::task::LocalSet::new();
@@ -1509,8 +1656,7 @@ async fn handle_prompt_frames_interrupt_on_user_message() {
         })
         .await;
 }
-/// Integration: a verbatim user turn must stay byte-identical to the caller
-/// text even when the interrupt one-shot is armed.
+/// Integration: a verbatim user turn must stay byte-identical to the caller text even when the interrupt one-shot is armed.
 #[tokio::test(flavor = "current_thread")]
 async fn handle_prompt_verbatim_skips_interrupt_envelope() {
     let local = tokio::task::LocalSet::new();
@@ -1558,8 +1704,8 @@ async fn handle_prompt_verbatim_skips_interrupt_envelope() {
         })
         .await;
 }
-/// Send-now must use the full interjection envelope (prefix + already-wrapped
-/// `<user_query>` + unfinished-task trailer), not the note prefix alone.
+/// Send-now must use the full interjection envelope, not the note prefix alone.
+/// The envelope is the prefix, the already-wrapped `<user_query>`, and the unfinished-task trailer.
 #[tokio::test(flavor = "current_thread")]
 async fn handle_prompt_send_now_frames_interjection_envelope() {
     let local = tokio::task::LocalSet::new();
@@ -1611,10 +1757,9 @@ async fn handle_prompt_send_now_frames_interjection_envelope() {
         })
         .await;
 }
-/// Integration: a synthetic-origin turn (here `scheduler-fired-*`) driven
-/// between the abort and the user's resend must NOT consume the one-shot or
-/// inject the reminder — it has to survive to the next *genuine* user turn.
-/// Guards the `PromptOrigin::User` gate on the injection call.
+/// Integration: a synthetic-origin turn (here `scheduler-fired-*`) can run between the abort and the user's resend.
+/// It must NOT consume the one-shot or inject the reminder; the one-shot has to survive to the next *genuine* user turn.
+/// This guards the `PromptOrigin::User` gate on the injection call.
 #[tokio::test(flavor = "current_thread")]
 async fn handle_prompt_synthetic_origin_preserves_interrupt_reminder() {
     let local = tokio::task::LocalSet::new();
@@ -1685,6 +1830,7 @@ async fn cancel_running_task_interactive_preserves_queued_work() {
             respond_to,
             persist_ack: None,
             parsed_prompt_tx: None,
+            initial_child_prompt_ready: None,
             queue_meta: Some(crate::session::prompt_queue::QueueEntryMeta {
                 id: queue_id.to_string(),
                 version: 0,
@@ -1696,6 +1842,7 @@ async fn cancel_running_task_interactive_preserves_queued_work() {
             }),
             queue_mutation_policy: QueueMutationPolicy::editable(),
             send_now: false,
+            traceparent: None,
         };
         (item, rx)
     }
@@ -1716,13 +1863,13 @@ async fn cancel_running_task_interactive_preserves_queued_work() {
             let (q2_item, mut q2_rx) = make_item("q2-pid", "q2");
             {
                 let mut state = actor.state.lock().await;
-                state.running_task = Some(AgentTask {
-                    prompt_id: "running".into(),
-                    handle: tokio::task::spawn_local(async move {
+                state.running_task = Some(AgentTask::new(
+                    "running",
+                    tokio::task::spawn_local(async move {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     })
                     .abort_handle(),
-                });
+                ));
                 state.pending_inputs.push_back(running_item);
                 state.pending_inputs.push_back(q1_item);
                 state.pending_inputs.push_back(q2_item);
@@ -1776,16 +1923,14 @@ async fn cancel_running_task_interactive_preserves_queued_work() {
         })
         .await;
 }
-/// The auto-wake defect chain end-to-end at the actor level: a running
-/// `task-completed-{id}` turn at the front, a real user prompt queued behind
-/// it, then the consumed-completion sweep (the auto-wake turn polling its own
-/// task's output) followed by an interactive Ctrl+C cancel. The sweep must
-/// leave the running turn's own front slot alone so the cancel resolves the
-/// AUTO-WAKE item with `Cancelled` and the user's prompt survives to run
-/// next. If the sweep deletes the front, the user prompt shifts to index 0
-/// and the cancel destroys it instead — the message never runs and, since
-/// user messages are only persisted when their turn starts, it is silently
-/// lost from history.
+/// Runs the full auto-wake defect sequence at the actor level.
+/// Setup: a running `task-completed-{id}` turn at the front, with a real user prompt queued behind it.
+/// The auto-wake turn then polls its own task's output, which sweeps `pending_inputs` for consumed completions.
+/// An interactive Ctrl+C cancel lands next.
+/// The sweep must leave the running turn's own front slot alone.
+/// The cancel then resolves the AUTO-WAKE item with `Cancelled`, and the user's prompt survives to run next.
+/// If the sweep deletes the front, the user prompt shifts to index 0 and the cancel destroys it instead.
+/// The message never runs and, since user messages are only persisted when their turn starts, it is silently lost from history.
 #[tokio::test(flavor = "current_thread")]
 async fn cancel_after_own_completion_sweep_preserves_queued_user_prompt() {
     use tokio::sync::oneshot::error::TryRecvError;
@@ -2067,7 +2212,7 @@ async fn assert_stop_trigger_arms_wake_barrier(trigger: &str) {
                 .barrier;
             assert_eq!(
                 barrier,
-                super::tasks_cancel::WakeBarrier::Armed,
+                super::cancel::WakeBarrier::Armed,
                 "{trigger}: outcome must report the armed barrier"
             );
             assert!(
@@ -2185,7 +2330,7 @@ async fn non_stop_cancels_preserve_queued_task_wakes_and_do_not_arm_barrier() {
                     .barrier;
                 assert_eq!(
                     barrier,
-                    super::tasks_cancel::WakeBarrier::Clear,
+                    super::cancel::WakeBarrier::Clear,
                     "non-stop cancel {trigger:?} must report an unarmed barrier"
                 );
                 let state = actor.state.lock().await;
@@ -2207,19 +2352,15 @@ async fn non_stop_cancels_preserve_queued_task_wakes_and_do_not_arm_barrier() {
         })
         .await;
 }
-/// Regression for the cancel-spinner hang: an interactive cancel must resolve
-/// the in-flight front prompt's `respond_to` with `Cancelled` even when
-/// `state.running_task` is `None`.
+/// Regression for the cancel-spinner hang.
+/// An interactive cancel must resolve the in-flight front prompt's `respond_to` with `Cancelled` even when `state.running_task` is `None`.
 ///
-/// Background: cancel is fire-and-forget on the client; the TUI spinner only
-/// returns to idle when the originating `session/prompt` resolves. Earlier the
-/// running turn was resolved only when `running_task.is_some()`
-/// (`is_running_turn = idx == 0 && had_running_turn`). In the narrow windows
-/// where the front has no live task (a completion was just dequeued before the
-/// next prompt is promoted, or a cancel races ahead of
-/// `maybe_start_running_task`), the front's `respond_to` was dropped, hanging
-/// the client's `session/prompt` and spinning the spinner forever. The front
-/// (index 0) must now always be resolved; deeper queued prompts are preserved.
+/// Background: cancel is fire-and-forget on the client; the TUI spinner only returns to idle when the originating `session/prompt` resolves.
+/// Earlier the running turn was resolved only when `running_task.is_some()` (`is_running_turn = idx == 0 && had_running_turn`).
+/// The front can lack a live task when a completion was just dequeued and the next prompt is not yet promoted.
+/// It can also happen when a cancel races ahead of `maybe_start_running_task`.
+/// In those windows the front's `respond_to` was dropped, hanging the client's `session/prompt` and spinning the spinner forever.
+/// The front (index 0) must now always be resolved; deeper queued prompts are preserved.
 #[tokio::test(flavor = "current_thread")]
 async fn cancel_resolves_front_when_running_task_is_none() {
     use tokio::sync::oneshot::error::TryRecvError;
@@ -2244,6 +2385,7 @@ async fn cancel_resolves_front_when_running_task_is_none() {
             respond_to,
             persist_ack: None,
             parsed_prompt_tx: None,
+            initial_child_prompt_ready: None,
             queue_meta: queue_id.map(|id| crate::session::prompt_queue::QueueEntryMeta {
                 id: id.to_string(),
                 version: 0,
@@ -2255,6 +2397,7 @@ async fn cancel_resolves_front_when_running_task_is_none() {
             }),
             queue_mutation_policy: QueueMutationPolicy::editable(),
             send_now: false,
+            traceparent: None,
         };
         (item, rx)
     }
@@ -2322,8 +2465,7 @@ async fn cancel_resolves_front_when_running_task_is_none() {
         })
         .await;
 }
-/// Regression: aborting `running_task` must propagate
-/// cancellation to the `SamplerHandle` so the sampler stops emitting.
+/// Regression: aborting `running_task` must propagate cancellation to the `SamplerHandle` so the sampler stops emitting.
 #[tokio::test(flavor = "current_thread")]
 async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
     use axum::Router;
@@ -2426,12 +2568,14 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
             );
             let state = TokioMutex::new(State {
                 running_task: None,
+                finalization_gate: Default::default(),
                 pending_inputs: VecDeque::new(),
                 edit_holds: HashMap::new(),
                 pending_notifications: Vec::new(),
                 notifications_suppressed: false,
                 rewindable: false,
                 front_message_committed: false,
+                hook_block_hold: Default::default(),
                 nudges_used_this_session: 0,
             });
             let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<
@@ -2447,6 +2591,10 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 )
                 .await;
             let actor = SessionActor {
+                repo_status_prefetch: crate::session::repo_status_prefix::RepoStatusPrefetchState::default(),
+                transient_retry_enabled: true,
+                transient_retries_prompt_total: std::cell::Cell::new(0),
+                transient_episode_start: std::cell::Cell::new(None),
                 status_wake: Default::default(),
                 session_info: SessionInfo {
                     id: acp::SessionId::new("test-cancel-sampler"),
@@ -2619,7 +2767,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 tool_metadata_snapshot: Arc::new(
                     std::sync::Mutex::new(Default::default()),
                 ),
-                mcp_announced_servers: Mutex::new(HashMap::new()),
+                mcp_announcements: Default::default(),
                 mcp_reminder_mode: McpReminderMode::Delta,
                 mcp_reminder_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 mcp_connecting_reminder_injected: std::cell::Cell::new(false),
@@ -2666,8 +2814,13 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 streaming_turn_capture: parking_lot::Mutex::new(
                     StreamingTurnCapture::default(),
                 ),
-                turn_stream_drained: parking_lot::Mutex::new(None),
-                pending_image_strip: parking_lot::Mutex::new(None),
+                turn_stream_drained: parking_lot::Mutex::new(
+                    std::collections::HashMap::new(),
+                ),
+                pending_image_strip: parking_lot::Mutex::new(
+                    std::collections::HashMap::new(),
+                ),
+                image_strip_rewrite_barrier: ImageStripRewriteBarrier::new(),
                 sampler_handle: sampler_handle.clone(),
                 sampling_gate: None,
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
@@ -2708,10 +2861,10 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
             }
             {
                 let mut state = actor.state.lock().await;
-                state.running_task = Some(AgentTask {
-                    prompt_id: "running".into(),
-                    handle: task.abort_handle(),
-                });
+                state.running_task = Some(
+                    AgentTask::new("running", task.abort_handle()),
+                );
+                state.pending_inputs.push_back(user_item("running", "test"));
             }
             let _ = actor
                 .cancel_running_task(crate::session::CancelOptions {
@@ -2809,8 +2962,8 @@ async fn skill_reminder_deferred_while_turn_running_flushed_when_idle() {
         })
         .await;
 }
-/// Cancel (Esc/Ctrl+C) with prompts waiting behind the running one: the queue broadcast to clients
-/// keeps waiting prompts in order, drops only the cancelled one, leaves the next free to start.
+/// Cancel (Esc/Ctrl+C) with prompts waiting behind the running one: the queue broadcast to clients keeps waiting prompts in order.
+/// It drops only the cancelled prompt and leaves the next free to start.
 #[tokio::test(flavor = "current_thread")]
 async fn cancel_keeps_remaining_queued_prompts_visible_to_clients() {
     fn make_item(prompt_id: &str, queue_id: &str) -> InputItem {
@@ -2831,6 +2984,7 @@ async fn cancel_keeps_remaining_queued_prompts_visible_to_clients() {
             respond_to,
             persist_ack: None,
             parsed_prompt_tx: None,
+            initial_child_prompt_ready: None,
             queue_meta: Some(crate::session::prompt_queue::QueueEntryMeta {
                 id: queue_id.to_string(),
                 version: 0,
@@ -2842,6 +2996,7 @@ async fn cancel_keeps_remaining_queued_prompts_visible_to_clients() {
             }),
             queue_mutation_policy: QueueMutationPolicy::editable(),
             send_now: false,
+            traceparent: None,
         }
     }
     let local = tokio::task::LocalSet::new();
@@ -2858,13 +3013,13 @@ async fn cancel_keeps_remaining_queued_prompts_visible_to_clients() {
                 .expect("current_prompt_id mutex poisoned") = Some("running".to_string());
             {
                 let mut state = actor.state.lock().await;
-                state.running_task = Some(AgentTask {
-                    prompt_id: "running".into(),
-                    handle: tokio::task::spawn_local(async move {
+                state.running_task = Some(AgentTask::new(
+                    "running",
+                    tokio::task::spawn_local(async move {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     })
                     .abort_handle(),
-                });
+                ));
                 state
                     .pending_inputs
                     .push_back(make_item("running", "running"));

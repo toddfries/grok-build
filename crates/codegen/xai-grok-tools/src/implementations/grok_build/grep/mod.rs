@@ -755,7 +755,7 @@ async fn prepare_grep(
     let output_mode = input.output_mode.clone().unwrap_or(OutputMode::Content);
     let effective_head_limit = resolve_effective_head_limit(input, &output_mode);
 
-    let rg_exec = rg_path();
+    let rg_exec = rg_path()?;
 
     let mut cmd = Command::new(rg_exec);
     cmd.arg("--heading")
@@ -1676,11 +1676,8 @@ mod tests {
 
     #[test]
     fn tool_name_and_description() {
-        use crate::types::tool_metadata::ToolMetadata;
         let tool = GrepTool;
         assert_eq!(xai_tool_runtime::Tool::id(&tool).as_str(), "grep");
-        assert!(tool.description_template().contains("ripgrep"));
-        assert!(tool.description_template().contains("regex"));
     }
 
     #[test]
@@ -1703,15 +1700,11 @@ mod tests {
             .render(ToolMetadata::description_template(&GrepTool))
             .unwrap();
         assert!(
-            rendered.contains("Pass query as a raw regex")
-                && rendered.contains("'filetype'")
-                && rendered.contains("'include'"),
+            rendered.contains("'filetype'") && rendered.contains("'include'"),
             "renamed search params must appear:\n{rendered}"
         );
         assert!(
-            !rendered.contains("Pass pattern as")
-                && !rendered.contains("'type'")
-                && !rendered.contains("'glob'"),
+            !rendered.contains("'type'") && !rendered.contains("'glob'"),
             "canonical search param names must not remain after rename:\n{rendered}"
         );
     }

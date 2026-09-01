@@ -1,7 +1,5 @@
-//! Named startup phases on a per-process timer, reported once to
-//! `unified.jsonl`, product events, and OTLP metrics. A closed schema with
-//! pinned metric keys: time anything else with a `tracing` span, or give it
-//! its own schema.
+//! Named startup phases on a per-process timer, reported once to `unified.jsonl`, product events, and OTLP metrics.
+//! A closed schema with pinned metric keys: time anything else with a `tracing` span, or give it its own schema.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -9,8 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-/// `unified.jsonl` message keys, exported so consumers (the probe, tests)
-/// grep for the same strings this module writes.
+/// `unified.jsonl` message keys, exported so consumers (the probe, tests) grep for the same strings this module writes.
 pub const STARTUP_PHASE_MSG: &str = "startup phase";
 pub const CONNECT_FINISHED_MSG: &str = "connect finished";
 pub const STARTUP_COMPLETE_MSG: &str = "startup complete";
@@ -39,6 +36,56 @@ impl StartupPhase {
         self.into()
     }
 }
+
+macro_rules! span_table {
+    ($visibility:vis fn $name:ident, fn $under:ident($enum_name:ident) { $($variant:ident => $label:literal),* $(,)? }) => {
+        $visibility fn $name(value: $enum_name) -> tracing::Span {
+            match value {
+                $($enum_name::$variant => tracing::info_span!($label),)*
+            }
+        }
+        $visibility fn $under(value: $enum_name, parent: &tracing::Span) -> tracing::Span {
+            match value {
+                $($enum_name::$variant => tracing::info_span!(parent: parent, $label),)*
+            }
+        }
+    };
+    ($visibility:vis fn $name:ident($enum_name:ident, parent) { $($variant:ident => $label:literal),* $(,)? }) => {
+        $visibility fn $name(value: $enum_name, parent: &tracing::Span) -> tracing::Span {
+            match value {
+                $($enum_name::$variant => tracing::info_span!(parent: parent, $label),)*
+            }
+        }
+    };
+    ($visibility:vis fn $name:ident($enum_name:ident) { $($variant:ident => $label:literal),* $(,)? }) => {
+        $visibility fn $name(value: $enum_name) -> tracing::Span {
+            match value {
+                $($enum_name::$variant => tracing::info_span!($label),)*
+            }
+        }
+    };
+}
+pub(crate) use span_table;
+
+span_table!(fn phase_span(StartupPhase, parent) {
+    ConfigLoad => "startup.config_load",
+    ManagedPolicy => "startup.managed_policy",
+    Bootstrap => "startup.bootstrap",
+    ModelCatalog => "startup.model_catalog",
+    WorkerSpawn => "startup.worker_spawn",
+    LeaderConnect => "startup.leader_connect",
+    AcpInitialize => "startup.acp_initialize",
+    EagerAuth => "startup.eager_auth",
+    AppInit => "startup.app_init",
+    SessionCreate => "startup.session_create",
+});
+
+span_table!(pub(crate) fn subphase_span(Subphase, parent) {
+    SessionLoad => "startup.session_load",
+    SessionReplay => "startup.session_replay",
+    SessionGitScan => "startup.session_git_scan",
+    SessionSpawn => "startup.session_spawn",
+});
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr, serde::Serialize)]
 #[strum(serialize_all = "snake_case")]
@@ -105,8 +152,7 @@ impl PhaseSnapshot {
         self.open.map_or("unknown", |(phase, _)| phase.label())
     }
 
-    /// Not the open step: a step with no await inside closes before a deadline
-    /// observer can run, so the open one is usually its successor.
+    /// Not the open step: a step with no await inside closes before a deadline observer can run, so the open one is usually its successor.
     pub fn longest_step(&self) -> Option<StartupPhase> {
         self.completed
             .iter()
@@ -141,6 +187,8 @@ impl PhaseSnapshot {
 struct Inner {
     completed: Vec<(StartupPhase, Duration)>,
     current: Option<(StartupPhase, Instant)>,
+    current_span: Option<tracing::Span>,
+    root_span: tracing::Span,
     auth_mode: AuthMode,
     owner: Owner,
 }
@@ -157,6 +205,8 @@ impl StartupTimer {
             inner: Mutex::new(Inner {
                 completed: Vec::new(),
                 current: None,
+                current_span: None,
+                root_span: tracing::info_span!("startup", outcome = tracing::field::Empty),
                 auth_mode: AuthMode::Unknown,
                 owner: Owner::Agent,
             }),
@@ -167,10 +217,11 @@ impl StartupTimer {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Closes the open phase; re-entering the open phase is ignored, so two
-    /// layers can name the same step and it is measured once.
+    /// Closes the open phase; re-entering the open phase is ignored, so two layers can name the same step and it is measured once.
     pub fn enter(&self, phase: StartupPhase) {
         let now = Instant::now();
+        // Dropped after the lock: closing a span runs subscriber hooks.
+        let finished_span;
         {
             let mut g = self.lock();
             if matches!(g.current, Some((open, _)) if open == phase) {
@@ -180,7 +231,10 @@ impl StartupTimer {
                 g.completed.push((prev, now.saturating_duration_since(t0)));
             }
             g.current = Some((phase, now));
+            let span = phase_span(phase, &g.root_span);
+            finished_span = g.current_span.replace(span);
         }
+        drop(finished_span);
         let elapsed_ms = self.started.elapsed().as_millis() as u64;
         tracing::info!(phase = %phase.label(), elapsed_ms, "startup phase");
         crate::unified_log::info(
@@ -192,10 +246,34 @@ impl StartupTimer {
 
     fn close_open_phase(&self) {
         let now = Instant::now();
-        let mut g = self.lock();
-        if let Some((prev, t0)) = g.current.take() {
-            g.completed.push((prev, now.saturating_duration_since(t0)));
+        let finished_span;
+        {
+            let mut g = self.lock();
+            if let Some((prev, t0)) = g.current.take() {
+                g.completed.push((prev, now.saturating_duration_since(t0)));
+            }
+            finished_span = g.current_span.take();
         }
+        drop(finished_span);
+    }
+
+    fn close_root_span(&self, outcome: &'static str) {
+        // Dropped after the lock: closing a span runs subscriber hooks.
+        // The open phase span closes too: `summary` keeps reporting the stuck phase from `current`, but its span must not run past the total
+        let (open_phase, root);
+        {
+            let mut g = self.lock();
+            open_phase = g.current_span.take();
+            g.root_span.record("outcome", outcome);
+            root = std::mem::replace(&mut g.root_span, tracing::Span::none());
+        }
+        drop(open_phase);
+        drop(root);
+    }
+
+    /// A discarded run's spans close at the discard, not at the last `Arc` drop, so idle wait after first client is never attributed to a phase.
+    fn discard_spans(&self) {
+        self.close_root_span("discarded");
     }
 
     pub fn set_auth_mode(&self, mode: AuthMode) {
@@ -210,7 +288,6 @@ impl StartupTimer {
         self.lock().owner
     }
 
-    /// The open phase and how long it has been open.
     fn open_phase_age(&self) -> Option<(StartupPhase, Duration)> {
         self.lock().current.map(|(p, t0)| (p, t0.elapsed()))
     }
@@ -300,8 +377,7 @@ static CURRENT: Mutex<Option<Arc<StartupTimer>>> = Mutex::new(None);
 static DONE: AtomicBool = AtomicBool::new(false);
 static PROCESS_START: LazyLock<Instant> = LazyLock::new(Instant::now);
 
-/// A session startup sub-phase routed to its own `*_ms` field, so a producer
-/// timer's field is chosen at compile time rather than by string match.
+/// A session startup sub-phase routed to its own `*_ms` field, so a producer timer's field is chosen at compile time rather than by string match.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Subphase {
     SessionLoad,
@@ -359,8 +435,7 @@ pub(crate) fn record_subphase(sp: Subphase, elapsed: Duration) {
     }
 }
 
-/// Call first in `main`; the clock otherwise starts at first use and
-/// totals undercount.
+/// Call first in `main`; the clock otherwise starts at first use and totals undercount.
 pub fn mark_process_start() {
     LazyLock::force(&PROCESS_START);
 }
@@ -377,8 +452,7 @@ fn current() -> Option<Arc<StartupTimer>> {
         .map(Arc::clone)
 }
 
-/// Installs a new attempt, unless startup already ended; after that the
-/// returned timer records locally only.
+/// Installs a new attempt, unless startup already ended; after that the returned timer records locally only.
 pub fn begin(owner: Owner) -> Arc<StartupTimer> {
     let timer = Arc::new(StartupTimer::new());
     timer.lock().owner = owner;
@@ -397,8 +471,7 @@ struct WarnedPhases {
     phases: Vec<StartupPhase>,
 }
 
-/// A phase left open past the threshold; agent-owned timers idle with a
-/// phase open until their first client, so they are skipped.
+/// A phase left open past the threshold; agent-owned timers idle with a phase open until their first client, so they are skipped.
 fn slow_phase_to_warn(
     timer: &Arc<StartupTimer>,
     threshold: Duration,
@@ -422,8 +495,8 @@ fn slow_phase_to_warn(
     Some((phase, age))
 }
 
-/// Warns once per phase that runs long. A plain thread, because startup
-/// spans runtime construction; exits when startup ends.
+/// Warns once per phase that runs long.
+/// A plain thread, because startup spans runtime construction; exits when startup ends.
 fn spawn_slow_phase_warnings() {
     static SPAWNED: std::sync::Once = std::sync::Once::new();
     SPAWNED.call_once(|| {
@@ -471,10 +544,10 @@ fn clear() {
     *CURRENT.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
-/// Stops recording for a standalone agent at its first client, so idle
-/// waiting is not counted; client-owned runs are unaffected.
+/// Stops recording for a standalone agent at its first client, so idle waiting is not counted; client-owned runs are unaffected.
 pub fn mark_agent_serving() {
-    if agent_owned().is_some() {
+    if let Some(timer) = agent_owned() {
+        timer.discard_spans();
         clear();
     }
 }
@@ -486,8 +559,7 @@ pub(crate) fn reset_for_tests() {
     *subphases() = SubphaseTimings::default();
 }
 
-/// Lazily installs an agent-owned timer, covering the standalone leader
-/// and agent server; a no-op once startup is done.
+/// Lazily installs an agent-owned timer, covering the standalone leader and agent server; a no-op once startup is done.
 pub fn enter(phase: StartupPhase) {
     if DONE.load(Ordering::Relaxed) {
         return;
@@ -499,8 +571,7 @@ pub fn enter(phase: StartupPhase) {
     timer.enter(phase);
 }
 
-/// Scopes a phase to a region of work: entered on creation, closed on drop,
-/// so no failure return can leave the phase open across a retry wait.
+/// Scopes a phase to a region of work: entered on creation, closed on drop, so no failure return can leave the phase open across a retry wait.
 #[must_use = "the phase closes when this guard drops"]
 pub struct PhaseScope(());
 
@@ -524,16 +595,14 @@ pub fn set_auth_mode(mode: AuthMode) {
     }
 }
 
-/// The obligation to end startup exactly once; a dropped token ends startup
-/// itself and logs a warning, so forgotten paths are visible.
+/// The obligation to end startup exactly once; a dropped token ends startup itself and logs a warning, so forgotten paths are visible.
 #[must_use = "startup must be finished or abandoned"]
 pub struct PendingStartup {
     ended: bool,
 }
 
 impl PendingStartup {
-    /// One per interactive or headless process; utility commands call
-    /// [`mark_utility_process`] instead.
+    /// One per interactive or headless process; utility commands call [`mark_utility_process`] instead.
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         PendingStartup { ended: false }
@@ -545,8 +614,7 @@ impl PendingStartup {
         self.ended = true;
     }
 
-    /// Ends recording without a total, for a run the user cancelled or one
-    /// that never was a startup.
+    /// Ends recording without a total, for a run the user cancelled or one that never was a startup.
     pub fn abandon(mut self) {
         clear();
         self.ended = true;
@@ -576,8 +644,8 @@ pub fn mark_utility_process() {
     clear();
 }
 
-/// Records the startup total, at most once per process. A failure the user
-/// can retry records nothing, so the eventual success still counts.
+/// Records the startup total, at most once per process.
+/// A failure the user can retry records nothing, so the eventual success still counts.
 pub(crate) fn report_total(outcome: StartupOutcome) {
     if DONE.swap(true, Ordering::Relaxed) {
         return;
@@ -589,6 +657,7 @@ pub(crate) fn report_total(outcome: StartupOutcome) {
             if outcome == StartupOutcome::Ok {
                 p.close_open_phase();
             }
+            p.close_root_span(outcome.label());
             (p.summary(), p.auth_mode())
         }
         None => (String::new(), AuthMode::Unknown),
@@ -612,8 +681,8 @@ pub(crate) fn report_total(outcome: StartupOutcome) {
     crate::session_ctx::log_event(event);
 }
 
-/// A deadline for a readiness-path network step. Naming the phase and
-/// bounding the wait are one call, so neither can be forgotten.
+/// A deadline for a readiness-path network step.
+/// Naming the phase and bounding the wait are one call, so neither can be forgotten.
 pub struct ReadinessBudget {
     limit: Duration,
 }
@@ -623,9 +692,8 @@ impl ReadinessBudget {
         Self { limit }
     }
 
-    /// Run `fut` under the budget, attributed to `phase` for exactly the
-    /// run's duration. Returns `None` on timeout, after logging, instead of
-    /// blocking readiness.
+    /// Run `fut` under the budget, attributed to `phase` for exactly the run's duration.
+    /// Returns `None` on timeout, after logging, instead of blocking readiness.
     pub async fn run<T>(
         &self,
         phase: StartupPhase,
@@ -666,10 +734,180 @@ pub fn format_duration(d: Duration) -> String {
 mod tests {
     use super::*;
 
-    // Serializes the tests that drive the process-wide startup statics
-    // (`CURRENT`/`DONE`/`SUBPHASES` and the redirected unified log); run in
-    // parallel they race. Each holder also calls `reset_for_tests` first.
+    // Serializes the tests that drive the process-wide startup statics (`CURRENT`/`DONE`/`SUBPHASES` and the redirected unified log)
+    // Run in parallel they race
+    // Each holder also calls `reset_for_tests` first
     static SERIAL: Mutex<()> = Mutex::new(());
+
+    mod span_capture {
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        use tracing::span::{Attributes, Id};
+        use tracing_subscriber::layer::{Context, Layer};
+        use tracing_subscriber::registry::LookupSpan;
+
+        pub(super) struct ClosedSpan {
+            pub(super) name: String,
+            pub(super) parent: Option<String>,
+            pub(super) elapsed: Duration,
+        }
+
+        #[derive(Default)]
+        pub(super) struct SpanLog {
+            open: HashMap<u64, (String, Option<String>, Instant)>,
+            pub(super) closed: Vec<ClosedSpan>,
+        }
+
+        pub(super) struct SpanTimingLayer(pub(super) Arc<Mutex<SpanLog>>);
+
+        impl<S: tracing::Subscriber + for<'a> LookupSpan<'a>> Layer<S> for SpanTimingLayer {
+            fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, _ctx: Context<'_, S>) {
+                let mut log = self.0.lock().unwrap();
+                let parent = attrs
+                    .parent()
+                    .and_then(|pid| log.open.get(&pid.into_u64()))
+                    .map(|(name, _, _)| name.clone());
+                log.open.insert(
+                    id.into_u64(),
+                    (attrs.metadata().name().to_string(), parent, Instant::now()),
+                );
+            }
+
+            fn on_close(&self, id: Id, _ctx: Context<'_, S>) {
+                let mut log = self.0.lock().unwrap();
+                if let Some((name, parent, opened)) = log.open.remove(&id.into_u64()) {
+                    let elapsed = opened.elapsed();
+                    log.closed.push(ClosedSpan {
+                        name,
+                        parent,
+                        elapsed,
+                    });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn startup_phases_emit_spans_with_durations() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_tests();
+        crate::unified_log::redirect_to_temp_for_tests();
+
+        let log = Arc::new(Mutex::new(span_capture::SpanLog::default()));
+        let subscriber =
+            tracing_subscriber::registry().with(span_capture::SpanTimingLayer(Arc::clone(&log)));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let _p = begin(Owner::Client);
+        enter(StartupPhase::ConfigLoad);
+        std::thread::sleep(Duration::from_millis(10));
+        // Re-entering the open phase must not open a second span.
+        enter(StartupPhase::ConfigLoad);
+        enter(StartupPhase::Bootstrap);
+        std::thread::sleep(Duration::from_millis(10));
+        {
+            let mut timer = crate::instrumentation::timer("session.git_divergence");
+            timer.with_subphase(Subphase::SessionGitScan);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        report_total(StartupOutcome::Ok);
+
+        let log = log.lock().unwrap_or_else(|e| e.into_inner());
+        let names: Vec<&str> = log.closed.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "startup.config_load",
+                "startup.session_git_scan",
+                "timer",
+                "startup.bootstrap",
+                "startup",
+            ]
+        );
+        for c in &log.closed {
+            assert!(
+                c.elapsed >= Duration::from_millis(10),
+                "{} must cover its region, got {:?}",
+                c.name,
+                c.elapsed
+            );
+        }
+
+        // Held spans never parent contextually: phases are explicit children of the root
+        // The sub-phase timer has no root handle, and its subphase span nests under it so the interval counts once
+        for c in &log.closed {
+            let expected_parent = match c.name.as_str() {
+                "startup" | "timer" => None,
+                "startup.session_git_scan" => Some("timer"),
+                _ => Some("startup"),
+            };
+            assert_eq!(c.parent.as_deref(), expected_parent, "{}", c.name);
+        }
+
+        // The launch-to-interactive bar contains every phase bar.
+        let root = log
+            .closed
+            .iter()
+            .find(|c| c.name == "startup")
+            .expect("the root startup span closes at the ok total");
+        let phase_sum: Duration = log
+            .closed
+            .iter()
+            .filter(|c| c.parent.as_deref() == Some("startup"))
+            .map(|c| c.elapsed)
+            .sum();
+        assert!(
+            root.elapsed >= phase_sum,
+            "root span ({:?}) must cover the phases it parents ({phase_sum:?})",
+            root.elapsed
+        );
+    }
+
+    #[test]
+    fn agent_run_spans_close_at_discard() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_tests();
+        crate::unified_log::redirect_to_temp_for_tests();
+
+        let log = Arc::new(Mutex::new(span_capture::SpanLog::default()));
+        let subscriber =
+            tracing_subscriber::registry().with(span_capture::SpanTimingLayer(Arc::clone(&log)));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let _p = begin(Owner::Agent);
+        enter(StartupPhase::ConfigLoad);
+        mark_agent_serving();
+
+        let log = log.lock().unwrap_or_else(|e| e.into_inner());
+        let names: Vec<&str> = log.closed.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["startup.config_load", "startup"],
+            "a discarded run's spans close at the discard, not at timer drop"
+        );
+    }
+
+    // The `phases` string is a frozen format that fleet dashboards parse.
+    #[test]
+    fn summary_is_byte_stable_for_fixed_inputs() {
+        let snap = PhaseSnapshot {
+            completed: vec![
+                (StartupPhase::ConfigLoad, Duration::from_millis(12)),
+                (StartupPhase::Bootstrap, Duration::from_millis(1500)),
+            ],
+            open: Some((StartupPhase::SessionCreate, Duration::from_millis(3))),
+        };
+        assert_eq!(
+            snap.summary(),
+            "config_load=12ms, bootstrap=1.5s, session_create>=3ms"
+        );
+    }
 
     #[test]
     fn slow_phase_warning_fires_once_per_open_phase() {
@@ -742,8 +980,7 @@ mod tests {
         );
     }
 
-    // Process-wide statics: `SERIAL` serializes this with the other global
-    // tests; interleaved runs race.
+    // Process-wide statics: `SERIAL` serializes this with the other global tests; interleaved runs race
     #[test]
     fn global_lifecycle_records_then_ends() {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -831,8 +1068,7 @@ mod tests {
         );
     }
 
-    // absent≠zero: with no prefetch the caller never stamps, so the record
-    // omits `prefetch_wait_ms` rather than reporting a spurious zero.
+    // Absent is not zero: with no prefetch the caller never stamps, so the record omits `prefetch_wait_ms` rather than reporting a spurious zero
     #[test]
     fn startup_completed_omits_prefetch_wait_without_a_prefetch() {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
