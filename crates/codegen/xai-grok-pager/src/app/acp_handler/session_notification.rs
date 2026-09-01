@@ -1,7 +1,7 @@
 use super::*;
 use xai_grok_shell::sampling::error::format_rate_limited_user_message;
-/// Stash a live stop-family batch under `stash_pid` for the turn marker
-/// to fold. `merge_same_name` merges a same-name repeat instead of standalone.
+/// Stash a live stop-family batch under `stash_pid` for the turn marker to fold.
+/// `merge_same_name` merges a same-name repeat instead of pushing it standalone.
 pub(super) fn stash_live_stop_batch(
     agent: &mut AgentView,
     stash_pid: Option<String>,
@@ -45,28 +45,31 @@ pub(super) fn refresh_context_used(view: &mut AgentView, used: u64) {
     let total = view.session.models.get_context_window().unwrap_or(0);
     view.apply_context_used(used, total);
 }
-/// Refresh the bar and record `used` as the confirmed count for a pending
-/// compaction message; call only from the `meta.totalTokens` path.
+/// Context-bar refresh carried by a compaction lifecycle update, if any.
+/// `AutoCompactStarted` carries the count the trigger fired on, and the banner percentage derives from it.
+/// Without this refresh the bar shows the stale pre-turn number right next to the "N% full" banner.
+pub(super) fn compaction_context_refresh(update: &XaiSessionUpdate) -> Option<u64> {
+    match update {
+        XaiSessionUpdate::AutoCompactStarted { tokens_used, .. } => Some(*tokens_used),
+        XaiSessionUpdate::AutoCompactCompleted { tokens_after, .. } => Some(*tokens_after),
+        _ => None,
+    }
+}
+/// Refresh the bar and record `used` as the confirmed count for a pending compaction message; call only from the `meta.totalTokens` path.
 pub(super) fn confirm_context_used(view: &mut AgentView, used: u64) {
     refresh_context_used(view, used);
     view.session.note_context_used(used);
 }
-/// Replay gate shared by the ACP and xAI session-update paths. Returns `true`
-/// when the update must be dropped.
+/// Replay gate shared by the ACP and xAI session-update paths. Returns `true` when the update must be dropped.
 ///
-/// Replay is only expected while a `session/load` is in flight for this agent
-/// (fresh-view load or reconnect reload window). Anything else is misrouted —
-/// e.g. a leader falling through to broadcast another client's replay, or a
-/// replay landing after its reload already timed out — and applying it would
-/// append duplicated history below the live transcript. An expected replay is
-/// recorded on the open reload window instead (see
-/// [`AgentView::mark_reload_replay_seen`]). One `warn!` per incident; the rest
-/// of the burst (one line per replayed event) logs at `debug!`.
+/// Replay is only expected while a `session/load` is in flight for this agent (fresh-view load or reconnect reload window).
+/// Anything else is misrouted: a leader falling through to broadcast another client's replay, or a replay landing after its reload timed out.
+/// Applying a misrouted replay would append duplicated history below the live transcript.
+/// An expected replay is recorded on the open reload window instead (see [`AgentView::mark_reload_replay_seen`]).
+/// One `warn!` per incident; the rest of the burst (one line per replayed event) logs at `debug!`.
 ///
-/// After `SessionLoaded` the barrier may release on an Unrelated ACP timeout
-/// while remaining `isReplay` still sits behind a foreign head. `late_replay_until`
-/// keeps accepting that tail until the first this-session live update or the
-/// grace expires.
+/// After `SessionLoaded` the barrier may release on an Unrelated ACP timeout while remaining `isReplay` still sits behind a foreign head.
+/// `late_replay_until` keeps accepting that tail until the first this-session live update or the grace expires.
 pub(crate) fn drop_unexpected_replay(
     agent: &mut AgentView,
     meta: &NotificationMeta,
@@ -99,25 +102,91 @@ pub(crate) fn drop_unexpected_replay(
     agent.unexpected_replay_drops = agent.unexpected_replay_drops.saturating_add(1);
     true
 }
-/// Advance the reconnect cursor to an APPLIED update's eventId. Called from
-/// every applied arm (Plan, bg-stdout, tracker) — dropped updates (dedup,
-/// promptId gate, unexpected replay) deliberately don't move it. Forward-only
-/// via [`AgentView::advance_last_seen_event_id`].
+/// Advance the reconnect cursor to an applied update's eventId.
+/// Called from every applied arm (Plan, bg-stdout, tracker); dropped updates (dedup, promptId gate, unexpected replay) deliberately don't move it.
+/// Forward-only via [`AgentView::advance_last_seen_event_id`].
 pub(super) fn advance_reconnect_cursor(agent: &mut AgentView, meta: &mut NotificationMeta) {
     if let Some(id) = meta.event_id.take() {
         agent.advance_last_seen_event_id(id, meta.event_seq);
     }
 }
-/// A string field off a turn-terminal notification envelope's `_meta`
-/// (the cancel-qualifier keys; absent on older shells).
+/// A string field off a turn-terminal notification envelope's `_meta` (the cancel-qualifier keys; absent on older shells).
 fn terminal_meta_str<'a>(meta: Option<&'a serde_json::Value>, key: &str) -> Option<&'a str> {
     meta.and_then(|v| v.get(key)).and_then(|v| v.as_str())
 }
+/// Decode the HTML entities that appear in generated session summaries.
+fn decode_html_entities(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.contains('&') {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = s.to_string();
+    out = out.replace("&amp;", "&");
+    out = out.replace("&lt;", "<");
+    out = out.replace("&gt;", ">");
+    out = out.replace("&quot;", "\"");
+    out = out.replace("&#39;", "'");
+    out = out.replace("&#x27;", "'");
+    out = out.replace("&apos;", "'");
+    std::borrow::Cow::Owned(out)
+}
+/// Display-only end marker for a replayed `TurnCompleted`.
+/// Reads cancel metadata once; chatty rate-limited wakes still paint `TurnFailed`.
+fn synthesize_replay_turn_marker(
+    agent: &mut AgentView,
+    prompt_id: &str,
+    stop_reason: &str,
+    agent_result: Option<&str>,
+    error_kind: Option<crate::app::error_display::WireErrorType>,
+    elapsed_ms: Option<u64>,
+    meta: Option<&serde_json::Value>,
+) -> Option<crate::scrollback::blocks::SessionEvent> {
+    use crate::app::turn_completion::{
+        CANCEL_TRIGGER_KEY, CANCELLATION_CATEGORY_KEY, TerminalMarkerInput, TurnStopReason,
+        terminal_marker,
+    };
+    let stop = TurnStopReason::from(stop_reason);
+    let is_wake = is_wake_prompt(prompt_id);
+    let visible = agent.replayed_visible_prompts.contains(prompt_id);
+    let chatty_rate_limit = is_wake && stop == TurnStopReason::RateLimit && visible;
+    if is_wake && (matches!(stop, TurnStopReason::Error) || chatty_rate_limit) {
+        agent.failed_wake_marker_for = Some(prompt_id.to_string());
+    }
+    let suppress = super::prompt_origin::suppress_replay_marker_for_origin(
+        agent.replayed_bash_prompts.contains(prompt_id),
+        visible,
+        prompt_id,
+        stop,
+    );
+    let banner = crate::app::dispatch::scrollback_has_recent_error_banner(&agent.scrollback);
+    let cancel_trigger = terminal_meta_str(meta, CANCEL_TRIGGER_KEY);
+    let cancellation_category = terminal_meta_str(meta, CANCELLATION_CATEGORY_KEY);
+    let paint_rate_limit_failure = chatty_rate_limit && !suppress && !banner;
+    let marker = if suppress {
+        None
+    } else {
+        terminal_marker(TerminalMarkerInput {
+            stop,
+            elapsed_ms,
+            agent_result,
+            send_now_cancel: cancel_trigger == Some("send_now"),
+            cancellation_category,
+            error_kind,
+            error_banner_present: banner,
+        })
+    };
+    marker.or_else(|| {
+        paint_rate_limit_failure.then(|| {
+            super::prompt_origin::rate_limited_wake_failure_event(
+                agent_result,
+                elapsed_ms.map(std::time::Duration::from_millis),
+            )
+        })
+    })
+}
 /// Handle `x.ai/session_notification` and replay-path `x.ai/session/update`.
 ///
-/// Routes by `session_id` so events for an inactive agent still mutate that
-/// agent's state. The redraw decision is gated on whether the matched agent
-/// is the currently visible one.
+/// Routes by `session_id` so events for an inactive agent still mutate that agent's state.
+/// The redraw decision is gated on whether the matched agent is the currently visible one.
 pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mut AppView) -> bool {
     handle_session_notification_with_origin(notif, app, LifecycleOrigin::Stream)
 }
@@ -245,8 +314,10 @@ pub(super) fn handle_session_notification_with_origin(
                 &mut agent.scrollback,
                 is_api_key_auth,
             );
-            if let XaiSessionUpdate::AutoCompactCompleted { tokens_after, .. } = update {
-                refresh_context_used(agent, *tokens_after);
+            if let Some(used) = compaction_context_refresh(update) {
+                refresh_context_used(agent, used);
+            }
+            if let XaiSessionUpdate::AutoCompactCompleted { .. } = update {
                 agent.todo.update_todos(Vec::new());
             }
             changed
@@ -278,10 +349,27 @@ pub(super) fn handle_session_notification_with_origin(
             prompt_id,
             stop_reason,
             agent_result,
+            error_kind,
+            elapsed_ms,
             ..
         } => {
+            let error_kind = crate::app::error_display::wire_error_kind(error_kind.as_deref());
             if agent.session.loading_replay {
-                agent.replayed_terminal_prompts.insert(prompt_id);
+                let first = agent.replayed_terminal_prompts.insert(prompt_id.clone());
+                if first
+                    && !prompt_id.is_empty()
+                    && let Some(event) = synthesize_replay_turn_marker(
+                        agent,
+                        &prompt_id,
+                        stop_reason.as_str(),
+                        agent_result.as_deref(),
+                        error_kind,
+                        elapsed_ms,
+                        session_notif.meta.as_ref(),
+                    )
+                {
+                    agent.push_end_marker_block(event, Vec::new(), Some(prompt_id));
+                }
                 false
             } else if is_wake_prompt(&prompt_id) {
                 if agent
@@ -304,27 +392,19 @@ pub(super) fn handle_session_notification_with_origin(
                         ) {
                             false
                         } else {
-                            let error = if stop_reason == "rate_limit" {
-                                agent_result
-                                    .as_deref()
-                                    .map(str::to_string)
-                                    .unwrap_or_else(|| "rate limited".to_string())
-                            } else {
-                                crate::app::error_display::format_request_failure(
+                            let event = if stop_reason == "rate_limit" {
+                                super::prompt_origin::rate_limited_wake_failure_event(
+                                    agent_result.as_deref(),
                                     None,
-                                    None,
-                                    agent_result.as_deref().unwrap_or("unknown error"),
                                 )
-                                .message()
+                            } else {
+                                crate::app::turn_completion::failed_turn_event(
+                                    error_kind,
+                                    agent_result.as_deref(),
+                                    None,
+                                )
                             };
-                            agent.push_end_marker_block(
-                                crate::scrollback::blocks::SessionEvent::TurnFailed {
-                                    error,
-                                    elapsed: None,
-                                },
-                                Vec::new(),
-                                Some(prompt_id.clone()),
-                            );
+                            agent.push_end_marker_block(event, Vec::new(), Some(prompt_id.clone()));
                             true
                         }
                     } else {
@@ -334,16 +414,19 @@ pub(super) fn handle_session_notification_with_origin(
                     finish_wake_turn(
                         agent,
                         &prompt_id,
-                        &stop_reason,
-                        agent_result.as_deref(),
-                        terminal_meta_str(
-                            session_notif.meta.as_ref(),
-                            super::super::turn_completion::CANCEL_TRIGGER_KEY,
-                        ),
-                        terminal_meta_str(
-                            session_notif.meta.as_ref(),
-                            super::super::turn_completion::CANCELLATION_CATEGORY_KEY,
-                        ),
+                        super::prompt_origin::WakeTerminal {
+                            stop_reason: &stop_reason,
+                            agent_result: agent_result.as_deref(),
+                            cancel_trigger: terminal_meta_str(
+                                session_notif.meta.as_ref(),
+                                super::super::turn_completion::CANCEL_TRIGGER_KEY,
+                            ),
+                            cancellation_category: terminal_meta_str(
+                                session_notif.meta.as_ref(),
+                                super::super::turn_completion::CANCELLATION_CATEGORY_KEY,
+                            ),
+                            error_kind,
+                        },
                     );
                     true
                 }
@@ -376,6 +459,10 @@ pub(super) fn handle_session_notification_with_origin(
                                 session_notif.meta.as_ref(),
                                 super::super::turn_completion::CANCELLATION_CATEGORY_KEY,
                             ),
+                            cancellation_context: session_notif.meta.as_ref().and_then(|m| {
+                                m.get(super::super::turn_completion::CANCELLATION_CONTEXT_KEY)
+                            }),
+                            error_kind,
                         },
                     ));
                 false
@@ -511,6 +598,8 @@ pub(super) fn handle_session_notification_with_origin(
                 available_commands_generation: 0,
                 available_tools: None,
                 model_switch_pending: false,
+                hook_block_hold: false,
+                blocked_prompt: None,
                 user_model_preference: None,
                 deferred_model_switch: None,
                 in_flight_prompt: None,
@@ -915,6 +1004,7 @@ pub(super) fn handle_session_notification_with_origin(
         } => {
             if let Some(ref mut modal) = agent.extensions_modal {
                 use crate::views::extensions_modal::TabDataState;
+                modal.seed_hook_groups_once(&hooks);
                 modal.hooks_data =
                     TabDataState::Loaded(xai_hooks_plugins_types::HooksListResponse {
                         hooks,
@@ -965,7 +1055,7 @@ pub(super) fn handle_session_notification_with_origin(
                     } else {
                         None
                     };
-                    let decoded = crate::util::decode_html_entities(&session_summary);
+                    let decoded = decode_html_entities(&session_summary);
                     if let Some(clean) =
                         xai_grok_shell::session::persistence::sanitize_and_cap_title(&decoded)
                     {
@@ -1301,9 +1391,8 @@ pub(super) fn handle_session_notification_with_origin(
 }
 /// Handle an xAI session notification that targets a child (subagent) session.
 ///
-/// Events like compaction, retry, and memory flush are emitted by the child's
-/// `acp_session` with the *child's* `session_id`. This routes them to the
-/// correct child view and updates `SubagentInfo` where appropriate.
+/// Events like compaction, retry, and memory flush are emitted by the child's `acp_session` with the *child's* `session_id`.
+/// This routes them to the correct child view and updates `SubagentInfo` where appropriate.
 pub(super) fn handle_child_session_notification(
     update: XaiSessionUpdate,
     child_sid: &str,
@@ -1366,10 +1455,9 @@ pub(super) fn handle_child_session_notification(
         _ => false,
     }
 }
-/// Apply one xAI session event to a child view: the scrollback/session
-/// rendering shared by the live child routing above and the from-disk child
-/// replay (`crate::app::subagent::replay_inherited_updates`), so a rebuilt
-/// transcript keeps the same compaction/retry markers the live one had.
+/// Apply one xAI session event to a child view.
+/// The live child routing above and the from-disk child replay (`crate::app::subagent::replay_inherited_updates`) share this rendering.
+/// A rebuilt transcript therefore keeps the same compaction/retry markers the live one had.
 pub(crate) fn apply_child_view_session_event(
     child_view: &mut AgentView,
     update: &XaiSessionUpdate,
@@ -1381,18 +1469,16 @@ pub(crate) fn apply_child_view_session_event(
         &mut child_view.scrollback,
         is_api_key_auth,
     );
-    if let XaiSessionUpdate::AutoCompactCompleted { tokens_after, .. } = update {
-        refresh_context_used(child_view, *tokens_after);
+    if let Some(used) = compaction_context_refresh(update) {
+        refresh_context_used(child_view, used);
     }
     changed
 }
 /// Apply a compaction or retry event to a session's activity state and scrollback.
 ///
 /// Shared between the root agent and child (subagent) notification paths.
-/// Test-only shim so dispatch-level tests can replay real notification
-/// sequences (e.g. `RetryState::Retrying` → `Exhausted`) through the
-/// production handler — the Retrying arm clears the `in_flight_prompt`
-/// rewind stash, which a fixture setting fields directly would miss.
+/// Test-only shim so dispatch tests can replay notification sequences (e.g. `RetryState::Retrying` then `Exhausted`) through the production handler.
+/// The Retrying arm clears the `in_flight_prompt` rewind stash, which a fixture setting fields directly would miss.
 #[cfg(test)]
 pub(crate) fn apply_session_event_for_test(
     update: &XaiSessionUpdate,
@@ -1475,9 +1561,8 @@ pub(super) fn apply_session_event(
         _ => false,
     }
 }
-/// True if the trailing run of session/system blocks contains a
-/// [`SessionEvent::CompactionFailed`]. Used so we don't stack a [`SessionEvent::ContextTooLarge`]
-/// prompt on top of the compaction handler's "too large to compact" message.
+/// True if the trailing run of session/system blocks contains a [`SessionEvent::CompactionFailed`].
+/// Used so we don't stack a [`SessionEvent::ContextTooLarge`] prompt on top of the compaction handler's "too large to compact" message.
 pub(super) fn scrollback_has_recent_compaction_failed(
     scrollback: &crate::scrollback::state::ScrollbackState,
 ) -> bool {
@@ -1495,12 +1580,10 @@ pub(super) fn scrollback_has_recent_compaction_failed(
     }
     false
 }
-/// Handle an `ImageCompressed` notification. A successful compression is
-/// deliberately invisible in the TUI (log-only): it needs no user action,
-/// and the model-facing `<image_compression_notice>` reminder is attached
-/// to the prompt independently. Only the re-encode *fallback* — the
-/// oversized original was KEPT — surfaces, as a persistent scrollback
-/// warning (and is re-materialized on session replay).
+/// Handle an `ImageCompressed` notification.
+/// A successful compression is deliberately invisible in the TUI (log-only): it needs no user action.
+/// The model-facing `<image_compression_notice>` reminder is attached to the prompt independently.
+/// Only the re-encode *fallback* (the oversized original was kept) shows, as a persistent scrollback warning that is rebuilt on session replay.
 pub(super) fn apply_image_compressed(
     agent: &mut AgentView,
     images: &[xai_grok_shell::extensions::notification::ImageCompressedEntry],
@@ -1530,11 +1613,13 @@ pub(super) fn apply_retry_state(
             attempt,
             max_retries,
             reason,
+            error_type,
         } => {
             session.set_retry_activity(Some(TurnActivity::Retrying {
                 attempt: *attempt,
                 max_retries: *max_retries,
                 reason: reason.clone(),
+                error_type: error_type.clone(),
             }));
         }
         RetryState::Exhausted {
@@ -1615,12 +1700,8 @@ pub(super) fn apply_retry_state(
                 }));
             } else {
                 scrollback.push_block(RenderBlock::session_event(
-                    crate::app::error_display::format_request_failure(
-                        None,
-                        Some(error_type.as_str()),
-                        message,
-                    )
-                    .into_session_event(),
+                    crate::app::error_display::format_request_failure(None, Some(wire), message)
+                        .into_session_event(),
                 ));
             }
         }
@@ -1640,19 +1721,15 @@ pub(super) fn apply_retry_state(
 }
 /// Single source of truth for plan-mode state on the pager side.
 ///
-/// The agent emits `CurrentModeUpdate` on every entry and exit — both for
-/// user-driven mode switches (Shift+Tab → `session/set_mode`) and for
-/// agent-driven `EnterPlanMode` / `ExitPlanMode` tool calls (mapped by the
-/// notification bridge).
+/// The agent emits `CurrentModeUpdate` on every entry and exit.
+/// That covers user-driven mode switches (Shift+Tab sends `session/set_mode`).
+/// It also covers agent-driven `EnterPlanMode` / `ExitPlanMode` tool calls (mapped by the notification bridge).
 ///
-/// Do not be tempted to infer mode from tool-call titles: titles incorporate
-/// raw model/user input (Grep pattern, Bash command, search query, ...), so
-/// a substring match silently bricks sessions whenever any tool happens to
-/// mention `enter_plan_mode`.
+/// Do not be tempted to infer mode from tool-call titles.
+/// Titles incorporate raw model/user input (Grep pattern, Bash command, search query, ...).
+/// A substring match would silently brick sessions whenever any tool happens to mention `enter_plan_mode`.
 ///
-/// Returns `true` when a `CurrentModeUpdate` was processed so the
-/// caller can refresh open settings modals after the per-agent borrow
-/// releases.
+/// Returns `true` when a `CurrentModeUpdate` was processed so the caller can refresh open settings modals after the per-agent borrow releases.
 pub(super) fn detect_plan_mode_change(update: &acp::SessionUpdate, agent: &mut AgentView) -> bool {
     use xai_grok_tools::types::SessionMode;
     let acp::SessionUpdate::CurrentModeUpdate(cmu) = update else {

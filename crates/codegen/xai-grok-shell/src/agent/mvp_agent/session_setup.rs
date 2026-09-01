@@ -1,5 +1,5 @@
-//! ACP [session setup]: the four methods that create, attach to, and free a
-//! session. Split from `acp_agent.rs`, whose trait impl delegates all four.
+//! ACP [session setup]: the four methods that create, attach to, and free a session.
+//! Split from `acp_agent.rs`, whose trait impl delegates all four.
 //!
 //! [session setup]: https://agentclientprotocol.com/protocol/v1/session-setup
 use super::reasoning_effort::{
@@ -7,8 +7,7 @@ use super::reasoning_effort::{
 };
 use super::*;
 use crate::agent::session_metrics::SessionStartKind;
-/// Refusals resume must give verbatim, so a test cannot mistake some other
-/// `invalid_params` for the guard it is pinning.
+/// Refusals resume must give verbatim, so a test cannot mistake some other `invalid_params` for the guard it is pinning.
 pub(super) const RESUME_REFUSES_CHAT: &str =
     "session/resume is not supported for chat sessions; use session/load";
 pub(super) const RESUME_REFUSES_EXTRA_DIRS: &str =
@@ -48,16 +47,36 @@ fn insert_applied_tool_overrides(
         );
     }
 }
-/// Per-client capabilities for one session. Leader mode injects these per
-/// request, so they belong to the request rather than to the agent.
+/// Parse the client-claimed `_meta.sessionKind` on `session/new`.
+/// `headless` is the only client-minted kind; the `subagent*` namespace is server-owned.
+/// Other values stay forward-compatible and leave the session unstamped.
+fn parse_client_session_kind(meta: Option<&acp::Meta>) -> Result<Option<String>, acp::Error> {
+    let Some(kind) = meta
+        .and_then(|m| m.get("sessionKind").or_else(|| m.get("session_kind")))
+        .and_then(|v| v.as_str())
+    else {
+        return Ok(None);
+    };
+    if kind == "headless" {
+        return Ok(Some(kind.to_owned()));
+    }
+    if kind.starts_with("subagent") {
+        return Err(acp::Error::invalid_params()
+            .data("_meta.sessionKind uses the server-reserved subagent namespace"));
+    }
+    tracing::warn!(kind, "ignoring unsupported _meta.sessionKind claim");
+    Ok(None)
+}
+/// Per-client capabilities for one session.
+/// Leader mode injects these per request, so they belong to the request rather than to the agent.
 struct ClientCaps {
     code_nav: bool,
     terminal: bool,
     fs_read: bool,
     fs_write: bool,
 }
-/// What an attach recovers from disk before the plan mode moves into the actor:
-/// telemetry counters, and the parked approval the rebuilt actor has to re-ask.
+/// What an attach recovers from disk before the plan mode moves into the actor.
+/// It holds telemetry counters and the parked approval the rebuilt actor has to re-ask.
 struct RestoredSignals {
     compaction_count: u64,
     turn_count: u64,
@@ -100,9 +119,8 @@ impl AttachOperation {
         }
     }
 }
-/// What the two attach methods do differently, decided in one exhaustive match
-/// so a branch further down cannot quietly skip [`AttachOperation`]. Not in the
-/// request's `_meta`, where resume used to write it: that lets a client spoof it.
+/// What the two attach methods do differently, decided in one exhaustive match so a branch further down cannot quietly skip [`AttachOperation`].
+/// It is not carried in the request's `_meta`, where resume used to write it: that lets a client spoof it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct AttachPolicy {
     /// Skip the transcript replay before responding.
@@ -131,9 +149,8 @@ impl AttachPolicy {
         }
     }
 }
-/// Client-supplied routing an attach's replay must echo: the `x.ai/persist`
-/// blob, the leader unicast target, and the reconnect cursor. All ride the
-/// load request's `_meta`.
+/// Client-supplied routing an attach's replay must echo: the `x.ai/persist` blob, the leader unicast target, and the reconnect cursor.
+/// All ride the load request's `_meta`.
 struct ReplayRouting<'a> {
     persist_data: Option<&'a serde_json::Value>,
     target_client_id: Option<&'a serde_json::Value>,
@@ -169,8 +186,7 @@ fn log_session_started(
     );
 }
 impl MvpAgent {
-    /// Read this client's capabilities, falling back to the agent's own state
-    /// where the request says nothing.
+    /// Read this client's capabilities, falling back to the agent's own state where the request says nothing.
     fn resolve_client_caps(
         &self,
         meta: Option<&acp::Meta>,
@@ -187,9 +203,8 @@ impl MvpAgent {
             fs_write,
         }
     }
-    /// Resolve the workspace both pipelines run in. Folder trust is recorded
-    /// before the MCP merge so an untrusted workspace's repo-local servers
-    /// are dropped before anything spawns against them.
+    /// Resolve the workspace both pipelines run in.
+    /// Folder trust is recorded before the MCP merge so an untrusted workspace's repo-local servers are dropped before anything spawns against them.
     async fn resolve_workspace(
         &self,
         cwd: &std::path::Path,
@@ -211,8 +226,8 @@ impl MvpAgent {
             mcp_meta_config_map: parse_mcp_meta_config(meta),
         })
     }
-    /// Start the relay mirror for a session and forward its connection state
-    /// to the client. `None` when relay is not configured.
+    /// Start the relay mirror for a session and forward its connection state to the client.
+    /// Returns `None` when relay is not configured.
     fn start_relay_sync(
         &self,
         session_id: &acp::SessionId,
@@ -272,6 +287,8 @@ impl MvpAgent {
             .as_ref()
             .and_then(|m| m.get("sessionId"))
             .and_then(|v| v.as_str());
+        let client_session_kind = parse_client_session_kind(arguments.meta.as_ref())?;
+        let is_headless = client_session_kind.as_deref() == Some("headless");
         let custom_model_id = arguments
             .meta
             .as_ref()
@@ -468,6 +485,7 @@ impl MvpAgent {
                     session_summary_model: summary_model,
                     registry_title_sync,
                     search_index: self.search_index_cell(),
+                    session_kind: client_session_kind,
                 },
             )
             .await
@@ -522,6 +540,7 @@ impl MvpAgent {
                     session_yolo_mode,
                     session_auto_mode: session_auto_mode && !session_yolo_mode,
                     prompt_display_cwd: None,
+                    is_headless,
                     is_chat_kind: false,
                 }
             };
@@ -823,12 +842,13 @@ impl MvpAgent {
                 session_summary_model: summary_model,
                 registry_title_sync,
                 search_index: self.search_index_cell(),
+                session_kind: None,
             },
         )
         .await
         .map_err(|e| crate::session::persistence::io_error_to_acp(&e))?;
         drop(persistence_timer);
-        let crate::session::persistence::PersistedInfoLight {
+        let crate::session::persistence::PersistedInfo {
             summary,
             chat_history,
             plan_state: _,
@@ -962,6 +982,7 @@ impl MvpAgent {
                     session_yolo_mode,
                     session_auto_mode: session_auto_mode && !session_yolo_mode,
                     prompt_display_cwd,
+                    is_headless: summary.is_headless(),
                     is_chat_kind: false,
                 },
             )
@@ -1075,8 +1096,7 @@ impl MvpAgent {
         );
         Ok(response)
     }
-    /// Restore-code phase: check the persisted HEAD out into `cwd`, then
-    /// worktree nor the session's own, so it cannot detach a real checkout.
+    /// Refuses a cwd that is neither a grok worktree nor the session's own, so it cannot detach a real checkout.
     async fn restore_session_code(
         &self,
         session_id: &acp::SessionId,
@@ -1144,8 +1164,7 @@ impl MvpAgent {
         }
         code_restore_info
     }
-    /// Replay-gate phase: replay the transcript (unless `no_replay`), reopen
-    /// the live-output gate, drain deltas so replay precedes the response.
+    /// Replay-gate phase: replay the transcript (unless `no_replay`), reopen the live-output gate, drain deltas so replay precedes the response.
     /// Stale-task reconciliation runs even under `no_replay`: it corrects state.
     async fn replay_transcript_gate(
         &self,
@@ -1221,8 +1240,7 @@ impl MvpAgent {
         }
         Ok((initial_total_tokens, unfinished_subagents))
     }
-    /// Reconnect phase: re-apply per-client capability and permission state
-    /// to the resident handle, which still reflects the client that spawned it.
+    /// Reconnect phase: re-apply per-client capability and permission state to the resident handle, which still reflects the client that spawned it.
     fn refresh_reconnect_session_state(
         &self,
         session_id: &acp::SessionId,
@@ -1258,9 +1276,9 @@ impl MvpAgent {
             }
         });
     }
-    /// Heal crash-orphaned subagents from both sources (replayed spawns with
-    /// no finish, on-disk `running` metas), keyed by id so a double orphan
-    /// heals once. Runs under `noReplay` too, and persists: skipping corrupts disk.
+    /// Heal crash-orphaned subagents from both sources (replayed spawns with no finish, on-disk `running` metas).
+    /// The pass is keyed by id so a double orphan heals once.
+    /// Runs under `noReplay` too, and persists: skipping corrupts disk.
     async fn heal_orphaned_subagents(
         &self,
         session_id: &acp::SessionId,
@@ -1278,7 +1296,7 @@ impl MvpAgent {
             crate::agent::subagent::reconcile_orphaned_subagents_with_backend(
                 unfinished_subagents,
                 &xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::new(
-                    self.subagent_event_tx.clone(),
+                    self.subagent_event_tx.event_sender().0,
                 ),
                 &session_dir,
                 session_id.0.as_ref(),
@@ -1290,8 +1308,7 @@ impl MvpAgent {
             .await;
         }
     }
-    /// Model-restore phase: point the actor at the persisted model without
-    /// writing the global `current_model_id` (shared across leader clients).
+    /// Model-restore phase: point the actor at the persisted model without writing the global `current_model_id` (shared across leader clients).
     /// A vanished model falls back within its family, or blocks prompts.
     pub(super) async fn restore_persisted_model(
         &self,
@@ -1431,8 +1448,7 @@ impl MvpAgent {
             }
         }
     }
-    /// Response phase: assemble the attach `_meta`, including the running
-    /// prompt id a mid-turn loader adopts to pass the `session/update` gate.
+    /// Response phase: assemble the attach `_meta`, including the running prompt id a mid-turn loader adopts to pass the `session/update` gate.
     async fn build_attach_response_meta(
         &self,
         session_id: &acp::SessionId,
@@ -1545,8 +1561,7 @@ impl MvpAgent {
             .config_options(loaded.config_options)
             .meta(loaded.meta))
     }
-    /// Closing an inactive session succeeds: the spec permits either, and
-    /// closes race disconnect-driven eviction routinely.
+    /// Closing an inactive session succeeds: the spec permits either, and closes race disconnect-driven eviction routinely.
     pub(super) async fn close_session_inner(
         &self,
         args: acp::CloseSessionRequest,
@@ -1565,9 +1580,9 @@ impl MvpAgent {
         Ok(acp::CloseSessionResponse::new().meta(meta))
     }
 }
-/// Reshape a resume into the load request that backs it. Policy is not encoded
-/// here: it rides on [`AttachOperation::Resume`], so a client cannot spoof it
-/// and a reader does not have to trace a `_meta` key to find it.
+/// Reshape a resume into the load request that backs it.
+/// Policy is not encoded here: it rides on [`AttachOperation::Resume`].
+/// A client thus cannot spoof it, and a reader does not have to trace a `_meta` key to find it.
 pub(super) fn load_request_for_resume(args: acp::ResumeSessionRequest) -> acp::LoadSessionRequest {
     let acp::ResumeSessionRequest {
         session_id,
@@ -1579,4 +1594,62 @@ pub(super) fn load_request_for_resume(args: acp::ResumeSessionRequest) -> acp::L
     acp::LoadSessionRequest::new(session_id, cwd)
         .mcp_servers(mcp_servers)
         .meta(meta.unwrap_or_default())
+}
+#[cfg(test)]
+mod session_kind_claim_tests {
+    use super::parse_client_session_kind;
+    use agent_client_protocol as acp;
+    fn meta(kind: serde_json::Value) -> acp::Meta {
+        let mut m = acp::Meta::new();
+        m.insert("sessionKind".into(), kind);
+        m
+    }
+    #[test]
+    fn absent_or_untyped_kind_is_none() {
+        assert_eq!(parse_client_session_kind(None).unwrap(), None);
+        assert_eq!(
+            parse_client_session_kind(Some(&acp::Meta::new())).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_client_session_kind(Some(&meta(serde_json::json!(7)))).unwrap(),
+            None
+        );
+    }
+    #[test]
+    fn headless_is_the_only_accepted_claim() {
+        assert_eq!(
+            parse_client_session_kind(Some(&meta(serde_json::json!("headless")))).unwrap(),
+            Some("headless".to_owned())
+        );
+        let mut snake = acp::Meta::new();
+        snake.insert("session_kind".into(), serde_json::json!("headless"));
+        assert_eq!(
+            parse_client_session_kind(Some(&snake)).unwrap(),
+            Some("headless".to_owned())
+        );
+    }
+    #[test]
+    fn reserved_subagent_claims_are_invalid_params() {
+        for kind in [
+            "subagent",
+            "subagent_fork",
+            "subagent_resume",
+            "subagent_future",
+        ] {
+            let error = parse_client_session_kind(Some(&meta(serde_json::json!(kind))))
+                .expect_err("reserved claims must be rejected");
+            assert_eq!(error.code, acp::ErrorCode::InvalidParams, "{kind}");
+        }
+    }
+    #[test]
+    fn unknown_non_reserved_claims_are_ignored() {
+        for kind in ["fork", "worktree", "future"] {
+            assert_eq!(
+                parse_client_session_kind(Some(&meta(serde_json::json!(kind)))).unwrap(),
+                None,
+                "{kind} must not be stamped"
+            );
+        }
+    }
 }
