@@ -8,8 +8,12 @@ use xai_grok_tools::implementations::grok_build::task::types::{
     SubagentEvent, SubagentMarkUsageNotAppliedRequest, SubagentWaitPromptDrainedRequest,
 };
 use xai_grok_tools::types::tool::ToolKind;
-/// Synthetic tool the model calls to return its schema-constrained final answer on backends that can't constrain output natively (Messages API).
-/// The loop intercepts it; it never executes as a real tool.
+static TURNS_ACTIVE: xai_grok_telemetry::activity::ActivityGauge =
+    xai_grok_telemetry::activity::ActivityGauge::work(
+        xai_grok_telemetry::activity::TURNS_ACTIVE_KEY,
+    );
+/// Synthetic tool for schema-constrained final answers on backends without native
+/// output constraints (Messages API); intercepted in the loop, never really executed.
 const STRUCTURED_OUTPUT_TOOL: &str = "StructuredOutput";
 /// Max times the model may re-call `StructuredOutput` with non-conforming args before the turn ends with the last validation error.
 const STRUCTURED_OUTPUT_MAX_RETRIES: u32 = 3;
@@ -342,7 +346,8 @@ impl SessionActor {
         self: &Arc<Self>,
         request: TurnInputRequest,
     ) -> PromptTurnResult {
-        let _active = xai_grok_telemetry::activity::TURNS_ACTIVE.enter();
+        let _active = TURNS_ACTIVE.enter();
+        let _work = crate::session::handle::WorkGuard::new(self.active_work.clone());
         let TurnInputRequest {
             prompt_id,
             input_origin,
@@ -438,6 +443,7 @@ impl SessionActor {
         } else {
             LoopFireMode::InSession
         };
+        let mut otel_command_name: Option<String> = None;
         let (resolved, slash_skills, workflow_registry) = match policy.authority {
             InputAuthority::HumanIntent => {
                 let slash_skills = self.slash_skills_for_resolve().await;
@@ -530,6 +536,7 @@ impl SessionActor {
                     span.record("command_name", action.command_name());
                     span.record("command_source", "builtin");
                 }
+                otel_command_name = Some(action.command_name().to_string());
                 match action {
                     BuiltinAction::GoalSet {
                         objective,
@@ -580,6 +587,7 @@ impl SessionActor {
             }) => {
                 if let Some(first) = parsed_skills.first() {
                     *self.active_skill.lock() = Some(first.name.clone());
+                    otel_command_name = Some(first.name.clone());
                     let span = tracing::Span::current();
                     span.record("command_name", first.name.as_str());
                     span.record(
@@ -926,7 +934,9 @@ impl SessionActor {
                     model_id,
                     client_identifier: effective_client_identifier,
                     screen_mode: prompt_screen_mode,
-                    prompt_text: None,
+                    prompt_text: xai_grok_telemetry::external::is_active()
+                        .then(|| user_message.to_owned()),
+                    command_name: otel_command_name,
                 };
                 xai_grok_telemetry::session_ctx::log_event_dual(self.telemetry_enabled, ev);
             }
@@ -1244,6 +1254,27 @@ impl SessionActor {
                 model_id: turn_model_id.clone(),
             })
             .await;
+        if xai_grok_telemetry::external::is_active() {
+            let committed = self
+                .chat_state_handle
+                .get_assistant_text_in_turn()
+                .await
+                .unwrap_or_default();
+            let captured = self.streaming_turn_capture.lock().assembled_response_text();
+            let trust_committed = matches!(
+                &result,
+                Ok(TurnOutcome::Completed { .. }) | Ok(TurnOutcome::StationarityEnded { .. })
+            );
+            let response_text = crate::session::streaming_capture::StreamingTurnCapture::merge_assistant_response_for_otel(
+                committed,
+                &captured,
+                trust_committed,
+            );
+            xai_grok_telemetry::external::emit(&xai_grok_telemetry::events::AssistantResponse {
+                response_length: response_text.len(),
+                response_text: (!response_text.is_empty()).then_some(response_text),
+            });
+        }
         match &result {
             Ok(TurnOutcome::Completed { stop, .. }) => {
                 self.emit_turn_ended(
@@ -3244,10 +3275,10 @@ impl SessionActor {
                         model_fingerprint.clone(),
                     )
                     .await;
-                if self.drain_pending_interjections().await {
+                if self.drain_admitted_messages_at_safe_point().await {
                     salvage.round_boundary();
                     tracing::info!(
-                        "Drained late interjection(s) during turn-end bookkeeping; continuing"
+                        "Drained late interjection(s) or parent Steer(s) during turn-end bookkeeping; continuing"
                     );
                     continue;
                 }

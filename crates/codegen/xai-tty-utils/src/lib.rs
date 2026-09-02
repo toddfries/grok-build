@@ -55,6 +55,9 @@ use std::io;
 mod child_wait;
 pub use child_wait::{is_child_wait_identity_uncertain, spawn_child_reaper, wait_child_bounded};
 
+mod kill_on_drop;
+pub use kill_on_drop::KillOnDrop;
+
 mod process_resources;
 pub use process_resources::{
     ProcessCpu, ProcessResources, process_memory_limit, process_start_time, sample_process_cpu,
@@ -400,7 +403,11 @@ pub fn detach_std_command(cmd: &mut std::process::Command) {
 /// so in the (rare) case the spawning thread never materialized it this
 /// can allocate — accepted for a debug-only misuse guard.
 #[cfg(target_os = "linux")]
-fn bind_to_parent_death(parent_pid: u32, armed_thread: std::thread::ThreadId) -> io::Result<()> {
+fn bind_to_parent_death(
+    parent_pid: u32,
+    armed_thread: std::thread::ThreadId,
+    signal: libc::c_int,
+) -> io::Result<()> {
     // Post-fork, TLS is a copy of the SPAWNING thread's, so this observes
     // which thread called `spawn()`.
     if cfg!(debug_assertions) && std::thread::current().id() != armed_thread {
@@ -408,7 +415,7 @@ fn bind_to_parent_death(parent_pid: u32, armed_thread: std::thread::ThreadId) ->
     }
     // SAFETY: prctl(PR_SET_PDEATHSIG, …) only sets the calling process's
     // parent-death signal; it reads/writes no caller memory.
-    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong) } == -1 {
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, signal as libc::c_ulong) } == -1 {
         return Err(io::Error::last_os_error());
     }
     // Parent already gone (pdeathsig can no longer fire): exit instead of
@@ -445,20 +452,30 @@ fn bind_to_parent_death(parent_pid: u32, armed_thread: std::thread::ThreadId) ->
 /// setuid/setcap `execve`.
 pub fn kill_on_parent_death_std(cmd: &mut std::process::Command) {
     #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::process::CommandExt;
-        let parent_pid = std::process::id();
-        let armed_thread = std::thread::current().id();
-        // SAFETY: bind_to_parent_death calls only async-signal-safe libc
-        // functions and builds errors without allocating (see its docs for
-        // the debug-only TLS read). Satisfies the pre_exec contract.
-        unsafe {
-            cmd.pre_exec(move || bind_to_parent_death(parent_pid, armed_thread));
-        }
-    }
+    kill_on_parent_death_std_with(cmd, libc::SIGTERM);
     #[cfg(not(target_os = "linux"))]
     {
         let _ = cmd;
+    }
+}
+
+/// [`kill_on_parent_death_std`] with an explicit parent-death signal.
+///
+/// SIGTERM (the default) lets the child run its graceful shutdown; pass
+/// `libc::SIGKILL` when the child must die even if it is wedged and cannot
+/// service a catchable signal — e.g. the PTY e2e pager children that leaked
+/// on CI precisely because they were unresponsive to the master-close SIGHUP.
+/// All caveats of [`kill_on_parent_death_std`] apply.
+#[cfg(target_os = "linux")]
+pub fn kill_on_parent_death_std_with(cmd: &mut std::process::Command, signal: libc::c_int) {
+    use std::os::unix::process::CommandExt;
+    let parent_pid = std::process::id();
+    let armed_thread = std::thread::current().id();
+    // SAFETY: bind_to_parent_death calls only async-signal-safe libc
+    // functions and builds errors without allocating (see its docs for
+    // the debug-only TLS read). Satisfies the pre_exec contract.
+    unsafe {
+        cmd.pre_exec(move || bind_to_parent_death(parent_pid, armed_thread, signal));
     }
 }
 

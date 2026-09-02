@@ -2047,7 +2047,8 @@ extra_rule_dirs = ["/c/rules"]
                 dir.path(),
                 true,
             )
-            .await;
+            .await
+            .resolved;
         if let Some(r) = resolved {
             let tempdir_claude = claude_dir.join("settings.json");
             use xai_grok_workspace::permission::types::RequirementSource;

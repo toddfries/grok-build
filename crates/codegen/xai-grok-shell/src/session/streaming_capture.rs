@@ -329,6 +329,41 @@ impl StreamingTurnCapture {
         }
     }
 
+    /// In-progress assistant **text** only (reasoning excluded). Retained
+    /// `segments` are discarded same-turn attempts (doomloop resample /
+    /// restart) and must not enter the customer OTEL `assistant_response`.
+    /// Empty after `clear_current_segment`; production emit then uses
+    /// committed chat-state text for finished bubbles, plus this slot for
+    /// uncommitted mid-stream text.
+    pub(crate) fn assembled_response_text(&self) -> String {
+        self.response_text.clone()
+    }
+
+    /// Join committed chat-state assistant text with the live capture slot.
+    ///
+    /// Completed turns trust chat-state: the slot can still hold the last
+    /// bubble after a stream-drain timeout (`clear_request_segment` runs on
+    /// the sampling-event rail and is skipped when the 5s barrier fails
+    /// open). Interrupt / error paths keep the slot so a cancel after a
+    /// prior tool round still exports the in-progress bubble. When both
+    /// sides are non-empty, skip the join if `committed` already ends with
+    /// `captured` so a stale slot cannot duplicate the last bubble.
+    pub(crate) fn merge_assistant_response_for_otel(
+        committed: String,
+        captured: &str,
+        trust_committed: bool,
+    ) -> String {
+        if trust_committed || captured.is_empty() {
+            committed
+        } else if committed.is_empty() {
+            captured.to_owned()
+        } else if committed.ends_with(captured) {
+            committed
+        } else {
+            format!("{committed}\n{captured}")
+        }
+    }
+
     /// Consolidate the turn for upload by folding the in-progress slot into `segments`.
     /// `segments` only ever holds uncommitted generations (a committed one is discarded on `Completed`).
     /// Every retained generation (a doomloop retry, a cancel or error mid-stream) is therefore uploaded.
@@ -628,5 +663,86 @@ mod streaming_turn_capture_tests {
         assert_eq!(cap.completion_tokens, Some(12));
         assert_eq!(cap.finish_reason.as_deref(), Some("stop"));
         assert_eq!(cap.empty_reason.as_deref(), Some("reasoning_only"));
+    }
+
+    #[test]
+    fn assembled_response_text_current_slot_only_excludes_reasoning_and_segments() {
+        let mut cap = StreamingTurnCapture::default();
+        cap.begin_turn(Some("p1".to_owned()), 1);
+        cap.start_stream(1);
+        cap.append(true, "thinking first");
+        cap.append(false, "discarded text");
+        cap.start_stream(2);
+        cap.append(true, "thinking second");
+        cap.append(false, "current text");
+        assert_eq!(cap.assembled_response_text(), "current text");
+    }
+
+    #[test]
+    fn assembled_response_text_empty_after_commit() {
+        let mut cap = StreamingTurnCapture::default();
+        cap.begin_turn(Some("p1".to_owned()), 1);
+        cap.start_stream(1);
+        cap.append(false, "the answer");
+        cap.clear_current_segment();
+        assert!(cap.assembled_response_text().is_empty());
+    }
+
+    #[test]
+    fn assembled_response_text_empty_after_commit_even_with_discarded_segments() {
+        let mut cap = StreamingTurnCapture::default();
+        cap.begin_turn(Some("p1".to_owned()), 1);
+        cap.start_stream(1);
+        cap.append(false, "discarded attempt");
+        cap.start_stream(2);
+        cap.append(false, "accepted answer");
+        cap.clear_current_segment();
+        assert!(cap.assembled_response_text().is_empty());
+        assert_eq!(cap.segments[0].response_text, "discarded attempt");
+    }
+
+    #[test]
+    fn merge_otel_drain_timeout_does_not_duplicate_committed_bubble() {
+        // Slot still populated, chat-state already has the same bubble.
+        assert_eq!(
+            StreamingTurnCapture::merge_assistant_response_for_otel(
+                "blocks".into(),
+                "blocks",
+                true,
+            ),
+            "blocks"
+        );
+        assert_eq!(
+            StreamingTurnCapture::merge_assistant_response_for_otel(
+                "blocks".into(),
+                "blocks",
+                false,
+            ),
+            "blocks"
+        );
+    }
+
+    #[test]
+    fn merge_otel_cancel_after_tool_round_joins_uncommitted_slot() {
+        assert_eq!(
+            StreamingTurnCapture::merge_assistant_response_for_otel(
+                "first bubble".into(),
+                "partial second",
+                false,
+            ),
+            "first bubble\npartial second"
+        );
+    }
+
+    #[test]
+    fn merge_otel_completed_multi_round_trusts_chat_state() {
+        assert_eq!(
+            StreamingTurnCapture::merge_assistant_response_for_otel(
+                "first bubble\nlast bubble".into(),
+                "",
+                true,
+            ),
+            "first bubble\nlast bubble"
+        );
     }
 }

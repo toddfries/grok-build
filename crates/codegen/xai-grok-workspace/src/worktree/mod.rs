@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as TokioMutex;
 use tokio_util::sync::CancellationToken;
 use xai_fast_worktree::{BtrfsDelegate, IgnoredFilesMode, WorkingTreeMode, WorktreeBuilder};
+use xai_grok_telemetry::region;
+use xai_grok_telemetry::region::Parent;
 
 use crate::session::git::{
     GitFileChange, change_type_from_git2_delta, find_git_root_from_path,
@@ -33,6 +35,15 @@ pub use xai_grok_workspace_types::rpc::worktree::{
 };
 
 const WORKTREE_LOG: &str = "xai_worktree";
+
+async fn blocking_copy_on_write<F, T>(work: F) -> std::result::Result<T, tokio::task::JoinError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let _span = region!("worktree.copy_on_write", Parent::Inherit);
+    tokio::task::spawn_blocking(work).await
+}
 
 /// True when `path` is on a grove FUSE mount.
 /// Fast btrfs CoW cannot snapshot FUSE; callers must fall back to a plain git checkout ([`WorktreeType::Git`]).
@@ -1146,7 +1157,7 @@ pub async fn create_worktree_streaming<N: WorktreeNotificationSender>(
             .is_some_and(|n| !n.trim().is_empty() && !sanitize_label(n).is_empty());
     let label_for_meta = label_from_path(&worktree_path_str);
     let label_metadata = build_label_metadata(&label_for_meta, user_provided_label);
-    let report = match tokio::task::spawn_blocking(move || {
+    let report = match blocking_copy_on_write(move || {
         let mut builder = WorktreeBuilder::new(&source_path, &dest_path)
             .working_tree_mode(working_tree_mode)
             .ignored_files_mode(IgnoredFilesMode::Skip)
@@ -1432,6 +1443,7 @@ pub async fn rehydrate_subagent_worktree(
     let source_repo = source_repo.to_path_buf();
     let snapshot_ref = snapshot_ref.to_string();
     let session_id = session_id.map(str::to_owned);
+    let _recreate = region!("worktree.cwd_recreate", Parent::Inherit);
     let report = tokio::task::spawn_blocking(move || {
         xai_fast_worktree::rehydrate_worktree_from_ref(
             &dest,
@@ -1810,7 +1822,7 @@ pub async fn create_worktree_from_worktree_streaming<N: WorktreeNotificationSend
         let grove_enabled = req.grove_worktree.unwrap_or(false);
         let label_for_meta = label_from_path(&worktree_path_str);
         let label_metadata = build_label_metadata(&label_for_meta, false);
-        tokio::task::spawn_blocking(move || {
+        blocking_copy_on_write(move || {
             let mut builder = WorktreeBuilder::new(&source_worktree_path, &dest_path)
                 .working_tree_mode(working_tree_mode)
                 .ignored_files_mode(IgnoredFilesMode::Skip)
@@ -2041,7 +2053,7 @@ pub async fn create_worktree_from_worktree_sync(
     let grove_enabled = req.grove_worktree.unwrap_or(false);
     let label_for_meta = label_from_path(&worktree_path_str);
     let label_metadata = build_label_metadata(&label_for_meta, false);
-    let report = tokio::task::spawn_blocking(move || {
+    let report = blocking_copy_on_write(move || {
         let mut builder = WorktreeBuilder::new(&source_worktree_path, &dest_path)
             .working_tree_mode(working_tree_mode)
             .ignored_files_mode(IgnoredFilesMode::Skip)

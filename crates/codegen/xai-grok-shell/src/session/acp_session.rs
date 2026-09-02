@@ -349,6 +349,7 @@ fn backdate_edit_hold(
 pub(crate) struct State {
     pub(crate) running_task: Option<AgentTask>,
     finalization_gate: FinalizationGate,
+    pub(crate) message_delivery: parent_message::MessageDeliveryState,
     pub(crate) pending_inputs: VecDeque<InputItem>,
     pub(crate) pending_notifications: Vec<PendingNotification>,
     /// Prompt ids under composer edit, stamped (and re-stamped) by `hold_edit`.
@@ -450,9 +451,6 @@ pub(crate) fn is_session_idle_for_injection(state: &State) -> bool {
         && !state.notifications_suppressed
         && !state.hook_block_held()
 }
-/// Predicate behind `SessionCommand::IsBusy`: the session has work in flight when a turn is running **or** inputs are queued.
-/// Consulted by the leader's idle-unload decision on client disconnect, and by `emit_session_idle_if_idle`.
-/// Kept as a free function so it can be unit-tested directly against a `State` without spawning a full actor and leader.
 pub(crate) fn state_is_busy(state: &State) -> bool {
     state.running_task.is_some()
         || state.finalization_gate.is_active()
@@ -756,6 +754,7 @@ pub(crate) struct SessionActor {
     pub(crate) chat_state_handle: xai_chat_state::ChatStateHandle,
     /// Current running prompt/turn id, shared with SessionHandle.
     pub(crate) current_prompt_id: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    pub(crate) active_work: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) unattributed_background_usage: std::sync::atomic::AtomicBool,
     /// Open blocking reverse-requests (permission / question / plan-approval), keyed by `tool_call_id`.
     /// Shared with `SessionHandle` so the roster can read it synchronously to report `NeedsInput`.
@@ -767,7 +766,6 @@ pub(crate) struct SessionActor {
     pub(crate) supports_backend_search: std::cell::Cell<bool>,
     /// Per-turn override, set at promotion. Not persisted; a reload reverts to the definition seed.
     pub(crate) tool_overrides: std::cell::RefCell<Option<xai_grok_sampling_types::ToolOverrides>>,
-    /// Configured cutoff a subagent inherits, read off the `SessionHandle` without an actor round-trip.
     pub(crate) resolved_tool_overrides:
         std::sync::Arc<arc_swap::ArcSwapOption<xai_grok_sampling_types::ToolOverrides>>,
     pub(crate) compactions_remaining:
@@ -941,6 +939,9 @@ pub(crate) struct SessionActor {
     /// Master switch for the one-shot goal summarizer (the closing "what was accomplished" summary on a verified achievement).
     /// Cached at actor construction (mirrors `goal_classifier_enabled`); absent remote setting tracks goal mode, `Some(false)` is a kill-switch.
     pub(crate) goal_summary_enabled: bool,
+    /// Remote tier of the Length-salvage budget resolver, snapshot from
+    /// `RemoteSettings` at actor construction. `Some(0)` is explicit off.
+    pub(crate) length_salvage_remote_budget: Option<u32>,
     /// Resolved skeptic count for the verification stage.
     /// Cached at actor construction (mirrors `goal_classifier_enabled`) and threaded into [`Self::run_verification_stage_for_drain`].
     /// Default `GOAL_VERIFIER_SKEPTIC_COUNT`; clamped to `[GOAL_VERIFIER_SKEPTIC_MIN, GOAL_VERIFIER_SKEPTIC_MAX]` by the resolver.
@@ -1345,6 +1346,18 @@ impl SessionActor {
         &self,
     ) -> Arc<parking_lot::Mutex<crate::session::workflow::tracker::WorkflowTracker>> {
         self.workflow_manager.lock().await.tracker()
+    }
+    pub(crate) async fn is_busy(&self) -> bool {
+        if self.active_work.load(std::sync::atomic::Ordering::Acquire) > 0 {
+            return true;
+        }
+        {
+            let state = self.state.lock().await;
+            if state_is_busy(&state) {
+                return true;
+            }
+        }
+        crate::session::pending_interaction::has_parked_plan_approval(&self.pending_interactions)
     }
     pub(crate) fn goal_runs_on_workflow_engine(&self) -> bool {
         self.background_workflows_enabled

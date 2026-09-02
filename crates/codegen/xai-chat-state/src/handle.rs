@@ -63,6 +63,17 @@ impl ChatStateHandle {
             .map_err(|_| ChatStateMailboxClosed)
     }
 
+    /// Enqueue an ordered batch and await acknowledgement after every item is processed.
+    pub async fn push_user_messages_batch_and_ack(
+        &self,
+        items: Vec<ConversationItem>,
+    ) -> Option<()> {
+        self.query("PushUserMessagesBatchAndAck", |reply| {
+            ChatStateCommand::PushUserMessagesBatchAndAck { items, reply }
+        })
+        .await
+    }
+
     /// Push a user message and await acknowledgement that the chat-state actor
     /// has accepted and processed it.
     pub async fn push_user_message_and_ack(&self, item: ConversationItem) -> Option<()> {
@@ -683,6 +694,19 @@ impl ChatStateHandle {
     pub async fn get_last_assistant_text_in_turn(&self) -> Option<String> {
         self.query("GetLastAssistantTextInTurn", |reply| {
             ChatStateCommand::GetLastAssistantTextInTurn { reply }
+        })
+        .await
+        .flatten()
+    }
+
+    /// Concatenate every non-empty assistant message in the current turn
+    /// (`"\n"`-joined), or `None` when the turn produced none (or the actor is
+    /// dead). Same turn boundary as [`get_last_assistant_text_in_turn`].
+    ///
+    /// [`get_last_assistant_text_in_turn`]: Self::get_last_assistant_text_in_turn
+    pub async fn get_assistant_text_in_turn(&self) -> Option<String> {
+        self.query("GetAssistantTextInTurn", |reply| {
+            ChatStateCommand::GetAssistantTextInTurn { reply }
         })
         .await
         .flatten()

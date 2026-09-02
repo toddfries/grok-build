@@ -15,6 +15,10 @@ use xai_grok_telemetry::region::Parent;
 use xai_grok_telemetry::subagent_spawn::{SubagentSpawnPhase, phase_region};
 use xai_grok_telemetry::{instrument_task, region};
 use xai_grok_tools::implementations::{grok_build, opencode};
+static SUBAGENTS_ACTIVE: xai_grok_telemetry::activity::ActivityGauge =
+    xai_grok_telemetry::activity::ActivityGauge::work(
+        xai_grok_telemetry::activity::SUBAGENTS_ACTIVE_KEY,
+    );
 /// Bounds each parent-side await in the child completion path. The parent's
 /// biased select polls its event channels ahead of `cmd_rx`, so a busy turn
 /// can starve `cmd_rx` and park a completed child (leaking its session
@@ -1205,9 +1209,9 @@ pub(crate) async fn run_shell_child(
         );
     }
     let mcp_owned_count = agent_mcp_servers.len() as u32;
-    let _active = xai_grok_telemetry::activity::SUBAGENTS_ACTIVE.enter();
+    let _active = SUBAGENTS_ACTIVE.enter();
     debug_assert!(
-        xai_grok_telemetry::activity::SUBAGENTS_ACTIVE.get() >= 1,
+        SUBAGENTS_ACTIVE.get() >= 1,
         "SubagentLaunched must stamp a self-inclusive count"
     );
     xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::SubagentLaunched {

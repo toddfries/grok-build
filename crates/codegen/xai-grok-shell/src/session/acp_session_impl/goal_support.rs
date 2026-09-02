@@ -241,6 +241,22 @@ pub(super) const GOAL_CONTINUATION_BAIL_PREFACE: &str = "You appear to be stoppi
 ///
 /// Legacy artifacts stay absent: the deleted COMPLETION AUDIT block, the canonical verifier blocks, and the `{VERIFIER_ID}` placeholder.
 /// `goal_rules_template_drops_all_legacy_verifier_artifacts` pins that.
+/// Keep the ## Active Goal heading. Body is the normal create/resume rules.
+pub(crate) fn format_compaction_goal_section(rules_body: &str) -> String {
+    format!("## Active Goal\n{rules_body}")
+}
+
+/// Append the goal section as a sibling of the other reminder headings.
+pub(crate) fn splice_goal_section(existing: &str, goal_block: &str) -> String {
+    if let Some(pos) = existing.rfind("</system-reminder>") {
+        let mut out = existing.to_string();
+        out.insert_str(pos, &format!("\n\n{goal_block}\n"));
+        out
+    } else {
+        format!("{existing}\n\n{goal_block}")
+    }
+}
+
 pub(super) fn render_goal_rules(
     objective: &str,
     names: &GoalToolNames,
@@ -1665,5 +1681,28 @@ impl SessionActor {
                 xai_grok_tools::implementations::grok_build::task::types::GoalLoopActive(active),
             )
             .await;
+    }
+}
+
+#[cfg(test)]
+mod compaction_goal_section_tests {
+    use super::format_compaction_goal_section;
+
+    #[test]
+    fn keeps_heading_and_normal_goal_rules() {
+        let out = format_compaction_goal_section("A goal has been set: ship it");
+        assert_eq!(out, "## Active Goal\nA goal has been set: ship it");
+        assert!(!out.contains("GoalTracker was not reset"));
+    }
+
+    #[test]
+    fn splices_goal_as_its_own_section() {
+        let existing = "<system-reminder>\n## Running Background Tasks\nThese tasks are still running:\n- \"t1\": `sleep 1` (running)\n</system-reminder>";
+        let out = super::splice_goal_section(existing, "A goal has been set: ship it");
+        let bg = out.find("## Running Background Tasks").unwrap();
+        let task = out.find("- \"t1\"").unwrap();
+        let goal = out.find("A goal has been set: ship it").unwrap();
+        assert!(bg < task && task < goal, "{out}");
+        assert!(out.contains("</system-reminder>"));
     }
 }

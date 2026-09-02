@@ -182,6 +182,32 @@ pub(crate) fn mouse_reporting_toggle_enabled() -> bool {
 /// Process-global voice gate for view code without an `AppView`.
 /// Written only by [`crate::app::app_view::AppView::apply_voice_mode_enabled`].
 pub(crate) static VOICE_MODE_ENABLED: AtomicBool = AtomicBool::new(false);
+fn dock_flag_in(layer: &toml::Value) -> Option<bool> {
+    layer
+        .get("features")?
+        .get(xai_grok_shell::agent::config::Feature::Dock.key())?
+        .as_bool()
+}
+/// `[features] dock` from merged `requirements.toml`.
+pub(crate) fn dock_requirement_pin() -> Option<bool> {
+    dock_flag_in(&xai_grok_config::load_merged_requirements()?)
+}
+/// `[features] dock` from effective config (user + managed).
+pub(crate) fn dock_config_value() -> Option<bool> {
+    dock_flag_in(&xai_grok_shell::config::load_effective_config().ok()?)
+}
+/// Registry precedence: pin, `GROK_DOCK` / `GROK_DOCK_V2`, config, remote `dock_enabled`, default off.
+pub(crate) fn resolve_dock_enabled(remote: Option<bool>) -> bool {
+    use xai_grok_shell::agent::config::{Feature, FeatureSources};
+    let mut sources = FeatureSources::from_process_env(Feature::Dock);
+    if sources.env.is_none() {
+        sources.env = xai_grok_config::env_bool("GROK_DOCK_V2");
+    }
+    sources.pin = dock_requirement_pin();
+    sources.config = dock_config_value();
+    sources.remote = remote;
+    Feature::Dock.resolve(sources).value
+}
 pub(crate) fn voice_mode_enabled() -> bool {
     VOICE_MODE_ENABLED.load(Ordering::Acquire)
 }
@@ -1444,11 +1470,11 @@ fn init_terminal(
                     Ok(true) => None,
                     _ => Some("unsupported"),
                 });
-        crate::terminal::da2::probe_at_startup();
-        let flags = crate::terminal::negotiated_kitty_flags(
-            skip_reason,
-            crate::terminal::da2::detected_packed(),
-        );
+        let alacritty_conservative_version = (ctx.brand
+            == crate::terminal::TerminalName::Alacritty)
+            .then_some(crate::terminal::kitty_keyboard::ALACRITTY_BROKEN_EVENT_TYPES_MAX_PACKED);
+        let flags =
+            crate::terminal::negotiated_kitty_flags(skip_reason, alacritty_conservative_version);
         if flags.is_empty() {
             tracing::info!(
                 kitty.flags = "none",
@@ -1469,6 +1495,10 @@ fn init_terminal(
             );
         }
         crate::terminal::set_pushed_kitty_flags(flags);
+        startup_typeahead.extend(event_loop::capture_startup_typeahead(
+            std::time::Duration::from_millis(20),
+        ));
+        event_loop::normalize_startup_submissions(&mut startup_typeahead);
         if mode.is_fullscreen() {
             let backend = CrosstermBackend::new(
                 crate::render::draw::TermWriter::new(frame_tx, writer_sync)

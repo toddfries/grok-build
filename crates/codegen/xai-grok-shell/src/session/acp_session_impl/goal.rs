@@ -1038,6 +1038,69 @@ impl SessionActor {
         }
     }
 
+    /// Live GoalTracker snapshot for the post-compaction reminder.
+    /// `None` when no goal exists or it already completed.
+    pub(crate) async fn compaction_goal_section(&self) -> Option<String> {
+        use crate::session::goal_tracker::GoalStatus;
+
+        let names = self.resolve_goal_tool_names().await;
+        let current_tokens = self.chat_state_handle.get_total_tokens().await as i64;
+        let (tokens_used, _) = self.goal_tokens(current_tokens);
+        let planner_enabled = self.goal_planner_enabled;
+        let on_workflow = self.goal_runs_on_workflow_engine();
+        let mut tracker = self.goal_tracker.lock();
+        tracker.account_elapsed();
+        let o = tracker.snapshot()?;
+        if o.status == GoalStatus::Complete {
+            return None;
+        }
+        let elapsed = crate::session::goal_orchestrator::format_elapsed(o.elapsed_ms);
+        let status = match o.status {
+            GoalStatus::Active => "Active",
+            GoalStatus::UserPaused => "Paused",
+            GoalStatus::BackOffPaused => "Paused (back off)",
+            GoalStatus::NoProgressPaused => "Paused (no progress)",
+            GoalStatus::InfraPaused => "Paused (infrastructure error)",
+            GoalStatus::Blocked => "Blocked",
+            GoalStatus::BudgetLimited => "Budget limited",
+            GoalStatus::Complete => unreachable!("complete goals are omitted above"),
+        };
+        let mut goal_state =
+            format!("<goal-state>\nStatus: {status}\nTokens: {tokens_used} | Elapsed: {elapsed}\n");
+        if let Some(budget) = o.token_budget {
+            goal_state.push_str(&format!("Token budget: {budget}\n"));
+        }
+        if let Some(sub) = o.current_subagent_id.as_deref() {
+            goal_state.push_str(&format!("Current subagent: {sub}\n"));
+        }
+        goal_state.push_str("</goal-state>\n\n");
+        let plan_path = goal_reminder_plan_path(planner_enabled, o);
+        let scratch_dir = crate::session::goal_tracker::implementer_scratch_dir(&o.verifier_id);
+        let scratch = scratch_dir.to_string_lossy();
+        let body = if on_workflow {
+            render_goal_rules(
+                &o.objective,
+                &names,
+                "",
+                &goal_state,
+                plan_path,
+                &scratch,
+                o.scratch_dir_ready,
+            )
+        } else {
+            render_goal_rules_legacy(
+                &o.objective,
+                &names,
+                "",
+                &goal_state,
+                plan_path,
+                &scratch,
+                o.scratch_dir_ready,
+            )
+        };
+        Some(format_compaction_goal_section(&body))
+    }
+
     pub(super) async fn prune_prior_goal_continuation_directives(&self) {
         use xai_grok_sampling_types::conversation::SyntheticReason;
 

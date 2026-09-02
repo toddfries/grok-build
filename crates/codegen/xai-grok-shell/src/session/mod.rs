@@ -195,6 +195,18 @@ impl PromptOrigin {
     pub fn is_synthetic(&self) -> bool {
         !matches!(self, Self::User)
     }
+    /// A queued user follow-up must wait for these to finish; Steer must not
+    /// promote into them.
+    pub fn is_auto_wake(&self) -> bool {
+        matches!(
+            self,
+            Self::TaskCompleted { .. }
+                | Self::SubagentCompleted { .. }
+                | Self::WorkflowCompleted { .. }
+                | Self::ParentAgentMessage { .. }
+                | Self::NotificationDrain
+        )
+    }
     /// Whether a `UserMessageChunk` echo for this origin must stay out of client scrollback (live and on resume).
     /// The hidden origins carry model-only, side-channel content the UI already shows elsewhere (task pane, monitor gutter, etc.).
     pub fn hide_user_echo_from_scrollback(&self) -> bool {
@@ -247,7 +259,9 @@ mod tests {
             }
         );
         assert!(origin.is_synthetic());
+        assert!(origin.is_auto_wake());
         assert_eq!(origin.completion_id(), Some("abc-123"));
+        assert!(!PromptOrigin::from_prompt_id("my-prompt").is_auto_wake());
     }
     #[test]
     fn from_prompt_id_parent_message() {

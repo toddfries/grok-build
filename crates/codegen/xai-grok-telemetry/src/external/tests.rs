@@ -16,6 +16,8 @@ fn gates_all_on() -> ContentGates {
     ContentGates {
         log_user_prompts: true,
         log_tool_details: true,
+        log_assistant_responses: true,
+        log_tool_content: true,
     }
 }
 
@@ -88,6 +90,7 @@ fn external_allowed_keys_are_pinned() {
         "prompt.id",
         "event.sequence",
         "user.id",
+        "user.email",
         "organization.id",
         "team.id",
         "deployment.id",
@@ -106,7 +109,10 @@ fn external_allowed_keys_are_pinned() {
         "compaction_count",
         "prompt_length",
         "prompt",
+        "response_length",
+        "response",
         "screen_mode",
+        "command_name",
         "outcome",
         "duration_ms",
         "error_category",
@@ -124,6 +130,10 @@ fn external_allowed_keys_are_pinned() {
         "hook_rewrote",
         "file_extension",
         "tool_parameters",
+        "tool_input",
+        "tool_output",
+        "full_command",
+        "tool_use_id",
         "file_path",
         "decision",
         "access_kind",
@@ -132,7 +142,10 @@ fn external_allowed_keys_are_pinned() {
         "transport_type",
         "tool_count",
         "error_type",
+        "error_message",
         "mcp_server.name",
+        "mcp_tool.name",
+        "from_mode",
         "to_mode",
         "trigger",
         "skill_source",
@@ -186,6 +199,7 @@ fn metric_attr_keys_are_pinned() {
         "session.id",
         "app.version",
         "user.id",
+        "user.email",
         "organization.id",
         "team.id",
         "deployment.id",
@@ -226,6 +240,7 @@ fn event_names_are_pinned() {
         (E::InternalError, "grok_code.internal_error"),
         (E::ModelSwitched, "grok_code.model_switched"),
         (E::ContextualTip, "grok_code.contextual_tip"),
+        (E::AssistantResponse, "grok_code.assistant_response"),
     ];
     assert_eq!(expected.len(), <E as strum::EnumCount>::COUNT);
     for (variant, name) in expected {
@@ -279,10 +294,7 @@ fn tool_name_sanitization() {
         schema::sanitize_tool_name("send_subagent_message"),
         "send_subagent_message"
     );
-    assert_eq!(
-        schema::sanitize_tool_name("nebula__post_message"),
-        "mcp_tool"
-    );
+    assert_eq!(schema::sanitize_tool_name("docs__post_message"), "mcp_tool");
     assert_eq!(
         schema::sanitize_tool_name("SuperSecretProjectTool"),
         "custom_tool",
@@ -596,6 +608,9 @@ fn tool_result_hook_rewrote_is_content_free() {
                 tool_result_size_bytes: None,
                 file_path: None,
                 parameters: None,
+                tool_use_id: None,
+                tool_output: None,
+                error_message: None,
             },
         );
         let events = exported_events(&stream);
@@ -609,19 +624,24 @@ fn tool_result_gates_off_collapses_and_reduces() {
     emit_event_into(
         &stream,
         &events::ToolCallCompleted {
-            tool_name: "nebula__post_message".into(),
+            tool_name: "docs__post_message".into(),
             outcome: xai_grok_session_events::types::ToolOutcome::Success,
             hook_rewrote: false,
             duration_ms: 42,
             tool_result_size_bytes: None,
             file_path: Some("/Users/alice/secret-project/main.rs".into()),
             parameters: Some(serde_json::json!({"text": "CANARY_TOOL_ARGS"})),
+            tool_use_id: None,
+            tool_output: None,
+            error_message: None,
         },
     );
     let events = exported_events(&stream);
     let ev = &events[0];
     assert_eq!(ev.0, "grok_code.tool_result");
     assert_eq!(attr(ev, "tool_name").as_deref(), Some("mcp_tool"));
+    assert_eq!(attr(ev, "mcp_tool.name").as_deref(), Some("mcp_tool"));
+    assert_eq!(attr(ev, "mcp_server.name").as_deref(), Some("mcp_server"));
     assert_eq!(attr(ev, "file_extension").as_deref(), Some("rs"));
     assert_eq!(attr(ev, "file_path"), None, "full path is details-gated");
     assert_eq!(
@@ -629,6 +649,9 @@ fn tool_result_gates_off_collapses_and_reduces() {
         None,
         "params are details-gated"
     );
+    assert_eq!(attr(ev, "tool_input"), None, "full input is content-gated");
+    assert_eq!(attr(ev, "tool_output"), None);
+    assert_eq!(attr(ev, "full_command"), None);
     let blob = format!("{events:?}");
     assert!(
         !blob.contains("CANARY_TOOL_ARGS"),
@@ -648,20 +671,23 @@ fn tool_result_details_gate_exposes_verbatim_scrubbed() {
     emit_event_into(
         &stream,
         &events::ToolCallCompleted {
-            tool_name: "nebula__post_message".into(),
+            tool_name: "docs__post_message".into(),
             outcome: xai_grok_session_events::types::ToolOutcome::Success,
             hook_rewrote: false,
             duration_ms: 42,
             tool_result_size_bytes: None,
             file_path: Some(path.clone()),
             parameters: Some(serde_json::json!({"key": "sk-CANARYabcdefghij1234567890"})),
+            tool_use_id: None,
+            tool_output: None,
+            error_message: None,
         },
     );
     let events = exported_events(&stream);
     let ev = &events[0];
     assert_eq!(
         attr(ev, "tool_name").as_deref(),
-        Some("nebula__post_message"),
+        Some("docs__post_message"),
         "details gate exposes the verbatim name"
     );
     let exported_path = attr(ev, "file_path").expect("details gate exposes the path");
@@ -689,6 +715,7 @@ fn user_prompt_gates_off_drops_text() {
             client_identifier: None,
             screen_mode: Some("minimal".into()),
             prompt_text: Some("CANARY_PROMPT secret user text".into()),
+            command_name: None,
         },
     );
     let events = exported_events(&stream);
@@ -718,6 +745,7 @@ fn user_prompt_screen_mode_sanitized_and_optional() {
             client_identifier: None,
             screen_mode: Some("Evil Free Text".into()),
             prompt_text: None,
+            command_name: None,
         },
     );
     emit_event_into(
@@ -728,6 +756,7 @@ fn user_prompt_screen_mode_sanitized_and_optional() {
             client_identifier: None,
             screen_mode: None,
             prompt_text: None,
+            command_name: None,
         },
     );
     let events = exported_events(&stream);
@@ -746,6 +775,7 @@ fn user_prompt_gate_on_exports_scrubbed_text() {
             client_identifier: None,
             screen_mode: None,
             prompt_text: Some("fix the bug; token sk-CANARYabcdefghij1234567890".into()),
+            command_name: None,
         },
     );
     let events = exported_events(&stream);
@@ -768,6 +798,7 @@ fn mcp_connection_collapses_server_name_by_default() {
             error_type: events::McpErrorType::Timeout,
             duration_ms: 1000,
             timeout_sec: 30,
+            error_message: None,
         },
     );
     let events = exported_events(&stream);
@@ -784,26 +815,29 @@ fn agent_message_tool_decision_identity() {
     let stream = build(gates_off());
     emit_event_into(
         &stream,
-        &events::PermissionDecisionPayload {
-            tool_name: "send_subagent_message".into(),
-            access_kind: events::AccessKind::AgentMessage,
-            decision: events::PermissionOutcome::Allow,
-            wait_ms: 10,
-            permission_mode: crate::enums::PermissionMode::Ask,
-            source: Some("allowed".into()),
-            subagent_session_id: None,
-            subagent_type: None,
-            manager_prompt_attempted: Some(true),
-            prompt_outcome: Some(events::PermissionPromptOutcome::Allow),
-            prompt_outcome_detail: Some(events::PermissionPromptOutcomeDetail::AllowOnce),
-            remember_tool_approvals: Some(true),
-            decision_reason: Some(events::PermissionDecisionReason::NeedsUser),
-            classifier_source: None,
-            classifier_verdict: None,
-            security_findings: None,
-            classifier_latency_ms: None,
-            auto_denials_consecutive: None,
-            auto_denials_total: None,
+        &events::PermissionDecisionRecord {
+            payload: events::PermissionDecisionPayload {
+                tool_name: "send_subagent_message".into(),
+                access_kind: events::AccessKind::AgentMessage,
+                decision: events::PermissionOutcome::Allow,
+                wait_ms: 10,
+                permission_mode: crate::enums::PermissionMode::Ask,
+                source: Some("allowed".into()),
+                subagent_session_id: None,
+                subagent_type: None,
+                manager_prompt_attempted: Some(true),
+                prompt_outcome: Some(events::PermissionPromptOutcome::Allow),
+                prompt_outcome_detail: Some(events::PermissionPromptOutcomeDetail::AllowOnce),
+                remember_tool_approvals: Some(true),
+                decision_reason: Some(events::PermissionDecisionReason::NeedsUser),
+                classifier_source: None,
+                classifier_verdict: None,
+                security_findings: None,
+                classifier_latency_ms: None,
+                auto_denials_consecutive: None,
+                auto_denials_total: None,
+            },
+            tool_input: events::ExternalToolInput::default(),
         },
     );
     let events = exported_events(&stream);
@@ -820,26 +854,29 @@ fn tool_decision_snapshot() {
     let stream = build(gates_off());
     emit_event_into(
         &stream,
-        &events::PermissionDecisionPayload {
-            tool_name: "run_terminal_cmd".into(),
-            access_kind: events::AccessKind::Bash,
-            decision: events::PermissionOutcome::Deny,
-            wait_ms: 1500,
-            permission_mode: crate::enums::PermissionMode::Ask,
-            source: Some("user_reject".into()),
-            subagent_session_id: None,
-            subagent_type: None,
-            manager_prompt_attempted: Some(true),
-            prompt_outcome: Some(events::PermissionPromptOutcome::Reject),
-            prompt_outcome_detail: Some(events::PermissionPromptOutcomeDetail::RejectOnce),
-            remember_tool_approvals: Some(true),
-            decision_reason: Some(events::PermissionDecisionReason::AutoDenialLimit),
-            classifier_source: Some(events::PermissionClassifierSource::Llm),
-            classifier_verdict: Some(events::PermissionClassifierVerdict::Block),
-            security_findings: Some(vec![events::PermissionSecurityFinding::DangerousCommand]),
-            classifier_latency_ms: Some(42),
-            auto_denials_consecutive: Some(3),
-            auto_denials_total: Some(3),
+        &events::PermissionDecisionRecord {
+            payload: events::PermissionDecisionPayload {
+                tool_name: "run_terminal_cmd".into(),
+                access_kind: events::AccessKind::Bash,
+                decision: events::PermissionOutcome::Deny,
+                wait_ms: 1500,
+                permission_mode: crate::enums::PermissionMode::Ask,
+                source: Some("user_reject".into()),
+                subagent_session_id: None,
+                subagent_type: None,
+                manager_prompt_attempted: Some(true),
+                prompt_outcome: Some(events::PermissionPromptOutcome::Reject),
+                prompt_outcome_detail: Some(events::PermissionPromptOutcomeDetail::RejectOnce),
+                remember_tool_approvals: Some(true),
+                decision_reason: Some(events::PermissionDecisionReason::AutoDenialLimit),
+                classifier_source: Some(events::PermissionClassifierSource::Llm),
+                classifier_verdict: Some(events::PermissionClassifierVerdict::Block),
+                security_findings: Some(vec![events::PermissionSecurityFinding::DangerousCommand]),
+                classifier_latency_ms: Some(42),
+                auto_denials_consecutive: Some(3),
+                auto_denials_total: Some(3),
+            },
+            tool_input: events::ExternalToolInput::default(),
         },
     );
     let events = exported_events(&stream);
@@ -932,6 +969,8 @@ fn contextual_tip_maps_every_tip_and_action() {
         (K::SmallScreen, A::Accepted, "small_screen", "accepted"),
         (K::WordSelect, A::Shown, "word_select", "shown"),
         (K::WordSelect, A::Accepted, "word_select", "accepted"),
+        (K::ExportCopy, A::Shown, "export_copy", "shown"),
+        (K::ExportCopy, A::Accepted, "export_copy", "accepted"),
         (K::SshWrap, A::Shown, "ssh_wrap", "shown"),
         (K::SshWrap, A::Accepted, "ssh_wrap", "accepted"),
     ];
@@ -993,12 +1032,40 @@ fn mapping_supplied_session_id_wins_and_sequence_increments() {
 }
 
 #[test]
+fn from_snapshot_copies_user_id_without_email() {
+    let attrs = super::IdentityAttrs::from_snapshot(&xai_grok_auth::CredentialSnapshot {
+        user_id: Some("api-key-principal".into()),
+        api_key_id: Some("hashed-key".into()),
+        ..Default::default()
+    });
+    assert_eq!(attrs.user_id.as_deref(), Some("api-key-principal"));
+    assert_eq!(attrs.email, None, "email is never taken from the snapshot");
+}
+
+#[test]
+fn identity_api_key_user_id_exports_without_email() {
+    let stream = build(gates_off());
+    super::set_identity_on(
+        &stream.ext,
+        super::IdentityAttrs::from_snapshot(&xai_grok_auth::CredentialSnapshot {
+            user_id: Some("api-key-principal".into()),
+            ..Default::default()
+        }),
+    );
+    emit_event_into(&stream, &sentinel_session_harness());
+    let ev = &exported_events(&stream)[0];
+    assert_eq!(attr(ev, "user.id").as_deref(), Some("api-key-principal"));
+    assert_eq!(attr(ev, "user.email"), None);
+}
+
+#[test]
 fn identity_attrs_attached_when_set_and_blank_ids_never_export() {
     let stream = build(gates_off());
     super::set_identity_on(
         &stream.ext,
         super::IdentityAttrs {
             user_id: Some("user-42".into()),
+            email: None,
             organization_id: Some(String::new()), // blank: must not export
             team_id: None,
             deployment_id: Some("dep-7".into()),
@@ -1011,6 +1078,443 @@ fn identity_attrs_attached_when_set_and_blank_ids_never_export() {
     assert_eq!(attr(ev, "deployment.id").as_deref(), Some("dep-7"));
     assert_eq!(attr(ev, "organization.id"), None, "blank ids never export");
     assert_eq!(attr(ev, "team.id"), None);
+}
+
+#[test]
+fn identity_email_attached_on_logs_and_metrics_when_present() {
+    let stream = build(gates_off());
+    super::set_identity_on(
+        &stream.ext,
+        super::IdentityAttrs {
+            user_id: Some("user-42".into()),
+            email: Some("alice@corp.example".into()),
+            organization_id: None,
+            team_id: None,
+            deployment_id: None,
+        },
+    );
+    emit_event_into(&stream, &sentinel_session_harness());
+    let events = exported_events(&stream);
+    assert_eq!(
+        attr(&events[0], "user.email").as_deref(),
+        Some("alice@corp.example")
+    );
+    emit_event_into(
+        &stream,
+        &events::SessionNew {
+            session_id: "sess-1".into(),
+            client_identifier: None,
+            client_version: None,
+            is_git_repo: true,
+            permission_mode: crate::enums::PermissionMode::Ask,
+        },
+    );
+    let finished = stream.metrics.get_finished_metrics().unwrap();
+    let mut saw_email = false;
+    for rm in &finished {
+        for sm in rm.scope_metrics() {
+            for metric in sm.metrics() {
+                if let opentelemetry_sdk::metrics::data::AggregatedMetrics::U64(
+                    opentelemetry_sdk::metrics::data::MetricData::Sum(sum),
+                ) = metric.data()
+                {
+                    for dp in sum.data_points() {
+                        for kv in dp.attributes() {
+                            if kv.key.as_str() == "user.email" {
+                                saw_email = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(saw_email, "user.email must ride metrics as well as logs");
+}
+
+#[test]
+fn identity_blank_email_never_exports() {
+    let stream = build(gates_off());
+    super::set_identity_on(
+        &stream.ext,
+        super::IdentityAttrs {
+            user_id: Some("user-42".into()),
+            email: Some(String::new()),
+            organization_id: None,
+            team_id: None,
+            deployment_id: None,
+        },
+    );
+    emit_event_into(&stream, &sentinel_session_harness());
+    assert_eq!(attr(&exported_events(&stream)[0], "user.email"), None);
+}
+
+#[test]
+fn lock_content_gates_drops_prompt_and_response_not_email() {
+    let stream = build(gates_all_on());
+    super::set_identity_on(
+        &stream.ext,
+        super::IdentityAttrs {
+            user_id: Some("user-42".into()),
+            email: Some("alice@corp.example".into()),
+            organization_id: None,
+            team_id: None,
+            deployment_id: None,
+        },
+    );
+    super::apply_remote_policy_on(
+        &stream.ext,
+        super::ExternalOtelRemotePolicy {
+            force_disable: false,
+            lock_content_gates: true,
+        },
+    );
+    emit_event_into(
+        &stream,
+        &events::PromptSubmitted {
+            prompt_length: 12,
+            model_id: "grok-4".into(),
+            client_identifier: None,
+            screen_mode: None,
+            prompt_text: Some("CANARY_PROMPT".into()),
+            command_name: None,
+        },
+    );
+    emit_event_into(
+        &stream,
+        &events::AssistantResponse {
+            response_length: 14,
+            response_text: Some("CANARY_REPLY".into()),
+        },
+    );
+    emit_event_into(
+        &stream,
+        &events::ToolCallCompleted {
+            tool_name: "run_terminal_cmd".into(),
+            outcome: xai_grok_session_events::types::ToolOutcome::Error,
+            hook_rewrote: false,
+            duration_ms: 1,
+            tool_result_size_bytes: None,
+            file_path: None,
+            parameters: Some(serde_json::json!({"command": "echo hi"})),
+            tool_use_id: Some("call-lock".into()),
+            tool_output: Some("CANARY_OUTPUT".into()),
+            error_message: Some("CANARY_ERR".into()),
+        },
+    );
+    let exported = exported_events(&stream);
+    let blob = format!("{exported:?}");
+    assert!(!blob.contains("CANARY_PROMPT"));
+    assert!(!blob.contains("CANARY_REPLY"));
+    assert!(!blob.contains("CANARY_OUTPUT"));
+    assert!(!blob.contains("CANARY_ERR"));
+    assert_eq!(
+        attr(&exported[0], "user.email").as_deref(),
+        Some("alice@corp.example")
+    );
+    assert_eq!(attr(&exported[0], "prompt"), None);
+    assert_eq!(attr(&exported[1], "response"), None);
+    assert_eq!(attr(&exported[1], "response_length").as_deref(), Some("14"));
+    assert_eq!(attr(&exported[2], "tool_output"), None);
+    assert_eq!(attr(&exported[2], "error_message"), None);
+    assert_eq!(attr(&exported[2], "tool_input"), None);
+    assert_eq!(attr(&exported[2], "full_command"), None);
+}
+
+#[test]
+fn deny_tool_decision_exports_gated_params_and_full_command() {
+    let params = serde_json::json!({"command": "ls -la /tmp", "timeout": 30});
+    let ev = events::PermissionDecisionRecord {
+        payload: events::PermissionDecisionPayload {
+            tool_name: "run_terminal_cmd".into(),
+            access_kind: events::AccessKind::Bash,
+            decision: events::PermissionOutcome::Deny,
+            wait_ms: 10,
+            permission_mode: crate::enums::PermissionMode::Ask,
+            source: Some("user_reject".into()),
+            subagent_session_id: None,
+            subagent_type: None,
+            manager_prompt_attempted: None,
+            prompt_outcome: None,
+            prompt_outcome_detail: None,
+            remember_tool_approvals: None,
+            decision_reason: None,
+            classifier_source: None,
+            classifier_verdict: None,
+            security_findings: None,
+            classifier_latency_ms: None,
+            auto_denials_consecutive: None,
+            auto_denials_total: None,
+        },
+        tool_input: events::ExternalToolInput {
+            parameters: Some(params),
+            tool_use_id: Some("call-deny-1".into()),
+        },
+    };
+    let mixpanel = serde_json::to_string(&ev).unwrap();
+    assert!(
+        !mixpanel.contains("ls -la") && !mixpanel.contains("call-deny-1"),
+        "Mixpanel must not receive deny-path tool args: {mixpanel}"
+    );
+    let off = build(gates_off());
+    emit_event_into(&off, &ev);
+    let off_ev = &exported_events(&off)[0];
+    assert_eq!(attr(off_ev, "tool_parameters"), None);
+    assert_eq!(attr(off_ev, "full_command"), None);
+    assert_eq!(attr(off_ev, "tool_use_id").as_deref(), Some("call-deny-1"));
+
+    let on = build(gates_all_on());
+    emit_event_into(&on, &ev);
+    let on_ev = &exported_events(&on)[0];
+    let params_out = attr(on_ev, "tool_parameters").expect("details gate exports params");
+    assert!(params_out.contains("ls -la"));
+    assert_eq!(attr(on_ev, "full_command").as_deref(), Some("ls -la /tmp"));
+    assert!(
+        attr(on_ev, "tool_input")
+            .expect("content gate exports full tool_input")
+            .contains("ls -la /tmp")
+    );
+}
+
+#[test]
+fn details_without_content_exports_preview_not_bodies() {
+    let ev = events::ToolCallCompleted {
+        tool_name: "run_terminal_cmd".into(),
+        outcome: xai_grok_session_events::types::ToolOutcome::Error,
+        hook_rewrote: false,
+        duration_ms: 1,
+        tool_result_size_bytes: None,
+        file_path: Some("/tmp/x.rs".into()),
+        parameters: Some(serde_json::json!({"command": "ls -la /tmp"})),
+        tool_use_id: Some("call-d".into()),
+        tool_output: Some("CANARY_OUTPUT".into()),
+        error_message: Some("CANARY_ERR".into()),
+    };
+    let stream = build(ContentGates {
+        log_tool_details: true,
+        ..ContentGates::default()
+    });
+    emit_event_into(&stream, &ev);
+    let out = &exported_events(&stream)[0];
+    assert!(attr(out, "tool_parameters").unwrap().contains("ls -la"));
+    assert_eq!(attr(out, "file_path").as_deref(), Some("/tmp/x.rs"));
+    assert_eq!(attr(out, "full_command"), None);
+    assert_eq!(attr(out, "tool_input"), None);
+    assert_eq!(attr(out, "tool_output"), None);
+    assert_eq!(attr(out, "error_message"), None);
+    let blob = format!("{out:?}");
+    assert!(!blob.contains("CANARY_OUTPUT") && !blob.contains("CANARY_ERR"));
+}
+
+#[test]
+fn content_without_details_exports_bodies_not_preview() {
+    let ev = events::ToolCallCompleted {
+        tool_name: "docs__post_message".into(),
+        outcome: xai_grok_session_events::types::ToolOutcome::Error,
+        hook_rewrote: false,
+        duration_ms: 1,
+        tool_result_size_bytes: None,
+        file_path: Some("/tmp/secret.rs".into()),
+        parameters: Some(serde_json::json!({"command": "echo hi", "body": "full"})),
+        tool_use_id: Some("call-c".into()),
+        tool_output: Some("CANARY_OUTPUT".into()),
+        error_message: Some("CANARY_ERR".into()),
+    };
+    let mixpanel = serde_json::to_string(&ev).unwrap();
+    assert!(
+        !mixpanel.contains("CANARY_OUTPUT")
+            && !mixpanel.contains("CANARY_ERR")
+            && !mixpanel.contains("echo hi"),
+        "Mixpanel must skip content fields: {mixpanel}"
+    );
+    let stream = build(ContentGates {
+        log_tool_content: true,
+        ..ContentGates::default()
+    });
+    emit_event_into(&stream, &ev);
+    let out = &exported_events(&stream)[0];
+    assert_eq!(attr(out, "tool_name").as_deref(), Some("mcp_tool"));
+    assert_eq!(attr(out, "mcp_tool.name").as_deref(), Some("mcp_tool"));
+    assert_eq!(attr(out, "file_path"), None);
+    assert_eq!(attr(out, "tool_parameters"), None);
+    assert_eq!(attr(out, "full_command").as_deref(), Some("echo hi"));
+    assert!(attr(out, "tool_input").unwrap().contains("echo hi"));
+    assert_eq!(attr(out, "tool_output").as_deref(), Some("CANARY_OUTPUT"));
+    assert_eq!(attr(out, "error_message").as_deref(), Some("CANARY_ERR"));
+}
+
+#[test]
+fn command_name_is_always_on_metadata() {
+    let stream = build(gates_off());
+    emit_event_into(
+        &stream,
+        &events::PromptSubmitted {
+            prompt_length: 6,
+            model_id: "grok-4".into(),
+            client_identifier: None,
+            screen_mode: None,
+            prompt_text: Some("CANARY_PROMPT".into()),
+            command_name: Some("compact".into()),
+        },
+    );
+    let mixpanel = serde_json::to_string(&events::PromptSubmitted {
+        prompt_length: 6,
+        model_id: "grok-4".into(),
+        client_identifier: None,
+        screen_mode: None,
+        prompt_text: Some("CANARY_PROMPT".into()),
+        command_name: Some("compact".into()),
+    })
+    .unwrap();
+    assert!(
+        !mixpanel.contains("CANARY_PROMPT") && !mixpanel.contains("compact"),
+        "Mixpanel must skip prompt/command_name: {mixpanel}"
+    );
+    let ev = &exported_events(&stream)[0];
+    assert_eq!(attr(ev, "command_name").as_deref(), Some("compact"));
+    assert_eq!(attr(ev, "prompt"), None);
+}
+
+#[test]
+fn from_mode_is_always_on() {
+    let stream = build(gates_off());
+    emit_event_into(
+        &stream,
+        &events::PlanModeToggled {
+            enabled: true,
+            trigger: events::PlanModeTrigger::User,
+            turn_in_flight: false,
+            was_previously_active: false,
+            from_mode: Some("default".into()),
+        },
+    );
+    emit_event_into(
+        &stream,
+        &events::YoloToggled {
+            enabled: true,
+            previous_state: false,
+            trigger: events::YoloTrigger::SlashCommand,
+            from_mode: None,
+        },
+    );
+    emit_event_into(
+        &stream,
+        &events::YoloToggled {
+            enabled: true,
+            previous_state: false,
+            trigger: events::YoloTrigger::SlashCommand,
+            from_mode: Some("plan".into()),
+        },
+    );
+    let exported = exported_events(&stream);
+    assert_eq!(attr(&exported[0], "from_mode").as_deref(), Some("default"));
+    assert_eq!(attr(&exported[0], "to_mode").as_deref(), Some("plan"));
+    assert_eq!(attr(&exported[1], "from_mode").as_deref(), Some("default"));
+    assert_eq!(
+        attr(&exported[1], "to_mode").as_deref(),
+        Some("bypass_permissions")
+    );
+    assert_eq!(attr(&exported[2], "from_mode").as_deref(), Some("plan"));
+    assert_eq!(
+        attr(&exported[2], "to_mode").as_deref(),
+        Some("bypass_permissions")
+    );
+}
+
+#[test]
+fn full_command_skips_512_collapse() {
+    let long = "x".repeat(600);
+    let ev = events::ToolCallCompleted {
+        tool_name: "run_terminal_cmd".into(),
+        outcome: xai_grok_session_events::types::ToolOutcome::Success,
+        hook_rewrote: false,
+        duration_ms: 1,
+        tool_result_size_bytes: None,
+        file_path: None,
+        parameters: Some(serde_json::json!({"command": long})),
+        tool_use_id: Some("call-1".into()),
+        tool_output: None,
+        error_message: None,
+    };
+    let stream = build(gates_all_on());
+    emit_event_into(&stream, &ev);
+    let exported = &exported_events(&stream)[0];
+    let cmd = attr(exported, "full_command").expect("full_command present");
+    assert_eq!(cmd.len(), 600, "full_command must not 512→128 collapse");
+    assert!(!cmd.contains("…[truncated]"));
+    let params = attr(exported, "tool_parameters").expect("params present");
+    assert!(
+        params.contains("…[truncated]"),
+        "JSON blob may still collapse nested strings"
+    );
+}
+
+#[test]
+fn assistant_response_tool_only_omits_response() {
+    let stream = build(gates_all_on());
+    emit_event_into(
+        &stream,
+        &events::AssistantResponse {
+            response_length: 0,
+            response_text: Some(String::new()),
+        },
+    );
+    let ev = &exported_events(&stream)[0];
+    assert_eq!(ev.0, "grok_code.assistant_response");
+    assert_eq!(attr(ev, "response_length").as_deref(), Some("0"));
+    assert_eq!(attr(ev, "response"), None);
+}
+
+#[test]
+fn assistant_response_gate_exports_text() {
+    let stream = build(gates_all_on());
+    emit_event_into(
+        &stream,
+        &events::AssistantResponse {
+            response_length: 11,
+            response_text: Some("hello world".into()),
+        },
+    );
+    let ev = &exported_events(&stream)[0];
+    assert_eq!(attr(ev, "response").as_deref(), Some("hello world"));
+    assert_eq!(attr(ev, "response_length").as_deref(), Some("11"));
+}
+
+#[test]
+fn assistant_response_with_url_does_not_drop_at_validator() {
+    // A2 laptop canary: gated `response` often contains https://… after the
+    // model replies. Emit scrubs; the validator must not treat the already-
+    // scrubbed origin as still-dirty (`redact_secrets` returns Owned whenever
+    // MATCH_ANY hits).
+    let stream = build(gates_all_on());
+    let text = "listed files; see https://example.com/docs?token=CANARY for help";
+    emit_event_into(
+        &stream,
+        &events::AssistantResponse {
+            response_length: text.len(),
+            response_text: Some(text.into()),
+        },
+    );
+    assert_eq!(
+        stream
+            .ext
+            .health
+            .records_dropped
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "scrubbed assistant response must pass the export validator"
+    );
+    let ev = &exported_events(&stream)[0];
+    assert_eq!(ev.0, "grok_code.assistant_response");
+    let response = attr(ev, "response").expect("gated response");
+    assert!(
+        response.contains("https://example.com"),
+        "origin lost: {response}"
+    );
+    assert!(
+        !response.contains("CANARY"),
+        "query token leaked: {response}"
+    );
 }
 
 #[test]

@@ -69,6 +69,16 @@ impl SessionActor {
                     trigger: xai_grok_telemetry::events::PlanModeTrigger::User,
                     turn_in_flight,
                     was_previously_active: !entered,
+                    from_mode: Some(if entered {
+                        if self.permissions.is_yolo_mode() {
+                            "bypass_permissions"
+                        } else {
+                            "default"
+                        }
+                        .to_owned()
+                    } else {
+                        "plan".to_owned()
+                    }),
                 },
             );
             if entered {
@@ -105,6 +115,7 @@ impl SessionActor {
                     trigger: xai_grok_telemetry::events::PlanModeTrigger::User,
                     turn_in_flight,
                     was_previously_active: true,
+                    from_mode: Some("plan".into()),
                 },
             );
             tracing::info_span!(

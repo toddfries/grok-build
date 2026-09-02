@@ -1131,6 +1131,9 @@ impl AgentView {
                 self.set_active_pane(AgentPane::Dock, false);
                 return InputOutcome::Changed;
             }
+            if self.dock_on {
+                return InputOutcome::Unchanged;
+            }
             self.tasks.overlay.toggle();
             self.tasks.on_state_change();
             if self.tasks.overlay.focused {
@@ -1169,6 +1172,8 @@ impl AgentView {
         {
             if self.dock_shown {
                 self.dock_queued_expanded = !self.dock_queued_expanded;
+            } else if self.dock_on {
+                return InputOutcome::Unchanged;
             } else {
                 self.toggle_queue_pane();
             }
@@ -1834,6 +1839,61 @@ mod btw_focus_tests {
         agent.handle_input(&key(KeyCode::Up), &reg);
         assert_eq!(done_scroll_offset(&agent), 1);
         assert!(agent.btw_focused);
+    }
+    /// Scroll cancels an in-flight `/btw` drag but keeps a finished highlight.
+    #[test]
+    fn btw_scroll_keeps_finished_highlight() {
+        use crate::scrollback::text_selection::{
+            ActiveTextDrag, PersistentTextSelection, RangeHit, SelectionEndpoint, SelectionKind,
+            SelectionOrigin,
+        };
+        use crate::views::btw_overlay::BTW_OVERLAY_ENTRY_IDX;
+        let mut agent = prompt_focused_agent();
+        let reg = ActionRegistry::defaults();
+        agent.btw_state = Some(BtwOverlayState::done("q".into(), long_btw_answer()));
+        agent.btw_focused = true;
+        let anchor = RangeHit {
+            entry_idx: BTW_OVERLAY_ENTRY_IDX,
+            range_id: 0,
+            block_line_idx: 0,
+            col_within_range: 0,
+        };
+        agent.persistent_text_selection = Some(PersistentTextSelection {
+            entry_idx: BTW_OVERLAY_ENTRY_IDX,
+            range_id: 0,
+            anchor: SelectionEndpoint {
+                block_line_idx: 0,
+                col_within_range: 0,
+            },
+            head: SelectionEndpoint {
+                block_line_idx: 1,
+                col_within_range: 4,
+            },
+            origin: SelectionOrigin::Drag,
+            kind: SelectionKind::Linear,
+        });
+        agent.drag_selection = Some(ActiveTextDrag {
+            anchor,
+            head: RangeHit {
+                col_within_range: 3,
+                ..anchor
+            },
+            kind: SelectionKind::Linear,
+            anchor_content_width: Some(40),
+        });
+        assert!(matches!(
+            agent.handle_input(&key(KeyCode::Down), &reg),
+            InputOutcome::Changed
+        ));
+        assert_eq!(done_scroll_offset(&agent), 1);
+        assert!(
+            agent.persistent_text_selection.is_some(),
+            "finished /btw highlight must survive scroll"
+        );
+        assert!(
+            agent.drag_selection.is_none(),
+            "in-flight /btw drag must cancel on scroll"
+        );
     }
     #[test]
     fn focused_panel_owns_page_keys_before_prompt_paging() {

@@ -1382,6 +1382,15 @@ pub(super) fn handle_session_notification_with_origin(
             );
         }
     }
+    if !app.reconnect_pending
+        && let Some(agent) = app.agents.get(&parent_id)
+        && agent.running_wake_turn.is_none()
+        && agent.session.state.is_idle()
+        && !agent.session.pending_prompts.is_empty()
+    {
+        let effects = crate::app::dispatch::maybe_drain_queue_and_note_peek(app, parent_id);
+        app.pending_effects.extend(effects);
+    }
     if let Some(outcome) = terminal_outcome {
         return super::super::turn_completion::apply_terminal_outcome(
             outcome, app, parent_id, is_active,

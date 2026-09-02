@@ -1918,6 +1918,26 @@ impl ExtensionsModalState {
         false
     }
 
+    pub fn active_tab_is_loading(&self) -> bool {
+        match self.active_tab {
+            ExtensionsTab::Hooks => matches!(self.hooks_data, TabDataState::Loading),
+            ExtensionsTab::Plugins => matches!(self.plugins_data, TabDataState::Loading),
+            ExtensionsTab::Marketplace => matches!(self.marketplace_data, TabDataState::Loading),
+            ExtensionsTab::Skills => matches!(self.skills_data, TabDataState::Loading),
+            ExtensionsTab::Workflows => matches!(self.workflows_data, TabDataState::Loading),
+            ExtensionsTab::McpServers => matches!(self.mcps_data, TabDataState::Loading),
+        }
+    }
+
+    pub fn has_tab_wide_pending_overlay(&self) -> bool {
+        self.pending_action.is_some() && self.pending_entry_index.is_none()
+    }
+
+    /// A spinner that renders without demanding ticks parks on its first frame.
+    pub fn needs_spinner_tick(&self) -> bool {
+        self.active_tab_is_loading() || self.has_tab_wide_pending_overlay()
+    }
+
     /// Switch to a different tab and reset the per-tab transient UI state.
     ///
     /// Clears anything tied to the previous tab's data indices or modal flow, so the new tab opens in a clean browse view.
@@ -2647,15 +2667,7 @@ pub fn render_extensions_modal(
         _ => StatusFilter::All,
     };
 
-    // Determine if this tab is loading.
-    let loading = match state.active_tab {
-        ExtensionsTab::Hooks => matches!(state.hooks_data, TabDataState::Loading),
-        ExtensionsTab::Plugins => matches!(state.plugins_data, TabDataState::Loading),
-        ExtensionsTab::Marketplace => matches!(state.marketplace_data, TabDataState::Loading),
-        ExtensionsTab::Skills => matches!(state.skills_data, TabDataState::Loading),
-        ExtensionsTab::Workflows => matches!(state.workflows_data, TabDataState::Loading),
-        ExtensionsTab::McpServers => matches!(state.mcps_data, TabDataState::Loading),
-    };
+    let loading = state.active_tab_is_loading();
 
     // Input mode hides the entry list (form overlay owns the content area).
     let in_input_mode = state.input.is_some() || state.mcp_setup.is_some();
@@ -3662,7 +3674,7 @@ pub fn render_extensions_modal(
             &non_selectable_clickable,
             Some(theme.bg_base),
             loading,
-            0,
+            tick,
             inner_x + inner_width - 1,
         );
         (content_hit.item_rects, content_hit.entry_indices)
@@ -3705,8 +3717,7 @@ pub fn render_extensions_modal(
     // Render the full-screen pending overlay when no specific entry is targeted
     // AddSource is one: the new row doesn't exist yet, so there's no entry badge to show
     // Covers the picker content with a centered spinner and message
-    if state.pending_action.is_some()
-        && state.pending_entry_index.is_none()
+    if state.has_tab_wide_pending_overlay()
         && let Some(popup_rect) = state.window.popup_area
     {
         let label = state.pending_action.as_deref().unwrap_or("Processing...");
@@ -5072,6 +5083,40 @@ mod tests {
             "loading spinner shown instead of the empty placeholder"
         );
         assert_eq!(buffer_count(&buf, "No workflows available"), 0);
+    }
+
+    #[test]
+    fn mcps_tab_loading_spinner_advances_with_tick() {
+        let frames = crate::glyphs::dot_spinner_frames();
+        let frame0 = frames[0];
+        let frame2 = frames[2];
+        assert_ne!(
+            frame0, frame2,
+            "dot spinner must change across an 8-tick stride (divisor 4)"
+        );
+
+        let mut state = ExtensionsModalState::new(ExtensionsTab::McpServers);
+        let area = Rect::new(0, 0, 100, 40);
+
+        let mut buf0 = Buffer::empty(area);
+        render_extensions_modal(&mut buf0, area, &mut state, None, false, 0);
+        let msg0 = format!("{frame0} Loading\u{2026}");
+        let msg2 = format!("{frame2} Loading\u{2026}");
+        assert_eq!(buffer_count(&buf0, &msg0), 1, "tick 0 must show {msg0:?}");
+        assert_eq!(
+            buffer_count(&buf0, &msg2),
+            0,
+            "tick 0 must not show {msg2:?}"
+        );
+
+        let mut buf2 = Buffer::empty(area);
+        render_extensions_modal(&mut buf2, area, &mut state, None, false, 8);
+        assert_eq!(buffer_count(&buf2, &msg2), 1, "tick 8 must show {msg2:?}");
+        assert_eq!(
+            buffer_count(&buf2, &msg0),
+            0,
+            "tick 8 must not show {msg0:?}"
+        );
     }
 
     #[test]

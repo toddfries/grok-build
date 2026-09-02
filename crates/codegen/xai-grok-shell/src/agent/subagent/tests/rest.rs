@@ -2648,6 +2648,86 @@ async fn resolve_subagent_config_override_wins_over_agent_definition() {
     assert_eq!(config.model, "config-pin");
     assert_eq!(model_id.0.as_ref(), "config-pin");
 }
+/// A named subagent model that is in the catalog but not user-selectable
+/// (fleet `allowed_models` pin) must not run inference. Same fall-through
+/// as an unknown id — inherit the parent.
+#[tokio::test]
+async fn resolve_subagent_config_override_unselectable_model_falls_through_to_inherit() {
+    use xai_grok_agent::config::ModelOverride;
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.sampling_config.model = "grok-4.5".to_string();
+    ctx.model_id = acp::ModelId::new("grok-4.5");
+    let mut blocked = test_model_entry("blocked-model");
+    blocked.info.user_selectable = false;
+    ctx.available_models.insert("blocked-model".to_string(), blocked);
+    ctx.subagent_model_overrides
+        .insert("explore".to_string(), "blocked-model".to_string());
+    let raw = toml::Value::Table(toml::map::Map::new());
+    let mut cfg = crate::agent::config::Config::new_from_toml_cfg(&raw).unwrap();
+    cfg.requirements
+        .allowed_models
+        .pin(
+            crate::agent::config::AllowlistPin::List(vec!["grok-4*".into()]),
+            crate::config::RequirementSource::Unknown,
+        );
+    ctx.agent_config = Some(cfg);
+    let (config, model_id) = resolve_subagent_sampling_config(
+            "explore",
+            &ModelOverride::Inherit,
+            &ctx,
+        )
+        .await;
+    assert_eq!(config.model, "grok-4.5");
+    assert_eq!(model_id.0.as_ref(), "grok-4.5");
+}
+/// A user's own `allowed_models` picker filter does not block named
+/// subagent overrides. Only a fleet pin does.
+#[tokio::test]
+async fn resolve_subagent_config_override_user_allowlist_still_applies() {
+    use xai_grok_agent::config::ModelOverride;
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.sampling_config.model = "grok-4.5".to_string();
+    ctx.model_id = acp::ModelId::new("grok-4.5");
+    let mut picker_hidden = test_model_entry("subagent-only");
+    picker_hidden.info.user_selectable = false;
+    ctx.available_models.insert("subagent-only".to_string(), picker_hidden);
+    ctx.subagent_model_overrides
+        .insert("explore".to_string(), "subagent-only".to_string());
+    let raw = toml::Value::Table(toml::map::Map::new());
+    ctx.agent_config = Some(
+        crate::agent::config::Config::new_from_toml_cfg(&raw).unwrap(),
+    );
+    let (config, model_id) = resolve_subagent_sampling_config(
+            "explore",
+            &ModelOverride::Inherit,
+            &ctx,
+        )
+        .await;
+    assert_eq!(config.model, "subagent-only");
+    assert_eq!(model_id.0.as_ref(), "subagent-only");
+}
+/// Missing `agent_config` cannot be told from a fleet pin — fail closed.
+#[tokio::test]
+async fn resolve_subagent_config_override_none_agent_config_blocks_unselectable() {
+    use xai_grok_agent::config::ModelOverride;
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.sampling_config.model = "grok-4.5".to_string();
+    ctx.model_id = acp::ModelId::new("grok-4.5");
+    let mut blocked = test_model_entry("blocked-model");
+    blocked.info.user_selectable = false;
+    ctx.available_models.insert("blocked-model".to_string(), blocked);
+    ctx.subagent_model_overrides
+        .insert("explore".to_string(), "blocked-model".to_string());
+    assert!(ctx.agent_config.is_none());
+    let (config, model_id) = resolve_subagent_sampling_config(
+            "explore",
+            &ModelOverride::Inherit,
+            &ctx,
+        )
+        .await;
+    assert_eq!(config.model, "grok-4.5");
+    assert_eq!(model_id.0.as_ref(), "grok-4.5");
+}
 /// An unresolvable `[subagents.models]` pin (model absent from `available_models`) falls through to inherit the parent model.
 #[tokio::test]
 async fn resolve_subagent_config_override_unknown_model_falls_through_to_inherit() {

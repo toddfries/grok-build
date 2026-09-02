@@ -187,8 +187,9 @@ fn toml_to_json(v: &toml::Value) -> Value {
 pub async fn load_permissions(root_cwd: &Path, project_trusted: bool) -> Value {
     use crate::permission::resolution;
 
-    let Some(resolved) =
-        resolution::resolve_permissions_with_provenance(root_cwd, project_trusted).await
+    let Some(resolved) = resolution::resolve_permissions_with_provenance(root_cwd, project_trusted)
+        .await
+        .resolved
     else {
         return Value::Null;
     };

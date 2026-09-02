@@ -61,6 +61,12 @@ pub enum ChatStateCommand {
     /// Push an ordered batch of user messages into the conversation.
     PushUserMessagesBatch { items: Vec<ConversationItem> },
 
+    /// Push an ordered batch and acknowledge once every message is processed.
+    PushUserMessagesBatchAndAck {
+        items: Vec<ConversationItem>,
+        reply: oneshot::Sender<()>,
+    },
+
     /// Push a user message and acknowledge once the chat-state actor has
     /// accepted and processed it.
     PushUserMessageAndAck {
@@ -359,6 +365,12 @@ pub enum ChatStateCommand {
         reply: oneshot::Sender<Option<String>>,
     },
 
+    /// Concatenate every non-empty assistant message in the current prompt
+    /// turn (`"\n"`-joined). Same turn boundary as `GetLastAssistantTextInTurn`.
+    GetAssistantTextInTurn {
+        reply: oneshot::Sender<Option<String>>,
+    },
+
     /// Get the text of the first `Text` content part in the first `User` message.
     /// Returns `None` if the conversation has no user messages or the first user
     /// message has no text content part.
@@ -413,6 +425,11 @@ mod tests {
         };
         let _ = ChatStateCommand::PushUserMessagesBatch {
             items: vec![ConversationItem::user("hello")],
+        };
+        let (tx, _rx) = oneshot::channel();
+        let _ = ChatStateCommand::PushUserMessagesBatchAndAck {
+            items: vec![ConversationItem::user("hello")],
+            reply: tx,
         };
         let (tx, _rx) = oneshot::channel();
         let _ = ChatStateCommand::PushUserMessageAndAck {
@@ -545,6 +562,9 @@ mod tests {
 
         let (tx, _rx) = oneshot::channel();
         let _ = ChatStateCommand::GetLastAssistantTextInTurn { reply: tx };
+
+        let (tx, _rx) = oneshot::channel();
+        let _ = ChatStateCommand::GetAssistantTextInTurn { reply: tx };
 
         let (tx, _rx) = oneshot::channel();
         let _ = ChatStateCommand::GetFirstUserText { reply: tx };

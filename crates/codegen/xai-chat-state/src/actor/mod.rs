@@ -125,6 +125,12 @@ impl ChatStateActor {
                     self.push_user_message(item);
                 }
             }
+            ChatStateCommand::PushUserMessagesBatchAndAck { items, reply } => {
+                for item in items {
+                    self.push_user_message(item);
+                }
+                let _ = reply.send(());
+            }
             ChatStateCommand::PushUserMessageAndAck { item, reply } => {
                 self.push_user_message(item);
                 let _ = reply.send(());
@@ -449,6 +455,9 @@ impl ChatStateActor {
             }
             ChatStateCommand::GetLastAssistantTextInTurn { reply } => {
                 let _ = reply.send(self.get_last_assistant_text_in_turn());
+            }
+            ChatStateCommand::GetAssistantTextInTurn { reply } => {
+                let _ = reply.send(self.get_assistant_text_in_turn());
             }
             ChatStateCommand::GetFirstUserText { reply } => {
                 let _ = reply.send(self.get_first_user_text());

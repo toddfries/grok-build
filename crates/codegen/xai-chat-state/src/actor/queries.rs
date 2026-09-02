@@ -216,22 +216,22 @@ impl ChatStateActor {
         Some(segments.iter().rev().copied().collect())
     }
 
-    /// Return the current turn's last assistant message with non-empty text, or
-    /// `None` when the turn produced none.
+    /// Non-empty assistant texts in the current turn, chronological.
     ///
-    /// Like [`Self::get_last_assistant_text`], but the backwards walk stops at the
-    /// turn boundary (a user item with `prompt_index` set, a genuine user message,
-    /// or a synthetic reason with [`SyntheticReason::starts_prompt_turn`]); mid-turn
-    /// synthetic injections are walked past.
+    /// The backwards walk stops at the turn boundary (a user item with
+    /// `prompt_index` set, a genuine user message, or a synthetic reason with
+    /// [`SyntheticReason::starts_prompt_turn`]); mid-turn synthetic injections
+    /// are walked past. Whitespace-only assistant items are skipped.
     ///
     /// [`SyntheticReason::starts_prompt_turn`]: xai_grok_sampling_types::SyntheticReason::starts_prompt_turn
-    pub(super) fn get_last_assistant_text_in_turn(&self) -> Option<String> {
+    fn assistant_texts_in_turn(&self) -> Vec<String> {
+        let mut texts = Vec::new();
         for item in self.state.conversation.iter().rev() {
             match item {
                 xai_grok_sampling_types::ConversationItem::Assistant(a)
                     if !a.content.trim().is_empty() =>
                 {
-                    return Some(a.content.as_ref().to_owned());
+                    texts.push(a.content.as_ref().to_owned());
                 }
                 xai_grok_sampling_types::ConversationItem::User(u)
                     if u.prompt_index.is_some()
@@ -239,12 +239,37 @@ impl ChatStateActor {
                             .as_ref()
                             .is_none_or(|r| r.starts_prompt_turn()) =>
                 {
-                    return None;
+                    break;
                 }
                 _ => {}
             }
         }
-        None
+        texts.reverse();
+        texts
+    }
+
+    /// Return the current turn's last assistant message with non-empty text, or
+    /// `None` when the turn produced none.
+    ///
+    /// Like [`Self::get_last_assistant_text`], but bounded to the current prompt
+    /// turn; see [`Self::assistant_texts_in_turn`].
+    pub(super) fn get_last_assistant_text_in_turn(&self) -> Option<String> {
+        self.assistant_texts_in_turn().pop()
+    }
+
+    /// Concatenate every non-empty assistant message in the current turn
+    /// (chronological, `"\n"`-joined), or `None` when the turn produced none.
+    ///
+    /// Same turn-boundary rules as [`Self::get_last_assistant_text_in_turn`].
+    /// Use this for turn-scoped export that must keep earlier bubbles of a
+    /// multi-round tool turn, not only the last.
+    pub(super) fn get_assistant_text_in_turn(&self) -> Option<String> {
+        let texts = self.assistant_texts_in_turn();
+        if texts.is_empty() {
+            None
+        } else {
+            Some(texts.join("\n"))
+        }
     }
 
     /// Return the text of the **first content part** of the first `User` message,

@@ -473,10 +473,16 @@ impl AgentView {
             DockItem::Row(..) => InputOutcome::Unchanged,
         }
     }
-    /// Dock-focused key handling (experimental `GROK_DOCK_V2`).
+    /// Dock-focused key handling (remote `dock_enabled`).
     pub(super) fn handle_dock_key(&mut self, key: &KeyEvent) -> InputOutcome {
         use crate::views::dock::{DockItem, Section};
         use crossterm::event::KeyCode;
+        if !self.dock_shown {
+            return InputOutcome::Unchanged;
+        }
+        if !key.modifiers.is_empty() {
+            return InputOutcome::Unchanged;
+        }
         let items = self.dock_items();
         if items.is_empty() {
             self.set_active_pane(AgentPane::Scrollback, false);

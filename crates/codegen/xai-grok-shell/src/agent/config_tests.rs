@@ -2623,7 +2623,7 @@ fn allowed_models_empty_is_unrestricted() {
 #[test]
 fn invalid_glob_is_rejected_by_validation() {
     use crate::agent::models::ModelGlobSet;
-    assert!(ModelGlobSet::compile(Some(&vec!["grok[".to_string()])).is_err());
+    assert!(ModelGlobSet::compile(Some(["grok[".to_string()].as_slice())).is_err());
     let raw: toml::Value = toml::from_str(
         r#"
             [models]
@@ -2771,6 +2771,37 @@ fn telemetry_config_parses_custom_values_from_toml() {
         Some("custom-token")
     );
     assert!(!cfg.telemetry.mixpanel_enabled);
+}
+#[test]
+fn telemetry_otel_timeout_accepts_toml_integer_and_string() {
+    let as_int: toml::Value = toml::from_str(
+        r#"
+            [telemetry]
+            otel_timeout = 10000
+            otel_metric_export_interval = 60000
+            "#,
+    )
+    .unwrap();
+    let cfg = Config::new_from_toml_cfg(&as_int).expect("integer otel_timeout must parse");
+    assert_eq!(cfg.telemetry.otel_timeout.as_deref(), Some("10000"));
+    assert_eq!(
+        cfg.telemetry.otel_metric_export_interval.as_deref(),
+        Some("60000")
+    );
+    let as_str: toml::Value = toml::from_str(
+        r#"
+            [telemetry]
+            otel_timeout = "10000"
+            otel_metric_export_interval = "60000"
+            "#,
+    )
+    .unwrap();
+    let cfg = Config::new_from_toml_cfg(&as_str).expect("string otel_timeout must parse");
+    assert_eq!(cfg.telemetry.otel_timeout.as_deref(), Some("10000"));
+    assert_eq!(
+        cfg.telemetry.otel_metric_export_interval.as_deref(),
+        Some("60000")
+    );
 }
 /// Empty/whitespace values must become `None`, not reach the HTTP client as empty strings.
 #[test]
@@ -5859,6 +5890,7 @@ fn external_otel_requirements_pin_wins_over_env() {
             [telemetry]
             otel_log_user_prompts = false
             otel_log_tool_details = false
+            otel_log_tool_content = false
             "#,
     )
     .unwrap();
@@ -5870,6 +5902,7 @@ fn external_otel_requirements_pin_wins_over_env() {
             ("OTEL_LOGS_EXPORTER", "otlp"),
             ("OTEL_LOG_USER_PROMPTS", "1"),
             ("OTEL_LOG_TOOL_DETAILS", "1"),
+            ("OTEL_LOG_TOOL_CONTENT", "1"),
         ]),
         ext_client(),
         false,
@@ -5877,12 +5910,429 @@ fn external_otel_requirements_pin_wins_over_env() {
     .expect("stream still active; only gates pinned");
     assert!(!cfg.gates.log_user_prompts, "requirement pin must win");
     assert!(!cfg.gates.log_tool_details, "requirement pin must win");
+    assert!(!cfg.gates.log_tool_content, "requirement pin must win");
 }
-/// Regression: an org enable via `[telemetry].otel_enabled` must flip the master switch the *internal* pipeline keys off.
-/// That path is managed config / requirements, with no `GROK_EXTERNAL_OTEL` env var set.
-/// Legacy `OTEL_EXPORTER_OTLP_*` repointing then shuts off in lockstep with the external stream activating.
-/// A desync would point the internally-authenticated stream at the customer collector.
-/// Meanwhile `internal_pipeline_consumed_otel_vars` would block the external stream.
+#[test]
+fn external_otel_requirements_pin_endpoint_beats_env() {
+    let req: toml::Value = toml::from_str(
+        r#"
+            [telemetry]
+            otel_enabled = true
+            otel_logs_exporter = "otlp"
+            otel_endpoint = "http://corp:4318"
+            "#,
+    )
+    .unwrap();
+    let cfg = resolve_external_otel_config_with(
+        None,
+        Some(&req),
+        ext_env(&[("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:9")]),
+        ext_client(),
+        false,
+    )
+    .expect("pin must keep the stream active");
+    assert!(
+        cfg.logs_endpoint.starts_with("http://corp:4318"),
+        "listed endpoint must beat env: {}",
+        cfg.logs_endpoint
+    );
+}
+#[test]
+fn external_otel_unset_endpoint_still_env_overridable() {
+    let req: toml::Value = toml::from_str(
+        r#"
+            [telemetry]
+            otel_enabled = true
+            otel_logs_exporter = "otlp"
+            "#,
+    )
+    .unwrap();
+    let cfg = resolve_external_otel_config_with(
+        None,
+        Some(&req),
+        ext_env(&[("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:4318")]),
+        ext_client(),
+        false,
+    )
+    .expect("unset endpoint stays developer-settable");
+    assert!(
+        cfg.logs_endpoint.contains("127.0.0.1:4318"),
+        "{}",
+        cfg.logs_endpoint
+    );
+}
+#[test]
+fn external_otel_pin_endpoint_strips_per_signal_env() {
+    let req: toml::Value = toml::from_str(
+        r#"
+            [telemetry]
+            otel_enabled = true
+            otel_logs_exporter = "otlp"
+            otel_endpoint = "http://corp:4318"
+            "#,
+    )
+    .unwrap();
+    let cfg = resolve_external_otel_config_with(
+        None,
+        Some(&req),
+        ext_env(&[(
+            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+            "http://127.0.0.1:9/v1/logs",
+        )]),
+        ext_client(),
+        false,
+    )
+    .expect("stream active");
+    assert!(
+        !cfg.logs_endpoint.contains("127.0.0.1:9"),
+        "unlisted per-signal endpoint env must not win: {}",
+        cfg.logs_endpoint
+    );
+    assert!(cfg.logs_endpoint.contains("corp:4318"));
+}
+#[test]
+fn external_otel_pin_endpoint_hides_unlisted_file_siblings() {
+    let req: toml::Value = toml::from_str(
+        r#"
+            [telemetry]
+            otel_enabled = true
+            otel_logs_exporter = "otlp"
+            otel_endpoint = "http://corp:4318"
+            "#,
+    )
+    .unwrap();
+    let effective: toml::Value = toml::from_str(
+        r#"
+            [telemetry]
+            otel_logs_endpoint = "http://127.0.0.1:9/v1/logs"
+            otel_metrics_endpoint = "http://127.0.0.1:9/v1/metrics"
+            "#,
+    )
+    .unwrap();
+    let cfg = resolve_external_otel_config_with(
+        Some(&effective),
+        Some(&req),
+        ext_env(&[]),
+        ext_client(),
+        false,
+    )
+    .expect("stream active");
+    assert!(
+        !cfg.logs_endpoint.contains("127.0.0.1:9"),
+        "unlisted file sibling must not retarget: {}",
+        cfg.logs_endpoint
+    );
+    assert!(
+        cfg.logs_endpoint.contains("corp:4318"),
+        "{}",
+        cfg.logs_endpoint
+    );
+}
+#[test]
+fn external_otel_pin_protocol_hides_unlisted_file_siblings() {
+    let req: toml::Value = toml::from_str(
+        r#"
+            [telemetry]
+            otel_enabled = true
+            otel_logs_exporter = "otlp"
+            otel_endpoint = "http://corp:4318"
+            otel_protocol = "http/protobuf"
+            "#,
+    )
+    .unwrap();
+    let effective: toml::Value = toml::from_str(
+        r#"
+            [telemetry]
+            otel_logs_protocol = "grpc"
+            "#,
+    )
+    .unwrap();
+    let cfg = resolve_external_otel_config_with(
+        Some(&effective),
+        Some(&req),
+        ext_env(&[]),
+        ext_client(),
+        false,
+    )
+    .expect("stream active");
+    assert_eq!(
+        cfg.logs_transport,
+        xai_grok_telemetry::external::config::OtlpTransport::HttpProtobuf,
+        "unlisted file protocol sibling must not win"
+    );
+}
+#[test]
+fn external_otel_pin_ca_keeps_file_endpoint() {
+    let req: toml::Value = toml::from_str(
+        r#"
+            [telemetry]
+            otel_enabled = true
+            otel_logs_exporter = "otlp"
+            otel_certificate = "/etc/ssl/corp-ca.pem"
+            "#,
+    )
+    .unwrap();
+    let effective: toml::Value = toml::from_str(
+        r#"
+            [telemetry]
+            otel_logs_endpoint = "http://logs:4318/v1/logs"
+            "#,
+    )
+    .unwrap();
+    let cfg = resolve_external_otel_config_with(
+        Some(&effective),
+        Some(&req),
+        ext_env(&[]),
+        ext_client(),
+        false,
+    )
+    .expect("stream active");
+    assert_eq!(
+        cfg.logs_endpoint, "http://logs:4318/v1/logs",
+        "CA pin must not lock destination"
+    );
+}
+#[test]
+fn external_otel_pin_client_cert_hides_file_endpoints() {
+    let req: toml::Value = toml::from_str(
+        r#"
+            [telemetry]
+            otel_enabled = true
+            otel_logs_exporter = "otlp"
+            otel_client_certificate = "/etc/ssl/client.crt"
+            otel_client_key = "/etc/ssl/client.key"
+            "#,
+    )
+    .unwrap();
+    let effective: toml::Value = toml::from_str(
+        r#"
+            [telemetry]
+            otel_logs_endpoint = "http://127.0.0.1:9/v1/logs"
+            "#,
+    )
+    .unwrap();
+    let cfg = resolve_external_otel_config_with(
+        Some(&effective),
+        Some(&req),
+        ext_env(&[]),
+        ext_client(),
+        false,
+    )
+    .expect("stream active");
+    assert!(
+        !cfg.logs_endpoint.contains("127.0.0.1:9"),
+        "client-identity pin must hide unlisted file endpoints: {}",
+        cfg.logs_endpoint
+    );
+}
+#[test]
+fn external_otel_pin_logs_endpoint_keeps_that_signal() {
+    let req: toml::Value = toml::from_str(
+        r#"
+            [telemetry]
+            otel_enabled = true
+            otel_logs_exporter = "otlp"
+            otel_endpoint = "http://corp:4318"
+            otel_logs_endpoint = "http://logs:4318/v1/logs"
+            "#,
+    )
+    .unwrap();
+    let cfg = resolve_external_otel_config_with(
+        None,
+        Some(&req),
+        ext_env(&[(
+            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+            "http://127.0.0.1:9/v1/logs",
+        )]),
+        ext_client(),
+        false,
+    )
+    .expect("stream active");
+    assert_eq!(cfg.logs_endpoint, "http://logs:4318/v1/logs");
+}
+#[test]
+fn external_otel_pin_exporter_beats_none() {
+    let req: toml::Value = toml::from_str(
+        r#"
+            [telemetry]
+            otel_enabled = true
+            otel_logs_exporter = "otlp"
+            otel_endpoint = "http://corp:4318"
+            "#,
+    )
+    .unwrap();
+    let cfg = resolve_external_otel_config_with(
+        None,
+        Some(&req),
+        ext_env(&[("OTEL_LOGS_EXPORTER", "none")]),
+        ext_client(),
+        false,
+    )
+    .expect("pinned exporter must beat OTEL_LOGS_EXPORTER=none");
+    assert_eq!(
+        cfg.logs_exporter,
+        xai_grok_telemetry::external::config::ExporterSelection::Otlp
+    );
+}
+#[test]
+fn external_otel_omit_exporter_still_allows_none() {
+    let req: toml::Value = toml::from_str(
+        r#"
+            [telemetry]
+            otel_enabled = true
+            otel_endpoint = "http://corp:4318"
+            "#,
+    )
+    .unwrap();
+    assert!(
+        resolve_external_otel_config_with(
+            None,
+            Some(&req),
+            ext_env(&[
+                ("OTEL_LOGS_EXPORTER", "none"),
+                ("OTEL_METRICS_EXPORTER", "none")
+            ]),
+            ext_client(),
+            false,
+        )
+        .is_none(),
+        "omitted exporter stays env-overridable to none"
+    );
+}
+#[test]
+fn external_otel_pin_client_cert_strips_developer_endpoints() {
+    let req: toml::Value = toml::from_str(
+        r#"
+            [telemetry]
+            otel_enabled = true
+            otel_logs_exporter = "otlp"
+            otel_endpoint = "http://corp:4318"
+            otel_client_certificate = "/etc/ssl/client.crt"
+            otel_client_key = "/etc/ssl/client.key"
+            "#,
+    )
+    .unwrap();
+    let cfg = resolve_external_otel_config_with(
+        None,
+        Some(&req),
+        ext_env(&[("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:9")]),
+        ext_client(),
+        false,
+    )
+    .expect("stream active");
+    assert!(
+        cfg.logs_endpoint.starts_with("http://corp:4318"),
+        "{}",
+        cfg.logs_endpoint
+    );
+}
+#[test]
+fn external_otel_pin_ca_does_not_strip_endpoints() {
+    let req: toml::Value = toml::from_str(
+        r#"
+            [telemetry]
+            otel_enabled = true
+            otel_logs_exporter = "otlp"
+            otel_certificate = "/etc/ssl/corp-ca.pem"
+            "#,
+    )
+    .unwrap();
+    let cfg = resolve_external_otel_config_with(
+        None,
+        Some(&req),
+        ext_env(&[("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:4318")]),
+        ext_client(),
+        false,
+    )
+    .expect("CA-only pin must not lock destination");
+    assert!(
+        cfg.logs_endpoint.contains("127.0.0.1:4318"),
+        "{}",
+        cfg.logs_endpoint
+    );
+}
+#[test]
+fn external_otel_pin_ca_hides_unlisted_per_signal_cert_env() {
+    let req: toml::Value = toml::from_str(
+        r#"
+            [telemetry]
+            otel_enabled = true
+            otel_logs_exporter = "otlp"
+            otel_endpoint = "http://corp:4318"
+            otel_certificate = "/etc/ssl/corp-ca.pem"
+            "#,
+    )
+    .unwrap();
+    let cfg = resolve_external_otel_config_with(
+        None,
+        Some(&req),
+        ext_env(&[(
+            "OTEL_EXPORTER_OTLP_LOGS_CERTIFICATE",
+            "/tmp/decoy-logs-ca.pem",
+        )]),
+        ext_client(),
+        false,
+    )
+    .expect("stream active");
+    assert_eq!(
+        cfg.logs_ca_certificate.as_deref(),
+        Some("/etc/ssl/corp-ca.pem"),
+        "generic CA pin must hide OTEL_EXPORTER_OTLP_LOGS_CERTIFICATE"
+    );
+}
+#[test]
+fn external_otel_pin_assistant_beats_env() {
+    let req: toml::Value = toml::from_str(
+        r#"
+            [telemetry]
+            otel_enabled = true
+            otel_logs_exporter = "otlp"
+            otel_log_assistant_responses = false
+            "#,
+    )
+    .unwrap();
+    let cfg = resolve_external_otel_config_with(
+        None,
+        Some(&req),
+        ext_env(&[("OTEL_LOG_ASSISTANT_RESPONSES", "1")]),
+        ext_client(),
+        false,
+    )
+    .expect("stream active");
+    assert!(!cfg.gates.log_assistant_responses);
+}
+#[test]
+fn external_otel_pin_prompts_true_omitted_assistant_stays_off() {
+    let req: toml::Value = toml::from_str(
+        r#"
+            [telemetry]
+            otel_enabled = true
+            otel_logs_exporter = "otlp"
+            otel_log_user_prompts = true
+            "#,
+    )
+    .unwrap();
+    let cfg =
+        resolve_external_otel_config_with(None, Some(&req), ext_env(&[]), ext_client(), false)
+            .expect("stream active");
+    assert!(cfg.gates.log_user_prompts);
+    assert!(
+        !cfg.gates.log_assistant_responses,
+        "omitted sibling gate must default off across the requirements boundary"
+    );
+    assert!(!cfg.gates.log_tool_details);
+    assert!(
+        !cfg.gates.log_tool_content,
+        "omitted CONTENT sibling must default off across the requirements boundary"
+    );
+}
+/// Regression: an org enable via `[telemetry].otel_enabled`
+/// (managed config / requirements — no `GROK_EXTERNAL_OTEL` env var) must
+/// flip the master switch the *internal* pipeline keys off, so legacy
+/// `OTEL_EXPORTER_OTLP_*` repointing shuts off in lockstep with the
+/// external stream activating. A desync would point the internally-authed
+/// firehose at the customer collector while
+/// `internal_pipeline_consumed_otel_vars` blocks the external stream.
 #[test]
 fn external_otel_master_switch_resolves_from_all_layers() {
     let enabled_table: toml::Value = toml::from_str("[telemetry]\notel_enabled = true").unwrap();

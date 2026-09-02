@@ -45,6 +45,8 @@ fn gate_open(gates: &ContentGates, gate: Gate) -> bool {
     match gate {
         Gate::UserPrompts => gates.log_user_prompts,
         Gate::ToolDetails => gates.log_tool_details,
+        Gate::AssistantResponses => gates.log_assistant_responses,
+        Gate::ToolContent => gates.log_tool_content,
     }
 }
 

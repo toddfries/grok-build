@@ -173,6 +173,13 @@ impl ToolNotificationFrame {
 /// Maximum serialized size of a `system.notify` opaque payload.
 pub const MAX_SYSTEM_NOTIFY_PAYLOAD_BYTES: usize = 256 * 1024;
 
+/// How long the hub waits for a tool server to ack `session.bind` before
+/// failing the bind. Lives in the shared protocol crate so both sides of
+/// the contract reference one value: the hub's ws router uses it as its
+/// bind timeout, and tool servers size any work they do inside the bind
+/// (e.g. the workspace's MCP converge grace) to stay under it.
+pub const SESSION_BIND_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Body of a `system.notify` frame. `payload` is an opaque `SystemNotification`
 /// JSON value forwarded verbatim without decoding.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

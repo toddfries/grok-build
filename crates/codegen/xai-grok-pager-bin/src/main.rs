@@ -1929,6 +1929,9 @@ fn main() {
     }
     #[cfg(all(feature = "jemalloc", unix))]
     install_heap_profile_hooks();
+    unsafe {
+        xai_grok_shell::agent::external_otel_pin::strip_conflicting_process_env();
+    }
     xai_grok_pager::memory_trace::start(xai_grok_pager::memory_trace::default_dir());
     raise_fd_limit();
     if let Err(e) = xai_grok_config::validate_requirements() {

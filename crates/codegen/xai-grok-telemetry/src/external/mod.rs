@@ -2,8 +2,11 @@
 //!
 //! Enterprise customers point the Grok CLI at *their own* OpenTelemetry collector through the standard `OTEL_*` env vars.
 //! `GROK_EXTERNAL_OTEL` is the master switch.
-//! The stream carries a curated, ZDR-safe schema: ~6 counters and ~17 log-record events.
-//! They fan out from the same typed call sites that emit the product events ([`crate::session_ctx::log_event`]).
+//! The stream is independent of ZDR: it ships only to the customer's collector
+//! under an explicit double opt-in. Default content-free (~6 counters and ~17
+//! log-record events); `user.email` is identity, not a content gate.
+//! Events fan out from the same typed call sites that emit the product events
+//! ([`crate::session_ctx::log_event`]).
 //!
 //! Structural invariants (enforced by construction and tests):
 //! - The providers here are **never** registered with `opentelemetry::global`; the internal tracer provider owns the global slot.
@@ -41,15 +44,25 @@ static EXTERNAL: OnceLock<Option<Arc<ExternalTelemetry>>> = OnceLock::new();
 #[derive(Debug, Clone, Default)]
 pub struct IdentityAttrs {
     pub user_id: Option<String>,
+    /// OAuth/gateway email. Identity, not a content gate — attached whenever
+    /// present. Never filled from git, API-key, or deployment-key.
+    pub email: Option<String>,
     pub organization_id: Option<String>,
     pub team_id: Option<String>,
     pub deployment_id: Option<String>,
 }
 
 impl IdentityAttrs {
+    /// Copy principal ids from the snapshot. `user.id` follows whatever the
+    /// snapshot has (OIDC principal, or an API-key session that populated
+    /// `user_id`). Email is never taken from the snapshot — OAuth/gateway
+    /// only, filled by the shell after `from_snapshot`. Env-only API-key
+    /// (no `GrokAuth` session) has no principal; we do not invent a
+    /// per-install hash.
     pub fn from_snapshot(snapshot: &xai_grok_auth::CredentialSnapshot) -> Self {
         Self {
             user_id: snapshot.user_id.clone(),
+            email: None,
             organization_id: snapshot.organization_id.clone(),
             team_id: snapshot.team_id.clone(),
             deployment_id: snapshot.deployment_id.clone(),
@@ -113,6 +126,8 @@ struct ConfiguredMeta {
     protocol: String,
     prompts_gate: bool,
     details_gate: bool,
+    assistant_gate: bool,
+    content_gate: bool,
     source: &'static str,
 }
 
@@ -193,6 +208,8 @@ fn build_handle(cfg: ExternalOtelConfig) -> Option<Arc<ExternalTelemetry>> {
         },
         prompts_gate: cfg.gates.log_user_prompts,
         details_gate: cfg.gates.log_tool_details,
+        assistant_gate: cfg.gates.log_assistant_responses,
+        content_gate: cfg.gates.log_tool_content,
         source: cfg.enabled_source,
     };
 
@@ -358,6 +375,8 @@ pub(crate) fn set_identity_on(ext: &ExternalTelemetry, attrs: IdentityAttrs) {
             metrics_endpoint_origin: meta.metrics_endpoint_origin.clone(),
             prompts_gate: meta.prompts_gate,
             details_gate: meta.details_gate,
+            assistant_gate: meta.assistant_gate,
+            content_gate: meta.content_gate,
             source: meta.source.to_owned(),
         });
     });
@@ -376,7 +395,11 @@ pub fn apply_remote_policy(policy: ExternalOtelRemotePolicy) {
 pub(crate) fn apply_remote_policy_on(ext: &ExternalTelemetry, policy: ExternalOtelRemotePolicy) {
     if policy.lock_content_gates {
         let mut gates = ext.gates.write();
-        if gates.log_user_prompts || gates.log_tool_details {
+        if gates.log_user_prompts
+            || gates.log_tool_details
+            || gates.log_assistant_responses
+            || gates.log_tool_content
+        {
             *gates = ContentGates::default();
             drop(gates);
             crate::session_ctx::log_session_event(crate::events::ExternalOtelRemotePolicyApplied {
@@ -566,6 +589,8 @@ pub(crate) mod test_support {
                 protocol: "test".into(),
                 prompts_gate: gates.log_user_prompts,
                 details_gate: gates.log_tool_details,
+                assistant_gate: gates.log_assistant_responses,
+                content_gate: gates.log_tool_content,
                 source: "env",
             },
             meta_event_once: std::sync::Once::new(),

@@ -25,6 +25,7 @@ pub mod flows;
 pub mod host_clipboard;
 pub mod leader;
 pub mod pty;
+mod pty_spawn;
 pub mod results;
 pub mod scenarios;
 pub mod screen;

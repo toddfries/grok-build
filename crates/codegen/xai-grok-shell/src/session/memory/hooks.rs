@@ -44,7 +44,6 @@ pub enum SessionEndResult {
 
 /// Real user queries iff the conversation meets the session-end size gate (enough real prompts, enough total bytes).
 /// `None` for empty/brief sessions.
-/// Independent of `save_on_end` so exit dream can still consolidate prior logs when auto-save is off for a substantial session.
 pub(crate) fn queries_meeting_session_end_threshold(
     conversation: &[ConversationItem],
 ) -> Option<Vec<String>> {
@@ -55,7 +54,7 @@ pub(crate) fn queries_meeting_session_end_threshold(
         tracing::debug!(
             real_count = real_queries.len(),
             min = MIN_USER_MESSAGES,
-            "session too short for memory save/dream"
+            "session too short for memory save"
         );
         return None;
     }
@@ -64,7 +63,7 @@ pub(crate) fn queries_meeting_session_end_threshold(
         tracing::debug!(
             total_bytes,
             min = MIN_TOTAL_QUERY_BYTES,
-            "session content too brief for memory save/dream"
+            "session content too brief for memory save"
         );
         return None;
     }
@@ -396,7 +395,6 @@ mod tests {
         );
     }
 
-    /// Threshold is independent of `save_on_end` so exit dream can still run.
     #[test]
     fn test_conversation_meets_session_end_threshold_ignores_save_config() {
         let short = vec![make_user("hi"), make_assistant("hey")];

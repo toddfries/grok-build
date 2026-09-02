@@ -275,7 +275,12 @@ impl SessionActor {
         };
         // Claim the named front under one lock before teardown; a stale id (a new turn already promoted) is a no-op
         // Legacy (no id) uses the path below
-        let mut claimed_rewound: Option<(InputItem, TurnEpoch, usize)> = None;
+        let mut claimed_rewound: Option<(
+            InputItem,
+            TurnEpoch,
+            usize,
+            Vec<super::parent_message::ParentOwnedDelivery>,
+        )> = None;
         if let Some(requested) = requested_prompt_id.as_deref() {
             let mut state = self.state.lock().await;
             let front_prompt_id = state.pending_inputs.front().map(|f| f.prompt_id.clone());
@@ -313,10 +318,22 @@ impl SessionActor {
                     .get_prompt_index()
                     .await
                     .saturating_sub(1);
+                let binding =
+                    xai_message_delivery_core::TurnBinding::new(requested.to_owned(), turn_epoch);
+                let (message_completions, had_fallbacks) = self.transition_parent_messages(
+                    &mut state,
+                    xai_message_delivery_core::TerminalTarget::Turn(&binding),
+                    xai_message_delivery_core::TerminalCause::Rewind,
+                );
                 claimed_rewound = state
                     .pending_inputs
                     .pop_front()
-                    .map(|input| (input, turn_epoch, target_prompt_index));
+                    .map(|input| (input, turn_epoch, target_prompt_index, message_completions));
+                // Broadcast after pop_front so clients do not see the cut prompt
+                // still queued alongside the new parent-message fallback rows.
+                if had_fallbacks {
+                    self.broadcast_queue_changed(&state);
+                }
                 "rewound"
             } else if !state.rewindable {
                 // Window closed: fall through to a normal cancel of this front.
@@ -333,13 +350,23 @@ impl SessionActor {
         }
         // A claimed rewind owns only the old turn
         // The generic teardown targets whatever is running now and must not run; a new turn may already be promoted
-        if let Some((input, epoch, target_prompt_index)) = claimed_rewound {
+        if let Some((input, epoch, target_prompt_index, message_completions)) = claimed_rewound {
             let _strip_guard = self.prepare_image_strips_for_rewind().await;
             self.cancel_active_sampling_requests();
             self.cancel_pending_image_strips_for_rewind();
             self.notify_turn_abort(epoch, xai_agent_lifecycle::TurnAbortReason::Interrupted)
                 .await;
             let total_tokens = self.chat_state_handle.get_total_tokens().await;
+            let result = Ok(PromptTurnOk {
+                stop_reason: acp::StopReason::Cancelled,
+                total_tokens,
+                turn_snapshot: None,
+                completion_kind: PromptCompletionKind::Rewound,
+                structured_output: None,
+                usage: None,
+                tool_overrides: self.effective_tool_overrides(),
+            });
+            Self::settle_parent_message_completions(message_completions, &result);
             return self
                 .finish_rewound_cancel(
                     input,
@@ -466,6 +493,7 @@ impl SessionActor {
             rewound_input,
             had_queued_user_prompt,
             turn_epoch,
+            message_completions,
         ) = {
             let mut state = self.state.lock().await;
             debug_assert!(
@@ -552,6 +580,9 @@ impl SessionActor {
                     },
                 );
             }
+            // Binding of the task actually torn down here; rewinds keep it `None`
+            // so their terminal transition targets `All` (matching the cause).
+            let mut binding = None;
             let cancelled_prompt_id = if !identity_matches {
                 None
             } else if rewound_input.is_some() {
@@ -563,6 +594,10 @@ impl SessionActor {
                     if let Some(epoch) = turn_epoch {
                         self.abort_turn_task(task, epoch);
                     }
+                    binding = Some(xai_message_delivery_core::TurnBinding::new(
+                        task.prompt_id.clone(),
+                        task.epoch,
+                    ));
                     task.prompt_id.clone()
                 })
             } else {
@@ -570,6 +605,10 @@ impl SessionActor {
                     if let Some(epoch) = turn_epoch {
                         self.abort_turn_task(&task, epoch);
                     }
+                    binding = Some(xai_message_delivery_core::TurnBinding::new(
+                        task.prompt_id.clone(),
+                        task.epoch,
+                    ));
                     task.prompt_id
                 })
             };
@@ -609,6 +648,24 @@ impl SessionActor {
             // A cancel can also race ahead of `maybe_start_running_task`
             // Gating on `running_task` there would drop the front's `respond_to` and hang the client's `session/prompt` forever
             // The TUI spinner would never return to idle
+            let message_cause = if kill_background_tasks {
+                xai_message_delivery_core::TerminalCause::HardTeardown
+            } else if rewound_input.is_some() {
+                xai_message_delivery_core::TerminalCause::Rewind
+            } else {
+                xai_message_delivery_core::TerminalCause::SoftCancel
+            };
+            let message_target =
+                if message_cause == xai_message_delivery_core::TerminalCause::HardTeardown {
+                    xai_message_delivery_core::TerminalTarget::All
+                } else {
+                    binding.as_ref().map_or(
+                        xai_message_delivery_core::TerminalTarget::All,
+                        xai_message_delivery_core::TerminalTarget::Turn,
+                    )
+                };
+            let (message_completions, had_message_fallbacks) =
+                self.transition_parent_messages(&mut state, message_target, message_cause);
             let pending_inputs = if rewound_input.is_some() {
                 VecDeque::new()
             } else if kill_background_tasks {
@@ -641,6 +698,9 @@ impl SessionActor {
                 state.pending_inputs = kept;
                 cancelled
             };
+            if had_message_fallbacks {
+                self.broadcast_queue_changed(&state);
+            }
             // Whether a user prompt remains queued behind the just-cancelled turn
             // It distinguishes the next turn's redirect kind for telemetry
             // `queued_after_cancel` means a queued prompt is promoted; `cancel_then_send` means the user types a fresh prompt
@@ -657,6 +717,7 @@ impl SessionActor {
                 rewound_input,
                 had_queued_user_prompt,
                 turn_epoch,
+                message_completions,
             )
         };
         // True iff this cancel aborted a live task: the Keep-with-task rail and
@@ -819,11 +880,34 @@ impl SessionActor {
             let _strip_guard = self.prepare_image_strips_for_rewind().await;
             self.cancel_active_sampling_requests();
             self.cancel_pending_image_strips_for_rewind();
+            let result = Ok(PromptTurnOk {
+                stop_reason: acp::StopReason::Cancelled,
+                total_tokens,
+                turn_snapshot: None,
+                completion_kind: PromptCompletionKind::Rewound,
+                structured_output: None,
+                usage: None,
+                tool_overrides: self.effective_tool_overrides(),
+            });
+            Self::settle_parent_message_completions(message_completions, &result);
             return self
                 .finish_rewound_cancel(input, None, total_tokens, turn_stopped)
                 .await;
         }
 
+        let message_result = Ok(PromptTurnOk {
+            stop_reason: acp::StopReason::Cancelled,
+            total_tokens,
+            turn_snapshot: None,
+            completion_kind: PromptCompletionKind::Cancelled {
+                category: Some(crate::session::events::CancellationCategory::MidTurnAbort),
+                context: None,
+            },
+            structured_output: None,
+            usage: cancelled_usage.clone(),
+            tool_overrides: self.effective_tool_overrides(),
+        });
+        Self::settle_parent_message_completions(message_completions, &message_result);
         for (idx, input) in pending_inputs.into_iter().enumerate() {
             // idx 0 gets running-turn attribution only when this cancel tore
             // down a live task; a no-task cancel attests nothing about it.

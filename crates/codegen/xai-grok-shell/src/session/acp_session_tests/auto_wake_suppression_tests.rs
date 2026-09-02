@@ -107,6 +107,7 @@ fn pending_notification_cap_keeps_newest_entries() {
     let mut state = State {
         running_task: None,
         finalization_gate: Default::default(),
+        message_delivery: Default::default(),
         pending_inputs: std::collections::VecDeque::new(),
         edit_holds: HashMap::new(),
         pending_notifications: Vec::new(),
@@ -1685,6 +1686,62 @@ async fn state_is_busy_reflects_queued_inputs() {
                     "clearing the queue must return to not busy"
                 );
             }
+        })
+        .await;
+}
+#[tokio::test(flavor = "current_thread")]
+async fn is_busy_reflects_active_work() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _) =
+                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _) = tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+            let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            assert!(
+                !actor.is_busy().await,
+                "a fresh actor (no turn, no queue, no work) must not be busy"
+            );
+            let guard = crate::session::handle::WorkGuard::new(actor.active_work.clone());
+            assert!(
+                actor.is_busy().await,
+                "a work unit in flight must keep the session busy"
+            );
+            drop(guard);
+            assert!(
+                !actor.is_busy().await,
+                "dropping the last work unit returns to idle"
+            );
+        })
+        .await;
+}
+#[tokio::test(flavor = "current_thread")]
+async fn is_busy_reflects_parked_plan_approval() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _) =
+                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _) = tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+            let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            assert!(!actor.is_busy().await, "a fresh actor must not be busy");
+            actor.pending_interactions.lock().unwrap().insert(
+                "exit-plan-mode-resume".to_string(),
+                crate::session::pending_interaction::PendingKind::PlanApproval,
+            );
+            assert!(
+                actor.is_busy().await,
+                "a parked plan-approval must keep the session busy"
+            );
+            actor.pending_interactions.lock().unwrap().clear();
+            actor.pending_interactions.lock().unwrap().insert(
+                "perm-1".to_string(),
+                crate::session::pending_interaction::PendingKind::Permission,
+            );
+            assert!(
+                !actor.is_busy().await,
+                "a bare permission park must not by itself keep the session busy"
+            );
         })
         .await;
 }

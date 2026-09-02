@@ -270,12 +270,12 @@ pub const RESERVED_EVENT_KEYS: &[&str] = &[
     "footprint_bytes",
     "memory_limit_bytes",
     "uptime_secs",
-    "sessions_active",
-    "subagents_active",
-    "compaction_active",
-    "mcp_servers_connected",
-    "turns_active",
-    "workflow_runs_active",
+    crate::activity::SESSIONS_ACTIVE_KEY,
+    crate::activity::SUBAGENTS_ACTIVE_KEY,
+    crate::activity::COMPACTIONS_ACTIVE_KEY,
+    crate::activity::MCP_SERVERS_CONNECTED_KEY,
+    crate::activity::TURNS_ACTIVE_KEY,
+    crate::activity::WORKFLOW_RUNS_ACTIVE_KEY,
     "session_id",
     "turn_number",
 ];
@@ -623,7 +623,9 @@ mod tests {
         assert_eq!(normalize_tier("api_key"), "api_key");
     }
 
-    /// Every reserved key comes from serializing the structs that own the wire names, so the const cannot drift from them.
+    /// Enrichment and session keys derive from the struct that owns them;
+    /// activity-gauge keys are defined in their domain crates and enumerated at
+    /// runtime, so they are reserved here explicitly. The const must cover all.
     #[test]
     fn reserved_event_keys_derive_from_the_serialized_schema() {
         let enrichment = EventEnrichment {
@@ -656,12 +658,15 @@ mod tests {
             .cloned()
             .collect();
         expected.extend(
-            serde_json::to_value(crate::activity::ActivitySnapshot::read())
-                .unwrap()
-                .as_object()
-                .unwrap()
-                .keys()
-                .cloned(),
+            [
+                crate::activity::SESSIONS_ACTIVE_KEY,
+                crate::activity::SUBAGENTS_ACTIVE_KEY,
+                crate::activity::COMPACTIONS_ACTIVE_KEY,
+                crate::activity::MCP_SERVERS_CONNECTED_KEY,
+                crate::activity::TURNS_ACTIVE_KEY,
+                crate::activity::WORKFLOW_RUNS_ACTIVE_KEY,
+            ]
+            .map(String::from),
         );
         expected.extend(["session_id".to_string(), "turn_number".to_string()]);
 

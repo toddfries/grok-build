@@ -3243,6 +3243,39 @@ async fn get_last_assistant_text_in_turn_walks_past_synthetic_injections() {
 }
 
 #[tokio::test]
+async fn get_assistant_text_in_turn_concatenates_multi_round_bubbles() {
+    let h = TestHarness::new();
+    h.handle.push_user_message(ConversationItem::user("q"));
+    h.handle
+        .push_assistant_response(ConversationItem::assistant("first bubble"));
+    h.handle
+        .push_tool_result(ConversationItem::tool_result("call-1", "ok"));
+    h.handle
+        .push_assistant_response(ConversationItem::assistant("last bubble"));
+
+    assert_eq!(
+        h.handle.get_last_assistant_text_in_turn().await.as_deref(),
+        Some("last bubble"),
+        "last-bubble helper stays last-only"
+    );
+    assert_eq!(
+        h.handle.get_assistant_text_in_turn().await.as_deref(),
+        Some("first bubble\nlast bubble"),
+        "completed multi-round turn must export earlier bubbles, not only the last"
+    );
+}
+
+#[tokio::test]
+async fn get_assistant_text_in_turn_stops_at_boundary() {
+    let h = TestHarness::new();
+    h.handle.push_user_message(ConversationItem::user("q1"));
+    h.handle
+        .push_assistant_response(ConversationItem::assistant("previous turn"));
+    h.handle.push_user_message(ConversationItem::user("q2"));
+    assert!(h.handle.get_assistant_text_in_turn().await.is_none());
+}
+
+#[tokio::test]
 async fn get_last_assistant_text_no_assistant_messages() {
     let h = TestHarness::new();
     h.handle.push_user_message(ConversationItem::user("hi"));

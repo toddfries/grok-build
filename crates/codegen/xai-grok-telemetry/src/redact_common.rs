@@ -11,13 +11,18 @@ use std::borrow::Cow;
 /// Returns `Some` only when the input changed (owned, so callers can overwrite in place).
 pub(crate) fn redact_owned(input: &str) -> Option<String> {
     let secrets = xai_grok_secrets::redact_secrets(input);
-    match xai_grok_secrets::redact_user_paths(secrets.as_ref()) {
-        Cow::Owned(paths) => Some(paths),
+    let after = match xai_grok_secrets::redact_user_paths(secrets.as_ref()) {
+        Cow::Owned(paths) => paths,
         Cow::Borrowed(_) => match secrets {
-            Cow::Owned(s) => Some(s),
-            Cow::Borrowed(_) => None,
+            Cow::Owned(s) => s,
+            Cow::Borrowed(_) => return None,
         },
-    }
+    };
+    // `redact_secrets` returns `Cow::Owned` whenever its matcher hits, even
+    // when replacements are no-ops — a URL origin still matches `https://…`.
+    // The export validator treats `Some` as "still dirty" and drops the
+    // record, so a second pass on already-scrubbed text must be `None`.
+    if after == input { None } else { Some(after) }
 }
 
 /// Scrub a string, returning the (possibly unchanged) owned value.
@@ -88,6 +93,18 @@ mod tests {
     #[test]
     fn redact_owned_returns_none_when_clean() {
         assert_eq!(redact_owned("no secrets here"), None);
+    }
+
+    #[test]
+    fn redact_owned_is_idempotent_after_url_scrub() {
+        let once = redact_to_owned("see https://example.com/docs?token=CANARY");
+        assert!(once.contains("https://example.com"), "origin lost: {once}");
+        assert!(!once.contains("CANARY"), "query token survived: {once}");
+        assert_eq!(
+            redact_owned(&once),
+            None,
+            "already-scrubbed URL text must not look dirty to the export validator"
+        );
     }
 
     #[test]

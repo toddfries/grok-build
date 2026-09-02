@@ -13,6 +13,40 @@ fn make_auth(expires_at: Option<DateTime<Utc>>, create_time: DateTime<Utc>) -> G
         ..GrokAuth::test_default()
     }
 }
+/// The one-read classification must match what split `current()` /
+/// `is_expired()` reads report for a stable credential, and `Valid` must
+/// carry the token so callers never re-read.
+#[test]
+fn cached_token_state_truth_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = AuthManager::new(dir.path(), GrokComConfig::default());
+    assert!(
+        matches!(mgr.cached_token_state(), CachedTokenState::Missing),
+        "no credential must classify Missing"
+    );
+    mgr.hot_swap(GrokAuth {
+        key: "expired".into(),
+        auth_mode: AuthMode::Oidc,
+        refresh_token: Some("rt".into()),
+        expires_at: Some(Utc::now() - chrono::Duration::hours(1)),
+        ..GrokAuth::test_default()
+    });
+    assert!(
+        matches!(mgr.cached_token_state(), CachedTokenState::Expired),
+        "an expired credential must classify Expired"
+    );
+    mgr.hot_swap(GrokAuth {
+        key: "live".into(),
+        auth_mode: AuthMode::Oidc,
+        expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
+        ..GrokAuth::test_default()
+    });
+    let state = mgr.cached_token_state();
+    assert!(
+        matches!(&state, CachedTokenState::Valid(auth) if auth.key == "live"),
+        "a live credential must classify Valid and carry the token, got {state:?}"
+    );
+}
 #[test]
 fn expired_within_5min_buffer() {
     let auth = make_auth(Some(Utc::now() + Duration::minutes(4)), Utc::now());

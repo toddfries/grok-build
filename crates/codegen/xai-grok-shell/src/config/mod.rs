@@ -1109,6 +1109,39 @@ fn apply_requirements_inner(
     fn req_str<'a>(req: &'a toml::Value, section: &str, key: &str) -> Option<&'a str> {
         req.get(section)?.get(key)?.as_str()
     }
+    enum ReqStrArray {
+        Absent,
+        Value(Vec<String>),
+        Malformed,
+    }
+    fn req_str_array(req: &toml::Value, section: &str, key: &str) -> ReqStrArray {
+        let Some(value) = req.get(section).and_then(|s| s.get(key)) else {
+            return ReqStrArray::Absent;
+        };
+        let Some(arr) = value.as_array() else {
+            tracing::error!(
+                section,
+                key,
+                kind = value.type_str(),
+                "requirements value is not an array; the constraint fail-closes"
+            );
+            return ReqStrArray::Malformed;
+        };
+        let mut out = Vec::with_capacity(arr.len());
+        for item in arr {
+            let Some(s) = item.as_str() else {
+                tracing::error!(
+                    section,
+                    key,
+                    kind = item.type_str(),
+                    "requirements array entry is not a string; the constraint fail-closes"
+                );
+                return ReqStrArray::Malformed;
+            };
+            out.push(s.to_owned());
+        }
+        ReqStrArray::Value(out)
+    }
     let mut enforced: Vec<EnforcedField> = Vec::new();
     let mut push = |path: &'static str, value: String| {
         enforced.push(EnforcedField {
@@ -1242,8 +1275,37 @@ fn apply_requirements_inner(
             }
         };
     }
+    use crate::agent::config::AllowlistPin;
+    macro_rules! pin_str_array {
+        ($section:expr, $key:expr, $pin:expr) => {
+            match req_str_array(req, $section, $key) {
+                ReqStrArray::Absent => {}
+                ReqStrArray::Value(val) => {
+                    let reported = if val.is_empty() {
+                        "(unrestricted)".to_owned()
+                    } else {
+                        val.join(", ")
+                    };
+                    $pin.pin(AllowlistPin::List(val), source.clone());
+                    push(concat!($section, ".", $key), reported);
+                }
+                ReqStrArray::Malformed => {
+                    $pin.pin(AllowlistPin::FailClosed, source.clone());
+                    push(
+                        concat!($section, ".", $key),
+                        "(invalid; nothing selectable)".to_owned(),
+                    );
+                }
+            }
+        };
+    }
     enforce_str!("models", "default", config.models.default);
     enforce_str!("models", "web_search", config.models.web_search);
+    pin_str_array!(
+        "models",
+        "allowed_models",
+        config.requirements.allowed_models
+    );
     enforce_str!("cli", "channel", config.cli.channel);
     enforce_str!("cli", "minimum_version", config.cli.minimum_version);
     enforce_str!("cli", "maximum_version", config.cli.maximum_version);

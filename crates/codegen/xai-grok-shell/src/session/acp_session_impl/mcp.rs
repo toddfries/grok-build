@@ -199,7 +199,11 @@ impl SessionActor {
     ///
     /// Runs force_reauth (browser flow), then re-initializes the server and registers its tools.
     pub(super) async fn handle_mcp_auth_trigger(&self, server_name: &str) -> Result<(), String> {
-        let client = match self.mcp_state.lock().await.get_client(server_name).cloned() {
+        let existing_client = {
+            let state = self.mcp_state.lock().await;
+            state.get_client(server_name).cloned()
+        };
+        let client = match existing_client {
             Some(c) if c.has_auth() => c,
             _ => {
                 self.rebuild_http_client_with_oauth(server_name, McpOauthDiscovery::Network)
@@ -1664,7 +1668,9 @@ impl SessionActor {
                                     _ => xai_grok_telemetry::events::McpTransport::Http,
                                 };
                                 debug_assert!(
-                                    xai_grok_telemetry::activity::MCP_SERVERS_CONNECTED.get() >= 1,
+                                    xai_grok_telemetry::activity::gauge_value(
+                                        xai_grok_telemetry::activity::MCP_SERVERS_CONNECTED_KEY
+                                    ) >= 1,
                                     "McpServerConnected must stamp a self-inclusive count"
                                 );
                                 xai_grok_telemetry::session_ctx::log_event(
@@ -1725,6 +1731,7 @@ impl SessionActor {
                                         error_type: error_type_label,
                                         duration_ms: elapsed.as_millis() as u64,
                                         timeout_sec,
+                                        error_message: Some(e.to_string()),
                                     },
                                 );
                                 let transport_str = server_transport_map

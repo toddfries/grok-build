@@ -30,34 +30,48 @@ pub(crate) enum SessionLiveState {
     /// A load or resume is building the actor.
     Attaching,
 }
-/// `_meta` key carrying [`SessionHandle::scheduler_background_loops`] on the `session/new` and `session/load` responses.
+/// `_meta` key carrying [`SpawnSnapshot::scheduler_background_loops`] on the `session/new` and `session/load` responses.
 /// Defined here so the shell that publishes it and the clients that read it share one spelling.
 pub const SCHEDULER_BACKGROUND_LOOPS_META_KEY: &str = "x.ai/schedulerBackgroundLoops";
-/// Permission event receivers are returned separately from `spawn_session_actor` and should be stored/managed by the caller.
+/// Everything the `session/new` reply reads from session state; built before the actor task starts so the reply cannot wait on it.
+#[derive(Clone)]
+pub struct SpawnSnapshot {
+    pub applied_tool_overrides: Option<xai_grok_sampling_types::ToolOverrides>,
+    /// Whether this session's scheduled fires run as detached background subagents.
+    /// Copied from the value the spawn resolved for the session's [`AgentRebuildSpec`](crate::session::agent_rebuild::AgentRebuildSpec).
+    /// It is pinned for the session's whole life exactly like the fire side.
+    /// Published to clients on the `session/new` / `session/load` response.
+    /// Clients then describe the fires this session will actually get rather than re-resolving a setting that may have flipped since spawn.
+    pub scheduler_background_loops: bool,
+}
+pub(crate) struct WorkGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+impl WorkGuard {
+    pub(crate) fn new(active_work: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        active_work.fetch_add(1, std::sync::atomic::Ordering::Release);
+        Self(active_work)
+    }
+}
+impl Drop for WorkGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Release);
+    }
+}
 #[derive(Clone)]
 pub struct SessionHandle {
     pub cmd_tx: mpsc::UnboundedSender<SessionCommand>,
-    /// Persistence channel shared with the actor (used by extension handlers).
     pub(crate) persistence_tx: mpsc::UnboundedSender<PersistenceMsg>,
-    /// Current running prompt/turn id, if any.
-    ///
-    /// Shared with the session actor so external cancellation paths can target subagents launched by the active turn only.
+    /// Shared with the actor so external cancellation can target subagents launched by the active turn only.
     pub current_prompt_id: std::sync::Arc<std::sync::Mutex<Option<String>>>,
-    /// Open blocking reverse-requests (permission / question / plan-approval), keyed by `tool_call_id`.
-    /// Mirrors `current_prompt_id`: the same `Arc` is shared with the session actor, which inserts on issue and removes on resolve.
-    /// The roster reads this synchronously to report `NeedsInput`.
-    /// This is never persisted.
+    /// Shared `Arc` with the actor (insert on issue, remove on resolve); never persisted.
     pub pending_interactions: crate::session::pending_interaction::PendingInteractions,
-    /// Session info (id, cwd), cached for quick access without querying persistence
+    pub(crate) active_work: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     pub info: crate::session::info::Info,
-    /// Resolved turn limit for this session; lets a spawned subagent inherit the parent's limit.
     /// `None` means unlimited.
     pub max_turns: Option<usize>,
-    /// Configured cutoff a subagent inherits, published by the session actor. `None` when unset.
     pub resolved_tool_overrides:
         std::sync::Arc<arc_swap::ArcSwapOption<xai_grok_sampling_types::ToolOverrides>>,
+    pub spawn_snapshot: SpawnSnapshot,
     pub hunk_tracker_handle: HunkTrackerHandle,
-    /// Actor-based chat state handle; lets callers inspect final conversation state.
     pub chat_state_handle: xai_chat_state::ChatStateHandle,
     /// Handle to session signals (used for completion tracking)
     pub signals_handle: super::signals::SessionSignalsHandle,
@@ -96,12 +110,6 @@ pub struct SessionHandle {
     /// The model this session was created with (or switched to via setModel).
     /// Per-session tracking prevents cross-client contamination in leader mode where `MvpAgent.current_model_id` is shared mutable state.
     pub model_id: acp::ModelId,
-    /// Whether this session's scheduled fires run as detached background subagents.
-    /// Copied from the value the spawn resolved for the session's [`AgentRebuildSpec`](crate::session::agent_rebuild::AgentRebuildSpec).
-    /// It is pinned for the session's whole life exactly like the fire side.
-    /// Published to clients on the `session/new` / `session/load` response.
-    /// Clients then describe the fires this session will actually get rather than re-resolving a setting that may have flipped since spawn.
-    pub scheduler_background_loops: bool,
     pub reasoning_effort: Option<ReasoningEffort>,
     /// YOLO (auto-approve) mode for this session.
     /// Per-session tracking prevents cross-client contamination in leader mode where one client enabling YOLO could affect another client's sessions.
@@ -223,10 +231,6 @@ impl SessionHandle {
         }
         rx.await.unwrap_or(Err("session actor died".to_string()))
     }
-    /// Returns `true` if the session has work in flight: a running turn or queued inputs (`running_task.is_some() || !pending_inputs.is_empty()`).
-    ///
-    /// Used by the leader's idle-unload decision on client disconnect.
-    /// Falls back to `true` (conservative: keep the session resident, never unload) if the actor is unreachable.
     pub async fn is_busy(&self) -> bool {
         let (tx, rx) = oneshot::channel();
         if self

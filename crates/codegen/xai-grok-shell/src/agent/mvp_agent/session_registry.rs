@@ -213,6 +213,7 @@ pub(super) struct SessionCounts {
     pub(super) model_unavailable_sessions: usize,
     pub(super) dispatch_locks: usize,
     pub(super) live_orphan_heal_locks: usize,
+    pub(super) config_mutation_locks: usize,
     pub(super) session_turn_numbers: usize,
     pub(super) permission_event_receivers: usize,
     pub(super) session_index_claims: usize,
@@ -686,6 +687,17 @@ impl SessionRegistry {
                 .clone()
         })
     }
+    /// Serializes a session's model and reasoning-effort changes so they compose.
+    /// The handlers hold this for the whole change; see `handlers::model_switch`.
+    pub(super) fn config_mutation_lock(&self, id: &acp::SessionId) -> Arc<tokio::sync::Mutex<()>> {
+        self.edit(id, |e| {
+            e.retained
+                .get_or_insert_default()
+                .config_mutation_lock
+                .get_or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        })
+    }
     pub(super) fn set_permission_receiver(
         &self,
         id: &acp::SessionId,
@@ -753,6 +765,8 @@ impl SessionRegistry {
                 counts.dispatch_locks += usize::from(retained.dispatch_lock.is_some());
                 counts.live_orphan_heal_locks +=
                     usize::from(retained.live_orphan_heal_lock.is_some());
+                counts.config_mutation_locks +=
+                    usize::from(retained.config_mutation_lock.is_some());
                 counts.session_turn_numbers += usize::from(retained.turn_number.is_some());
                 counts.permission_event_receivers +=
                     usize::from(retained.permission_event_receiver.is_some());

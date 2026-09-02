@@ -205,6 +205,7 @@ impl HubHandle {
         tool_handlers: Vec<std::sync::Arc<dyn ToolServerHandler>>,
         server_metadata: Option<serde_json::Value>,
         session_handler_resolver: Option<xai_computer_hub_sdk::SessionHandlerResolver>,
+        on_session_unbound: Option<std::sync::Arc<xai_computer_hub_sdk::SessionUnboundCallback>>,
     ) -> Result<Self, ClientError> {
         let pool = HubConnectionPool::new();
         let server_url = config.url.clone();
@@ -258,6 +259,9 @@ impl HubHandle {
         }
         if let Some(resolver) = session_handler_resolver {
             server_builder = server_builder.session_handler_resolver(resolver);
+        }
+        if let Some(cb) = on_session_unbound {
+            server_builder = server_builder.on_session_unbound(move |sid| cb(sid));
         }
         let server = server_builder.build().await?;
         Ok(Self {

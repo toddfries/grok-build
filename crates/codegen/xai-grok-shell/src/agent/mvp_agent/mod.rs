@@ -521,6 +521,10 @@ pub(crate) struct PromptResponseMeta {
     pub structured_output_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_overrides: Option<xai_grok_sampling_types::ToolOverrides>,
+    /// Why this RPC resolved without becoming the running turn (`removedFromQueue`).
+    /// `None` for a turn that actually ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_kind: Option<String>,
 }
 /// A struct (not positional args) so call sites are self-documenting and adding a field can't silently reorder an existing one.
 pub(crate) struct PromptResponseMetaArgs<'a> {
@@ -535,6 +539,7 @@ pub(crate) struct PromptResponseMetaArgs<'a> {
     pub cancel_trigger: Option<String>,
     pub structured_output: Option<Result<serde_json::Value, String>>,
     pub tool_overrides: Option<xai_grok_sampling_types::ToolOverrides>,
+    pub completion_kind: Option<String>,
 }
 /// Includes baseline session/prompt/model identifiers plus optional per-turn token counts from the most recent `TokenUsage`.
 pub(crate) fn build_prompt_response_meta(
@@ -552,6 +557,7 @@ pub(crate) fn build_prompt_response_meta(
         cancel_trigger,
         structured_output,
         tool_overrides,
+        completion_kind,
     } = args;
     let (structured_output, structured_output_error) = match structured_output {
         Some(Ok(value)) => (Some(value), None),
@@ -575,6 +581,7 @@ pub(crate) fn build_prompt_response_meta(
         structured_output,
         structured_output_error,
         tool_overrides,
+        completion_kind,
     };
     serde_json::to_value(meta).expect("PromptResponseMeta is always serializable")
 }
@@ -610,6 +617,7 @@ struct SettingsUpdateNotification {
     group_tool_verbs: Option<bool>,
     collapsed_edit_blocks: Option<bool>,
     subscription_watch_interval_secs: Option<u64>,
+    dock_enabled: Option<bool>,
 }
 /// When the announcements push gate emits despite an unchanged visible list.
 #[derive(Clone, Copy, Debug)]
@@ -709,6 +717,10 @@ struct RetainedResources {
     /// Same `Arc` is cloned onto `ToolContext` at spawn.
     /// Released by `remove_session`.
     live_orphan_heal_lock: Option<std::sync::Arc<tokio::sync::Mutex<()>>>,
+    /// Serializes a session's model and reasoning-effort changes so overlapping
+    /// requests compose instead of racing the live sampling config.
+    /// See [`crate::agent::handlers::model_switch`]. Released by `remove_session`.
+    config_mutation_lock: Option<std::sync::Arc<tokio::sync::Mutex<()>>>,
     permission_event_receiver: Option<
         tokio::sync::mpsc::UnboundedReceiver<PermissionEvent>,
     >,
@@ -1376,6 +1388,7 @@ mod session_lifecycle;
 mod agent_ops;
 mod acp_agent;
 pub(crate) mod reasoning_effort;
+mod sampler_prewarm;
 mod session_setup;
 mod subagent_spawn;
 use session_registry::SessionRegistry;
@@ -2018,6 +2031,7 @@ impl MvpAgent {
                 collapsed_edit_blocks: rs.and_then(|s| s.collapsed_edit_blocks),
                 subscription_watch_interval_secs: rs
                     .and_then(|s| s.subscription_watch_interval_secs),
+                dock_enabled: rs.and_then(|s| s.dock_enabled),
             }
         };
         if let Ok(params) = serde_json::value::to_raw_value(&payload) {

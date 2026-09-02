@@ -1687,6 +1687,41 @@ async fn promote_queued_as_interjections_stops_at_send_now() {
         .await;
 }
 
+/// A follow-up queued behind an auto-wake must stay queued; Steer must not inject it into the wake.
+#[tokio::test]
+async fn promote_queued_as_interjections_skips_auto_wake() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            crate::util::config::set_follow_up_steer_cache(true);
+            let (actor, _rx) = build_actor().await;
+            {
+                let mut state = actor.state.lock().await;
+                state
+                    .pending_inputs
+                    .push_back(user_item("task-completed-bg-1", "A"));
+                state.pending_inputs.push_back(user_item("held", "A"));
+                state.running_task = Some(running_task_stub("task-completed-bg-1"));
+            }
+
+            actor.promote_queued_as_interjections().await;
+
+            let state = actor.state.lock().await;
+            let order: Vec<&str> = state
+                .pending_inputs
+                .iter()
+                .map(|i| i.prompt_id.as_str())
+                .collect();
+            assert_eq!(order, vec!["task-completed-bg-1", "held"]);
+            drop(state);
+            assert!(
+                actor.pending_interjections.is_empty(),
+                "auto-wake must not absorb a queued follow-up"
+            );
+        })
+        .await;
+}
+
 /// Product gate: with Steer off, a held plain row must not promote at a safe point (queue stays; no interjection in conversation).
 #[tokio::test]
 async fn drain_at_safe_point_with_steer_off_does_not_promote_held_row() {

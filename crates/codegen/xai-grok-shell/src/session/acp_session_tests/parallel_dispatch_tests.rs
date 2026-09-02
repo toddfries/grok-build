@@ -22,6 +22,7 @@ impl SubagentBackend for FixedActiveMessageBackend {
     async fn spawn(
         &self,
         _: SubagentRequest,
+        _: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<SubagentResult, xai_tool_runtime::ToolError> {
         Err(xai_tool_runtime::ToolError::custom(
             "unsupported",
@@ -56,12 +57,24 @@ impl SubagentBackend for FixedActiveMessageBackend {
 }
 
 fn active_message_call(id: &str, text: &str) -> crate::sampling::types::ToolCallResponse {
+    active_message_call_with_queue(id, text, None)
+}
+
+fn active_message_call_with_queue(
+    id: &str,
+    text: &str,
+    queue: Option<bool>,
+) -> crate::sampling::types::ToolCallResponse {
+    let mut arguments = serde_json::json!({ "subagent_id": "child", "text": text });
+    if let Some(queue) = queue {
+        arguments["queue"] = queue.into();
+    }
     crate::sampling::types::ToolCallResponse {
         id: id.to_owned(),
         kind: "function".to_owned(),
         function: crate::sampling::types::ToolCallFunction::new(
             "send_subagent_message",
-            serde_json::json!({ "subagent_id": "child", "text": text }).to_string(),
+            arguments.to_string(),
         ),
     }
 }
@@ -238,6 +251,24 @@ async fn generic_tool_completion_chokepoint_has_exact_active_message_cardinality
                 .await;
                 assert_eq!(active_message_event_names(&events), expected);
             }
+
+            let events = execute_with_captured_active_message_events(
+                &actor,
+                active_message_call_with_queue("queued", "follow up", Some(true)),
+            )
+            .await;
+            assert!(matches!(
+                events.as_slice(),
+                [
+                    crate::session::telemetry::ActiveAgentMessageEvent::Completed(
+                        xai_grok_telemetry::events::ActiveAgentMessageCompleted {
+                            requested_operation:
+                                xai_grok_telemetry::events::ActiveAgentMessageOperation::Queue,
+                            ..
+                        }
+                    )
+                ]
+            ));
 
             let events = execute_with_captured_active_message_events(
                 &actor,

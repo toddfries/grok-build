@@ -64,6 +64,8 @@ pub enum ContextualTipKind {
     SmallScreen,
     /// A double-click on the fold/nav path shows a tip to enable Word select in settings.
     WordSelect,
+    /// Three nearby drag-copies → tip naming /copy and /export.
+    ExportCopy,
     /// An SSH session without `grok wrap` shows a tip to wrap the ssh command locally.
     SshWrap,
 }
@@ -462,6 +464,10 @@ pub struct PlanModeToggled {
     pub trigger: PlanModeTrigger,
     pub turn_in_flight: bool,
     pub was_previously_active: bool,
+    /// Previous permission-mode label (`default` / `plan` / `bypass_permissions`)
+    /// for the external `from_mode` attr. `#[serde(skip)]`.
+    #[serde(skip)]
+    pub from_mode: Option<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -507,6 +513,10 @@ pub struct YoloToggled {
     pub enabled: bool,
     pub previous_state: bool,
     pub trigger: YoloTrigger,
+    /// Previous permission mode (`default` / `plan` / `bypass_permissions`).
+    /// `None` falls back to yolo-only derivation from `previous_state`.
+    #[serde(skip)]
+    pub from_mode: Option<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1176,6 +1186,10 @@ pub struct McpServerFailed {
     pub error_type: McpErrorType,
     pub duration_ms: u64,
     pub timeout_sec: u64,
+    /// Failure text for the external `error_message` attr (CONTENT gate).
+    /// `#[serde(skip)]`.
+    #[serde(skip)]
+    pub error_message: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1263,6 +1277,10 @@ pub struct PromptSubmitted {
     /// Dropped at external emit time unless the gate is on (then capped at 60 KB and secret-scrubbed).
     #[serde(skip)]
     pub prompt_text: Option<String>,
+    /// Slash/skill command name for the external `command_name` attr.
+    /// Always-on metadata (not user prompt text). `#[serde(skip)]`.
+    #[serde(skip)]
+    pub command_name: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1426,6 +1444,7 @@ pub struct ProcessResourceUsage {
     pub open_files: Option<u64>,
     pub resident_sessions: usize,
     pub session_threads: usize,
+    pub idle: bool,
 }
 
 #[derive(Serialize)]
@@ -1522,10 +1541,21 @@ pub struct ToolCallCompleted {
     /// Always reduced to `file_extension`; the full path rides the `OTEL_LOG_TOOL_DETAILS` gate.
     #[serde(skip)]
     pub file_path: Option<String>,
-    /// Tool parameters for the external stream's `OTEL_LOG_TOOL_DETAILS` gate **only** (`#[serde(skip)]`).
-    /// Reduced to 4 KB / depth 2 / 20 items at emit time.
+    /// Tool parameters for the external stream's `OTEL_LOG_TOOL_DETAILS`
+    /// 4 KB preview **and** `OTEL_LOG_TOOL_CONTENT` full `tool_input`
+    /// (`#[serde(skip)]`; reduced / capped at emit time).
     #[serde(skip)]
     pub parameters: Option<serde_json::Value>,
+    /// Tool-call id for the external stream (`#[serde(skip)]`; always-on
+    /// join key, not content).
+    #[serde(skip)]
+    pub tool_use_id: Option<String>,
+    /// Tool result body for `OTEL_LOG_TOOL_CONTENT` (`#[serde(skip)]`).
+    #[serde(skip)]
+    pub tool_output: Option<String>,
+    /// Failure text for `OTEL_LOG_TOOL_CONTENT` (`#[serde(skip)]`).
+    #[serde(skip)]
+    pub error_message: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1551,6 +1581,22 @@ pub struct ModelResponseReceived {
     /// USD ticks (1e10 ticks = $1); `None` when unpriced.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_usd_ticks: Option<i64>,
+}
+
+/// Assembled assistant **text** for the external stream. Emitted once per
+/// turn via [`crate::external::emit`] (not [`crate::session_ctx::log_event`]),
+/// so Mixpanel never receives `assistant_response`. Thinking/tool-use blocks
+/// are excluded at the source. `response_length` always exports on the
+/// external event; `response_text` is `#[serde(skip)]` and gated by
+/// `OTEL_LOG_ASSISTANT_RESPONSES`.
+#[derive(Serialize)]
+pub struct AssistantResponse {
+    /// Char/byte count of the assembled text blocks (always-on, like
+    /// `prompt_length`). Zero on tool-only turns.
+    pub response_length: usize,
+    /// Gated by `OTEL_LOG_ASSISTANT_RESPONSES`; omitted when length is 0.
+    #[serde(skip)]
+    pub response_text: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1598,6 +1644,7 @@ pub struct SessionEndTimings {
     pub total_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_save_ms: Option<u64>,
+    /// Intentionally unpopulated; retained because downstream metrics consumers still read this field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_consolidate_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2072,6 +2119,8 @@ pub struct ExternalOtelConfigured {
     pub metrics_endpoint_origin: String,
     pub prompts_gate: bool,
     pub details_gate: bool,
+    pub assistant_gate: bool,
+    pub content_gate: bool,
     /// Startup source of the master switch: `env` | `config`.
     pub source: String,
 }
@@ -2371,7 +2420,7 @@ telemetry_event!(
 telemetry_event!(SlashCommandUsed, "slash_command_used");
 telemetry_event!(PermissionPrompted, "permission_prompted");
 telemetry_event!(
-    PermissionDecisionPayload,
+    PermissionDecisionRecord,
     "permission_decision",
     external = crate::external::schema::map_tool_decision
 );
@@ -2501,6 +2550,11 @@ telemetry_event!(
     ModelResponseReceived,
     "model_response_received",
     external = crate::external::schema::map_api_request
+);
+telemetry_event!(
+    AssistantResponse,
+    "assistant_response",
+    external = crate::external::schema::map_assistant_response
 );
 telemetry_event!(MemoryFlushed, "memory_flushed");
 telemetry_event!(MediaGenerated, "media_generated");
@@ -2820,6 +2874,7 @@ mod tests {
                 open_files: None,
                 resident_sessions: 2,
                 session_threads: 3,
+                idle: false,
             })
             .unwrap(),
             serde_json::json!({
@@ -2827,6 +2882,7 @@ mod tests {
                 "allocated_bytes": 4_096,
                 "resident_sessions": 2,
                 "session_threads": 3,
+                "idle": false,
             })
         );
         assert_eq!(
@@ -2840,12 +2896,14 @@ mod tests {
                 open_files: None,
                 resident_sessions: 2,
                 session_threads: 3,
+                idle: false,
             })
             .unwrap(),
             serde_json::json!({
                 "trigger": "periodic",
                 "resident_sessions": 2,
                 "session_threads": 3,
+                "idle": false,
             })
         );
     }
@@ -2861,6 +2919,9 @@ mod tests {
                 tool_result_size_bytes: Some(2_048),
                 file_path: None,
                 parameters: None,
+                tool_use_id: None,
+                tool_output: None,
+                error_message: None,
             })
             .unwrap(),
             serde_json::json!({
@@ -2880,6 +2941,9 @@ mod tests {
                 tool_result_size_bytes: None,
                 file_path: None,
                 parameters: None,
+                tool_use_id: None,
+                tool_output: None,
+                error_message: None,
             })
             .unwrap(),
             serde_json::json!({

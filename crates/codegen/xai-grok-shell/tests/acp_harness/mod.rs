@@ -1,7 +1,7 @@
 //! Drives a real in-process `MvpAgent` over ACP on duplex pipes.
 //! This lives outside `tests/common/` because that compiles into every integration binary and would pull the transport stack into all of them.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use agent_client_protocol::{self as acp, Agent as _};
@@ -203,6 +203,7 @@ pub async fn new_session(
     .session_id
 }
 
+#[allow(dead_code)]
 pub async fn prompt_turn(
     conn: &acp::ClientSideConnection,
     session_id: &acp::SessionId,
@@ -244,14 +245,30 @@ fn set_test_env(grok_home: &std::path::Path, server_url: &str) {
     }
 }
 
-/// Runs `body` against a mock inference server with `GROK_HOME` isolated to a temp dir.
-/// `body` gets the cwd and the mock, and opens its own connection, since each test wants a different `acp::Client`.
-/// One `#[test]` per binary: the env is global.
+/// Runs `body` against a mock inference server with `GROK_HOME` isolated to a
+/// temp dir. `body` gets the cwd and the mock, and opens its own connection,
+/// since each test wants a different `acp::Client`.
 pub fn run_agent_test<F, Fut>(body: F)
 where
     F: FnOnce(std::path::PathBuf, std::rc::Rc<xai_grok_test_support::MockInferenceServer>) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
+    run_agent_test_with_models(
+        vec![xai_grok_test_support::MockModelEntry::new("test-model")],
+        body,
+    )
+}
+
+/// [`run_agent_test`] with a custom `/v1/models` catalog.
+#[allow(dead_code)]
+pub fn run_agent_test_with_models<F, Fut>(
+    models: Vec<xai_grok_test_support::MockModelEntry>,
+    body: F,
+) where
+    F: FnOnce(std::path::PathBuf, std::rc::Rc<xai_grok_test_support::MockInferenceServer>) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let _env_guard = hold_global_env();
     xai_grok_extra_ca::ensure_default_crypto_provider();
 
     // Own thread: agent startup blocks on a models prefetch and would starve the mock.
@@ -262,7 +279,7 @@ where
         .expect("mock runtime");
     let server = std::rc::Rc::new(
         mock_rt
-            .block_on(xai_grok_test_support::MockInferenceServer::start())
+            .block_on(xai_grok_test_support::MockInferenceServer::start_with_models(models))
             .expect("mock server"),
     );
     let grok_home = tempfile::TempDir::new().expect("grok home");
@@ -278,4 +295,12 @@ where
         workdir.path().to_path_buf(),
         std::rc::Rc::clone(&server),
     )));
+}
+
+fn hold_global_env() -> MutexGuard<'static, ()> {
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }

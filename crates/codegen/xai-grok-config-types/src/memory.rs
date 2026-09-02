@@ -377,7 +377,7 @@ pub struct MemoryDreamConfig {
     /// Seconds before a stale dream lock is reclaimed.
     pub stale_lock_secs: u64,
     /// Periodic dream check interval in seconds.
-    /// `None` disables it (dream only at session end or via /dream).
+    /// `None` disables it (dream only at launch or via /dream).
     /// When set, the session actor checks dream gates on this interval.
     pub check_interval_secs: Option<u64>,
 }

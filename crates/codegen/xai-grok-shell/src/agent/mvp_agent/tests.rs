@@ -1129,12 +1129,17 @@ fn make_test_handle(
         pending_interactions: std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::HashMap::new(),
         )),
+        active_work: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         info: crate::session::info::Info {
             id: acp::SessionId::new("test"),
             cwd: "/tmp".to_string(),
         },
         max_turns: None,
         resolved_tool_overrides: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+        spawn_snapshot: crate::session::SpawnSnapshot {
+            applied_tool_overrides: None,
+            scheduler_background_loops: true,
+        },
         hunk_tracker_handle,
         chat_state_handle: xai_chat_state::ChatStateHandle::noop(),
         signals_handle: crate::session::signals::SessionSignalsHandle::new(),
@@ -1156,7 +1161,6 @@ fn make_test_handle(
             std::sync::Arc::new(crate::terminal::LocalTerminalRunner),
         ),
         model_id: acp::ModelId::new(model),
-        scheduler_background_loops: true,
         reasoning_effort: None,
         yolo_mode: yolo,
         origin_client: client_id.map(|s| crate::http::OriginClientInfo {
@@ -2139,7 +2143,7 @@ async fn session_meta_publishes_the_sessions_pinned_scheduler_background_loops()
     let sid = acp::SessionId::new("loop-mode-sess");
     let mut handle = make_test_handle("test-model", false, None);
     handle.info.id = sid.clone();
-    handle.scheduler_background_loops = false;
+    handle.spawn_snapshot.scheduler_background_loops = false;
     agent.insert_resident(&sid, handle);
     let model_state = agent.model_state(Some(&sid));
     let mut meta = serde_json::Map::new();
@@ -4317,6 +4321,20 @@ fn spawn_fake_actor(
     });
     observed_rx
 }
+/// Spawn a session actor that answers `IsBusy` from a live `active_work` counter —
+/// the same check `SessionActor::is_busy` performs — so a real `WorkGuard` drives it.
+fn spawn_active_work_actor(
+    mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<TestSessionCommand>,
+    active_work: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    tokio::task::spawn_local(async move {
+        while let Some(cmd) = cmd_rx.recv().await {
+            if let TestSessionCommand::IsBusy { respond_to } = cmd {
+                let _ = respond_to.send(active_work.load(std::sync::atomic::Ordering::Acquire) > 0);
+            }
+        }
+    });
+}
 /// Drive `x.ai/internal/evict_sessions` through the real `ext_notification` handler path (not the internal helper).
 /// This matches how the leader server signals a client disconnect.
 async fn drive_disconnect(agent: &MvpAgent, sid: &acp::SessionId) {
@@ -4831,10 +4849,6 @@ fn disconnect_keeps_resident_when_actor_reports_busy() {
         );
     });
 }
-/// Here a session's ONLY outstanding work is a parked `PlanApproval` reverse-request (the resume re-park).
-/// The between-turns session must be kept resident on disconnect.
-/// The actor answers `IsBusy = false`, so the keep-resident outcome can come ONLY from the parked-approval sync fast path in `session_has_live_work`.
-/// Deleting that check would let this session unload (mutation-killing).
 #[test]
 fn disconnect_keeps_resident_when_plan_approval_parked() {
     run_local_for_bridge_test(|| async {
@@ -4864,6 +4878,32 @@ fn disconnect_keeps_resident_when_plan_approval_parked() {
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty)
             ),
             "a parked-approval session must not be sent Shutdown"
+        );
+    });
+}
+#[test]
+fn disconnect_keeps_the_workflow_session_and_evicts_the_idle_one() {
+    run_local_for_bridge_test(|| async {
+        let agent = build_minimal_agent_for_tests();
+        let workflow_sid = acp::SessionId::new("sess-workflow");
+        let (wf_handle, _wf_tx, wf_rx) = make_live_session_handle(&workflow_sid, None);
+        let active_work = wf_handle.active_work.clone();
+        agent.insert_resident(&workflow_sid, wf_handle);
+        spawn_active_work_actor(wf_rx, active_work.clone());
+        let _workflow = crate::session::handle::WorkGuard::new(active_work.clone());
+        let idle_sid = acp::SessionId::new("sess-idle");
+        let (idle_handle, _idle_tx, idle_rx) = make_live_session_handle(&idle_sid, None);
+        let idle_work = idle_handle.active_work.clone();
+        agent.insert_resident(&idle_sid, idle_handle);
+        spawn_active_work_actor(idle_rx, idle_work);
+        drive_disconnect_many(&agent, &[&workflow_sid, &idle_sid]).await;
+        assert!(
+            agent.is_resident(&workflow_sid),
+            "a session running a workflow must survive client disconnect (GBT-6282)"
+        );
+        assert!(
+            !agent.is_resident(&idle_sid),
+            "an idle session must be evicted on client disconnect"
         );
     });
 }

@@ -21,6 +21,9 @@ use serde::Serialize;
 use crate::auth::ForceLoginTeam;
 use xai_grok_tools::types::config_source::ConfigSource;
 use xai_grok_tools::util::truncate::estimate_tokens;
+use xai_grok_workspace::permission::resolution::{
+    ManagedSettingsFeatures, YoloPolicyLock, claude_bypass_lock_request,
+};
 
 const TREE: &str = "\u{2514}";
 
@@ -121,7 +124,7 @@ pub(crate) struct PermissionsReport {
     pub enforced: Vec<EnforcedPolicy>,
     /// A Claude managed-settings `disableBypassPermissionsMode` request, which grok
     /// deliberately does not enforce
-    /// ([`yolo_disabled_by_policy`](xai_grok_workspace::permission::resolution::yolo_disabled_by_policy)).
+    /// ([`claude_bypass_lock_request`](xai_grok_workspace::permission::resolution::claude_bypass_lock_request)).
     /// Always emitted so "no request" is distinguishable from an old binary.
     pub claude_bypass_lock_advisory: bool,
 }
@@ -134,8 +137,9 @@ pub(crate) struct EnforcedPolicy {
     pub setting: EnforcedSetting,
     /// The enforced value.
     pub enabled: bool,
-    /// Provenance label: the pinning requirements layer for alwaysApprove,
-    /// "managed-settings.json" for telemetry/feedback.
+    /// Provenance label: the full path of the policy file that set it
+    /// (requirements layer for alwaysApprove, managed-settings.json for
+    /// telemetry/feedback), or the diskless macOS MDM source id.
     pub source: String,
 }
 
@@ -612,19 +616,15 @@ async fn list_permissions(cwd: &Path, project_trusted: bool) -> PermissionsRepor
     // `source_path` is set only when the file was read and parsed successfully, so it signals "actually loaded" rather than merely present
     let managed_settings_active = ms.features.source_path.is_some();
 
-    // One pin read feeds both the enforced row and the resolver so the report
-    // can't contradict itself.
-    let yolo_lock = resolution::yolo_policy_lock();
-    let (enforced, claude_bypass_lock_advisory) =
-        permission_policy_rows(&ms.features, yolo_lock.as_ref());
-
-    let (sources, loaded, skipped) = match resolution::resolve_permissions_with_provenance_pinned(
-        cwd,
-        project_trusted,
-        yolo_lock.as_ref(),
-    )
-    .await
-    {
+    // The resolution carries the always-approve pin it applied, even when
+    // nothing resolves, so the enforced row and the resolved rules can't
+    // disagree about the pin. This covers only the pin: `ms.features` rows
+    // come from a separate `managed_settings()` read.
+    let resolution::ProvenanceResolution {
+        yolo_lock,
+        resolved,
+    } = resolution::resolve_permissions_with_provenance(cwd, project_trusted).await;
+    let (sources, loaded, skipped) = match resolved {
         Some(resolved) => {
             let mut sources: Vec<String> = resolved.sources.iter().map(|s| s.to_string()).collect();
             sources.dedup();
@@ -638,8 +638,13 @@ async fn list_permissions(cwd: &Path, project_trusted: bool) -> PermissionsRepor
                 .collect();
             (sources, resolved.config.rules.len(), skipped)
         }
+        // Nothing resolved: no rules, but the pin above still surfaces as an enforced row.
         None => (vec![], 0, vec![]),
     };
+    let PermissionPolicyReport {
+        enforced,
+        claude_bypass_lock_advisory,
+    } = permission_policy_report(&ms.features, yolo_lock.as_ref());
 
     PermissionsReport {
         sources,
@@ -655,13 +660,20 @@ async fn list_permissions(cwd: &Path, project_trusted: bool) -> PermissionsRepor
     }
 }
 
-/// Enforced rows + the Claude bypass-lock advisory flag. A Claude bypass-lock
-/// request must never appear as an enforced row — see
-/// [`PermissionsReport::claude_bypass_lock_advisory`].
-fn permission_policy_rows(
-    features: &xai_grok_workspace::permission::resolution::ManagedSettingsFeatures,
-    yolo_lock: Option<&xai_grok_workspace::permission::resolution::YoloPolicyLock>,
-) -> (Vec<EnforcedPolicy>, bool) {
+/// Enforced rows plus the Claude bypass-lock advisory flag.
+struct PermissionPolicyReport {
+    enforced: Vec<EnforcedPolicy>,
+    claude_bypass_lock_advisory: bool,
+}
+
+/// Build the managed-policy report: one enforced row per active clamp (the
+/// always-approve pin, telemetry, feedback) and the Claude bypass-lock
+/// advisory flag. A Claude bypass-lock request must never appear as an
+/// enforced row — see [`PermissionsReport::claude_bypass_lock_advisory`].
+fn permission_policy_report(
+    features: &ManagedSettingsFeatures,
+    yolo_lock: Option<&YoloPolicyLock>,
+) -> PermissionPolicyReport {
     let mut enforced = Vec::new();
     if let Some(lock) = yolo_lock {
         enforced.push(EnforcedPolicy {
@@ -670,12 +682,9 @@ fn permission_policy_rows(
             source: lock.source_label.clone(),
         });
     }
-    let mut claude_bypass_lock_advisory = false;
     if let Some(src) = &features.source_path {
-        let source = src
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "managed-settings.json".to_string());
+        // Full path, matching the alwaysApprove row's granularity.
+        let source = src.display().to_string();
         for (flag, setting) in [
             (features.disable_telemetry, EnforcedSetting::Telemetry),
             (features.disable_feedback, EnforcedSetting::Feedback),
@@ -688,9 +697,11 @@ fn permission_policy_rows(
                 });
             }
         }
-        claude_bypass_lock_advisory = features.disable_yolo == Some(true);
     }
-    (enforced, claude_bypass_lock_advisory)
+    PermissionPolicyReport {
+        enforced,
+        claude_bypass_lock_advisory: claude_bypass_lock_request(features),
+    }
 }
 
 /// Resolves the enterprise login-hardening knobs from the merged config (`[grok_com_config]`, the `[auth]` alias, and env overrides).
@@ -2055,8 +2066,10 @@ mod tests {
     /// enforced row.
     #[test]
     fn claude_bypass_lock_is_advisory_not_enforced() {
-        let (enforced, advisory) =
-            permission_policy_rows(&managed_features(Some(true), None, None), None);
+        let PermissionPolicyReport {
+            enforced,
+            claude_bypass_lock_advisory: advisory,
+        } = permission_policy_report(&managed_features(Some(true), None, None), None);
         assert!(advisory);
         assert!(
             enforced.is_empty(),
@@ -2064,14 +2077,17 @@ mod tests {
         );
 
         // Managed telemetry/feedback clamps ARE enforced and keep their rows.
-        let (enforced, advisory) =
-            permission_policy_rows(&managed_features(Some(true), Some(true), Some(true)), None);
+        let PermissionPolicyReport {
+            enforced,
+            claude_bypass_lock_advisory: advisory,
+        } = permission_policy_report(&managed_features(Some(true), Some(true), Some(true)), None);
         assert!(advisory);
         assert_eq!(enforced.len(), 2);
         assert_eq!(enforced[0].setting, EnforcedSetting::Telemetry);
         assert_eq!(enforced[1].setting, EnforcedSetting::Feedback);
-        assert_eq!(enforced[0].source, "managed-settings.json");
-        assert_eq!(enforced[1].source, "managed-settings.json");
+        // Same granularity as the alwaysApprove row: the full file path.
+        assert_eq!(enforced[0].source, "/etc/claude-code/managed-settings.json");
+        assert_eq!(enforced[1].source, "/etc/claude-code/managed-settings.json");
     }
 
     /// The enforced alwaysApprove row comes from grok's own requirements lock,
@@ -2081,9 +2097,12 @@ mod tests {
     fn requirements_lock_reports_always_approve_enforced() {
         let lock = xai_grok_workspace::permission::resolution::YoloPolicyLock {
             source_label: "/etc/grok/requirements.toml".to_string(),
-            reason: xai_grok_workspace::permission::resolution::YOLO_PIN_REASON_REQUIREMENTS,
+            reason: xai_grok_workspace::permission::resolution::YoloPinReason::DisableBypassPermissionsMode,
         };
-        let (enforced, advisory) = permission_policy_rows(&Default::default(), Some(&lock));
+        let PermissionPolicyReport {
+            enforced,
+            claude_bypass_lock_advisory: advisory,
+        } = permission_policy_report(&Default::default(), Some(&lock));
         assert!(!advisory);
         assert_eq!(enforced.len(), 1);
         assert_eq!(enforced[0].setting, EnforcedSetting::AlwaysApprove);
@@ -2091,8 +2110,10 @@ mod tests {
         assert_eq!(enforced[0].source, "/etc/grok/requirements.toml");
 
         // Both present: the real lock row + the advisory flag, no duplicate row.
-        let (enforced, advisory) =
-            permission_policy_rows(&managed_features(Some(true), None, None), Some(&lock));
+        let PermissionPolicyReport {
+            enforced,
+            claude_bypass_lock_advisory: advisory,
+        } = permission_policy_report(&managed_features(Some(true), None, None), Some(&lock));
         assert!(advisory);
         assert_eq!(enforced.len(), 1);
         assert_eq!(enforced[0].source, "/etc/grok/requirements.toml");
@@ -2104,10 +2125,13 @@ mod tests {
     fn mdm_pin_attributes_enforced_row_to_mdm_layer() {
         let lock = xai_grok_workspace::permission::resolution::YoloPolicyLock {
             source_label: crate::config::MDM_REQUIREMENTS_SOURCE.to_string(),
-            reason: xai_grok_workspace::permission::resolution::YOLO_PIN_REASON_REQUIREMENTS,
+            reason: xai_grok_workspace::permission::resolution::YoloPinReason::DisableBypassPermissionsMode,
         };
 
-        let (enforced, advisory) = permission_policy_rows(&Default::default(), Some(&lock));
+        let PermissionPolicyReport {
+            enforced,
+            claude_bypass_lock_advisory: advisory,
+        } = permission_policy_report(&Default::default(), Some(&lock));
         assert!(!advisory);
         assert_eq!(enforced.len(), 1);
         assert_eq!(enforced[0].setting, EnforcedSetting::AlwaysApprove);

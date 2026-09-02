@@ -682,6 +682,59 @@ fn validate_selectable_rejects_bad_allowlists() {
     assert!(validate_selectable(&zero, &catalog).is_err());
 }
 
+#[test]
+fn from_config_defers_validate_without_prefetch() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let mut cfg = config::Config::default();
+    cfg.requirements.allowed_models.pin(
+        crate::agent::config::AllowlistPin::List(vec!["nomatch-*".into()]),
+        crate::config::RequirementSource::Unknown,
+    );
+
+    let mgr = ModelsManager::from_config(&cfg, None, auth_manager)
+        .expect("cold start must not validate against built-ins-only");
+    assert!(
+        !mgr.has_fetched_real_catalog(),
+        "no prefetch means the first-fetch gate has not run"
+    );
+    assert!(
+        mgr.allowlist_excludes_all(),
+        "from_config must latch the prompt-path guard on a builtins-only miss"
+    );
+}
+
+#[test]
+fn set_session_model_fleet_deny_uses_organization_message() {
+    let raw: toml::Value = toml::from_str(
+        r#"
+            [models]
+            [model.grok-3]
+            model = "grok-3"
+            base_url = "https://api.x.ai/v1"
+            context_window = 256000
+            [model.grok-4]
+            model = "grok-4"
+            base_url = "https://api.x.ai/v1"
+            context_window = 256000
+            "#,
+    )
+    .unwrap();
+    let mut cfg = config::Config::new_from_toml_cfg(&raw).unwrap();
+    cfg.requirements.allowed_models.pin(
+        crate::agent::config::AllowlistPin::List(vec!["grok-4".into()]),
+        crate::config::RequirementSource::Unknown,
+    );
+    let catalog = resolve_model_catalog(&cfg, None);
+    assert!(!catalog["grok-3"].info.user_selectable);
+    let msg = allowlist_denied_message(&cfg);
+    assert!(
+        msg.contains("organization"),
+        "set_session_model /model gate must use the fleet deny string: {msg}"
+    );
+    assert!(!msg.contains("allowed_models"));
+}
+
 #[tokio::test]
 async fn refresh_if_new_etag_skips_when_same() {
     let mgr = test_manager();

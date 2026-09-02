@@ -48,14 +48,14 @@ pub mod worktree;
 pub use capability::CapabilityMode;
 pub use channel::{TransportCallResult, TransportContext, TransportError, TransportNotification};
 pub use config::{
-    AgentSessionConfig, DEFAULT_EVENT_BUFFER_CAPACITY, HookSourceConfig, IsolationMode,
-    MemoryConfig, SessionContextFactory, SessionTerminalBackend, WorkspaceConfig,
+    AgentSessionConfig, BindMcpConfig, DEFAULT_EVENT_BUFFER_CAPACITY, HookSourceConfig,
+    IsolationMode, MemoryConfig, SessionContextFactory, SessionTerminalBackend, WorkspaceConfig,
 };
 pub use error::{WorkspaceError, WorkspaceResult};
 pub use file_system::*;
 pub use handle::{
-    DrainOutcome, DrainReason, WorkspaceHandle, connect_local_workspace, resolve_workspace_home,
-    termination_grace_from_env,
+    DrainOutcome, DrainReason, LocalWorkspaceConnectOptions, WorkspaceHandle,
+    connect_local_workspace, resolve_workspace_home, termination_grace_from_env,
 };
 pub use hub::HubConfig;
 pub use path_virtualization::{

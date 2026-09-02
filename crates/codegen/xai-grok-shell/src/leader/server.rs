@@ -94,6 +94,59 @@ where
         ClientOutbound::Message(m) => write_message(writer, m).await,
     }
 }
+struct OutstandingModelSwitch {
+    request_id: String,
+    model: String,
+    seq: u64,
+}
+/// Resolves a client's `default_model` across overlapping switch requests. Each
+/// forwarded switch gets a rising sequence number, so a response that arrives
+/// late or is rejected never restores a model older than the client's most
+/// recent choice.
+#[derive(Default)]
+struct ModelSwitchTracker {
+    confirmed: Option<String>,
+    confirmed_seq: u64,
+    next_seq: u64,
+    outstanding: Vec<OutstandingModelSwitch>,
+}
+impl ModelSwitchTracker {
+    fn seed_confirmed(&mut self, model: Option<String>) {
+        self.confirmed = model;
+        self.confirmed_seq = 0;
+    }
+    fn record_forward(&mut self, request_id: String, model: String) {
+        self.next_seq += 1;
+        self.outstanding.push(OutstandingModelSwitch {
+            request_id,
+            model,
+            seq: self.next_seq,
+        });
+    }
+    fn resolve(&mut self, request_id: &str, accepted: bool) -> bool {
+        let Some(pos) = self
+            .outstanding
+            .iter()
+            .position(|switch| switch.request_id == request_id)
+        else {
+            return false;
+        };
+        let switch = self.outstanding.remove(pos);
+        if accepted && switch.seq > self.confirmed_seq {
+            self.confirmed = Some(switch.model);
+            self.confirmed_seq = switch.seq;
+        }
+        true
+    }
+    fn default_model(&self) -> Option<String> {
+        self.outstanding
+            .iter()
+            .filter(|switch| switch.seq > self.confirmed_seq)
+            .max_by_key(|switch| switch.seq)
+            .map(|switch| switch.model.clone())
+            .or_else(|| self.confirmed.clone())
+    }
+}
 struct ClientState {
     tx: AsyncSender<ClientOutbound>,
     mode: ClientMode,
@@ -108,6 +161,7 @@ struct ClientState {
     /// Patch the next response's `modelState.currentModelId` to match `default_model`.
     /// Set on outbound `initialize`, cleared after patching the response.
     patch_initialize_model: bool,
+    model_switches: ModelSwitchTracker,
     /// Whether this client has completed IPC registration.
     /// Only registered clients are counted in `client_count`.
     /// Pre-registration connections (which may time out) must not inflate the count and block auto-updates.
@@ -883,6 +937,29 @@ fn extract_model_id_from_set_model(json: &serde_json::Value) -> Option<String> {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
 }
+fn extract_model_id_from_set_config_option(json: &serde_json::Value) -> Option<String> {
+    let method = json.get("method")?.as_str()?;
+    if method != AGENT_METHOD_NAMES.session_set_config_option {
+        return None;
+    }
+    let params = json.get("params")?;
+    let config_id = params
+        .get("configId")
+        .or_else(|| params.get("config_id"))?
+        .as_str()?;
+    if config_id != crate::agent::session_config::CONFIG_ID_MODEL {
+        return None;
+    }
+    let value = params.get("value")?;
+    let model = if let Some(bare) = value.as_str() {
+        Some(bare)
+    } else if value.get("type").and_then(|t| t.as_str()) == Some("boolean") {
+        None
+    } else {
+        value.get("value").and_then(|inner| inner.as_str())
+    };
+    model.filter(|s| !s.is_empty()).map(str::to_string)
+}
 fn cpu_profile_status_payload(status: CpuProfileStatus) -> ControlPayload {
     match status {
         CpuProfileStatus::Inactive => ControlPayload::CpuProfileStatus {
@@ -1084,16 +1161,16 @@ async fn handle_workspace_start(
         cwd_path.clone(),
         url,
         auth,
-        Some(metadata),
-        Some(server_id),
-        alpha_test_key,
-        allow_insecure_ws,
-        status_config,
-        upload_queue_enabled,
-        project_lsp_trusted,
-        None,
-        false,
-        false,
+        xai_grok_workspace::LocalWorkspaceConnectOptions {
+            metadata: Some(metadata),
+            server_id: Some(server_id),
+            alpha_test_key,
+            allow_insecure_ws,
+            status_config,
+            upload_queue_enabled,
+            project_lsp_trusted,
+            ..Default::default()
+        },
     )
     .await
     .map_err(|e| workspace_err(format!("failed to connect workspace to hub: {e}")))?;
@@ -1542,6 +1619,7 @@ pub async fn run_leader_server(
                             client_type: String::new(),
                             initialize_seen: false,
                             patch_initialize_model: false,
+                            model_switches: ModelSwitchTracker::default(),
                             registered: false,
                         },
                     );
@@ -1561,6 +1639,9 @@ pub async fn run_leader_server(
                 ServerEvent::Registered(id, mode, capabilities, client_type) => {
                     if let Some(client) = clients.get_mut(&id) {
                         client.mode = mode;
+                        client
+                            .model_switches
+                            .seed_confirmed(capabilities.default_model.clone());
                         client.capabilities = capabilities;
                         client.client_type = client_type;
                         client.registered = true;
@@ -1784,6 +1865,7 @@ pub async fn run_leader_server(
                             &mut session_driver,
                         );
                     }
+                    let mut pending_new_model: Option<String> = None;
                     if let (Some(json), Some(client)) = (json.as_ref(), clients.get_mut(&id)) {
                         if let Some(yolo_mode) = extract_yolo_mode_change(json) {
                             client.capabilities.yolo_mode = yolo_mode;
@@ -1799,9 +1881,10 @@ pub async fn run_leader_server(
                                 auto_mode, "Updated client auto_mode from notification"
                             );
                         }
-                        if let Some(new_model) = extract_model_id_from_set_model(json) {
-                            debug!(client_id = id.0, model = %new_model, "Updated client default_model from session/setModel");
-                            client.capabilities.default_model = Some(new_model);
+                        if let Some(new_model) = extract_model_id_from_set_model(json)
+                            .or_else(|| extract_model_id_from_set_config_option(json))
+                        {
+                            pending_new_model = Some(new_model);
                         }
                     }
                     if let (Some(json), Some(client)) = (json.as_mut(), clients.get_mut(&id)) {
@@ -1841,6 +1924,15 @@ pub async fn run_leader_server(
                     {
                         pending_load_by_req.insert(ns_id.clone(), (id, load_sid.clone()));
                         load_live_buffer.entry((id, load_sid)).or_default();
+                    }
+                    if let Some(new_model) = pending_new_model
+                        && let Some((ns_id, _)) = rewritten.as_ref()
+                        && let Some(client) = clients.get_mut(&id)
+                    {
+                        client
+                            .model_switches
+                            .record_forward(ns_id.clone(), new_model);
+                        client.capabilities.default_model = client.model_switches.default_model();
                     }
                     if rewritten.is_some() {
                         pending_requests += 1;
@@ -1898,6 +1990,12 @@ pub async fn run_leader_server(
                             client_id = client_id.0,
                             session_id, "Subscribed client to session from response"
                         );
+                    }
+                    if client
+                        .model_switches
+                        .resolve(raw_response_id, json.get("result").is_some())
+                    {
+                        client.capabilities.default_model = client.model_switches.default_model();
                     }
                     if client.patch_initialize_model {
                         client.patch_initialize_model = false;

@@ -35,6 +35,9 @@ pub(crate) struct SessionMemory {
     pub compaction_recovery_count: AtomicU64,
     /// Total memory chunks added across all sources.
     pub chunks_added: Arc<AtomicU64>,
+    /// Handle to the startup reindex+embed task, taken and awaited by the launch dream. `None`
+    /// once taken, or when memory was not indexed at launch.
+    pub init_reindex_handle: RefCell<Option<tokio::task::JoinHandle<()>>>,
     /// autoDream consolidation config.
     pub dream_config: crate::config::MemoryDreamConfig,
     pub dream_count: AtomicU64,
@@ -123,6 +126,14 @@ impl SessionMemory {
             embed_dims,
         )
         .ok()
+    }
+
+    /// Await the startup reindex+embed task if it is still tracked; `None` returns at once.
+    pub(crate) async fn await_init_reindex(&self) {
+        let handle = self.init_reindex_handle.borrow_mut().take();
+        if let Some(handle) = handle {
+            let _ = handle.await;
+        }
     }
 
     /// Reindex a file and embed new chunks when embedding is configured.

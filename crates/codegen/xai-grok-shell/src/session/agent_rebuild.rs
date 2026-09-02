@@ -121,7 +121,7 @@ pub(crate) struct AgentRebuildSpec {
     pub respect_gitignore: bool,
     pub path_not_found_hints: bool,
     /// Fire side of the scheduler mode.
-    /// The spawn copies the same resolution onto [`SessionHandle::scheduler_background_loops`](crate::session::SessionHandle), which clients read.
+    /// The spawn copies the same resolution onto [`SpawnSnapshot::scheduler_background_loops`](crate::session::SpawnSnapshot), which clients read.
     /// Keep the two on one resolve.
     pub scheduler_background_loops: bool,
     pub mcp_state: Arc<tokio::sync::Mutex<crate::session::mcp_servers::McpState>>,

@@ -154,6 +154,9 @@ pub(super) fn handle_settings_update(notif: &acp::ExtNotification, app: &mut App
             app.apply_voice_mode_enabled(false);
         }
     }
+    if let Some(remote_v) = update.dock_enabled {
+        crate::views::dock::set_enabled(crate::app::resolve_dock_enabled(Some(remote_v)));
+    }
     if let Some(remote_v) = update.voice_mode_enabled {
         let v = crate::app::resolve_voice_mode_live(Some(remote_v), app.is_api_key_auth);
         if !v {
@@ -505,6 +508,8 @@ pub(super) struct PagerSettingsUpdate {
     privacy_banner_reshow_days: Option<u64>,
     #[serde(default)]
     voice_mode_enabled: Option<bool>,
+    #[serde(default)]
+    dock_enabled: Option<bool>,
     #[serde(default)]
     session_picker_grouped: Option<bool>,
     #[serde(default)]

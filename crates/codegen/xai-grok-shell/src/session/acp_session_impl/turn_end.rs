@@ -257,6 +257,13 @@ impl SessionActor {
                 })),
             );
         }
+        let binding = xai_message_delivery_core::TurnBinding::new(prompt_id.clone(), epoch);
+        let (message_completions, had_message_fallbacks) = self.transition_parent_messages(
+            &mut state,
+            xai_message_delivery_core::TerminalTarget::Turn(&binding),
+            xai_message_delivery_core::TerminalCause::Completion,
+        );
+        broadcast_queue |= had_message_fallbacks;
         // Owned (dequeued at the front) completions only
         // The unknown-prompt branch above is a stale completion the Cancel path already finalized, and `RemovedFromQueue` never ran
         let finalizes_turn = owned_completion
@@ -319,8 +326,9 @@ impl SessionActor {
                 self.persist_plan_mode_state();
             }
         }
-        // Drop the state guard before the async emit so the persist and broadcast work does not run under the state lock
+        // Drop the state guard before sends and async emits.
         drop(state);
+        Self::settle_parent_message_completions(message_completions, &result);
 
         if let Some(held) = held_rows_notice {
             self.send_hook_annotation(&format!(

@@ -176,6 +176,8 @@ pub use prompt_stash::{PromptStashEntry, StashCause};
 mod queue;
 mod render;
 pub use render::AppRenderParams;
+#[cfg(test)]
+mod dock_input_tests;
 mod rewind;
 mod selection;
 mod session;
@@ -936,9 +938,9 @@ pub struct AgentView {
     /// Sticky: render enforces the queue overlay's visibility from this each
     /// frame, so the queue's auto-show can't re-open a manual collapse.
     pub dock_queued_expanded: bool,
-    /// Set each render: dock enabled, terminal tall enough, ≥1 non-empty
-    /// section. Key handling reads it so `Ctrl+G` only focuses the dock when it
-    /// exists (and short terminals fall back to the tasks pane).
+    /// Last frame: dock replaced Tasks/Queue, even if every section is empty.
+    pub dock_on: bool,
+    /// Last frame: dock painted (`dock_on` and ≥1 non-empty section).
     pub dock_shown: bool,
     /// Current mode of the prompt widget (normal vs editing a queued prompt).
     pub prompt_mode: PromptMode,
@@ -1126,9 +1128,12 @@ pub struct AgentView {
     /// completion, double-click, or triple-click. Cleared on next click
     /// elsewhere, Escape, or navigation.
     pub persistent_text_selection: Option<PersistentTextSelection>,
-    /// Table geometry backing a table-shaped drag / persistent selection,
-    /// keyed to that selection; ignored when the key doesn't match.
+    /// Table geometry for the held highlight. Not shared with an in-progress drag.
     pub table_selection_geometry: Option<TableSelectionGeometry>,
+    /// Table geometry for the active drag. A `/btw` drag must not steal the held slot.
+    pub drag_table_geometry: Option<TableSelectionGeometry>,
+    /// Wrap width the `/btw` selection was armed against. A mismatch invalidates it.
+    pub btw_selection_wrap_width: Option<u16>,
     /// Timestamp when the current persistent selection was created.
     /// Used for auto-dismissal after a configurable timeout.
     pub selection_created_at: Option<Instant>,
@@ -1368,6 +1373,7 @@ pub struct AgentView {
     /// repeated-selection-attempt signal that fires the word-select tip;
     /// lone double-clicks (habitual folders) never tip.
     pub(crate) last_word_select_probe: Option<Instant>,
+    pub(crate) export_copy_detector: crate::tips::export_copy::ExportCopyDetector,
     /// Persistent status line (e.g. mouse reporting off). Survives transient
     /// toasts, keypress dismissal, and subagent open/close when propagated
     /// via [`Self::set_sticky_toast_recursive`].

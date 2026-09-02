@@ -275,6 +275,41 @@ fn ext_method_no_client(err: &acp::Error) -> bool {
         Some(xai_acp_lib::AcpChannelFailure::SendFailed)
     )
 }
+/// CONTENT-gated tool bodies for the external stream. Capture-time cap so
+/// multi-MB bodies are not retained; emit still drops them when CONTENT is off.
+fn external_tool_bodies(
+    result: &Result<ToolRunResult, xai_tool_runtime::ToolError>,
+) -> (Option<String>, Option<String>) {
+    match result {
+        Ok(tool_result) if tool_result.output.is_error() => {
+            let body = tool_result.output.to_prompt_format();
+            (
+                Some(xai_grok_telemetry::external::truncate::cap_bytes(
+                    &body,
+                    xai_grok_telemetry::external::truncate::MAX_CONTENT_BYTES,
+                )),
+                Some(xai_grok_telemetry::external::truncate::cap_bytes(
+                    &body,
+                    xai_grok_telemetry::external::truncate::MAX_TOOL_INPUT_JSON_BYTES,
+                )),
+            )
+        }
+        Ok(tool_result) => (
+            Some(xai_grok_telemetry::external::truncate::cap_bytes(
+                &tool_result.output.to_prompt_format(),
+                xai_grok_telemetry::external::truncate::MAX_CONTENT_BYTES,
+            )),
+            None,
+        ),
+        Err(e) => (
+            None,
+            Some(xai_grok_telemetry::external::truncate::cap_bytes(
+                &e.to_string(),
+                xai_grok_telemetry::external::truncate::MAX_TOOL_INPUT_JSON_BYTES,
+            )),
+        ),
+    }
+}
 /// Model-facing turn injected after a resumed plan is approved.
 const PLAN_APPROVED_IMPLEMENT_MESSAGE: &str =
     "The user approved the plan. Implement the plan in plan.md.";
@@ -949,13 +984,32 @@ impl SessionActor {
             };
             let tool_failed = match &result {
                 Ok(tool_result) => {
-                    crate::session::telemetry::record_completed_tool_output(
-                        &tool_result.output,
-                        duration_ms,
-                    );
+                    if let ToolsToolOutput::SendSubagentMessage(_) = &tool_result.output {
+                        let requested_operation = if prepared
+                            .parsed_args
+                            .get("queue")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false)
+                        {
+                            xai_grok_tools::implementations::grok_build::task::types::ActiveAgentMessageOperation::Queue
+                        } else {
+                            xai_grok_tools::implementations::grok_build::task::types::ActiveAgentMessageOperation::Steer
+                        };
+                        crate::session::telemetry::record_completed_tool_output(
+                            &tool_result.output,
+                            requested_operation,
+                            duration_ms,
+                        );
+                    }
                     tool_result.output.is_error()
                 }
                 Err(_) => true,
+            };
+            let (ext_tool_output, ext_error_message) = if xai_grok_telemetry::external::is_active()
+            {
+                external_tool_bodies(&result)
+            } else {
+                (None, None)
             };
             let tool_loop = match result {
                 Ok(tool_result) => {
@@ -1137,6 +1191,10 @@ impl SessionActor {
                     tool_result_size_bytes,
                     file_path: ext_file_path,
                     parameters: ext_parameters,
+                    tool_use_id: xai_grok_telemetry::external::is_active()
+                        .then(|| prepared.call_id.clone()),
+                    tool_output: ext_tool_output,
+                    error_message: ext_error_message,
                 },
             );
             if let Some(artifact) = compaction_artifact_read(&prepared.parsed_args) {
@@ -1651,16 +1709,28 @@ impl SessionActor {
                 wait_ms = resolved.wait_ms as i64,
             )
             .in_scope(|| {});
-            xai_grok_telemetry::session_ctx::log_event(
-                crate::session::telemetry::permission_decision_payload(
+            xai_grok_telemetry::session_ctx::log_event({
+                let payload = crate::session::telemetry::permission_decision_payload(
                     canonical_permission_tool_name,
                     telemetry_access_kind,
                     &decision,
                     subagent_session_id.clone(),
                     manager_event.as_ref(),
                     resolved,
-                ),
-            );
+                );
+                let tool_input = if xai_grok_telemetry::external::is_active() {
+                    xai_grok_telemetry::events::ExternalToolInput {
+                        parameters: Some(raw_input.clone()),
+                        tool_use_id: Some(call.id.clone()),
+                    }
+                } else {
+                    xai_grok_telemetry::events::ExternalToolInput::default()
+                };
+                xai_grok_telemetry::events::PermissionDecisionRecord {
+                    payload,
+                    tool_input,
+                }
+            });
             match decision {
                 Decision::PolicyDeny(ref reason) | Decision::Reject(ref reason) => {
                     let is_policy_deny = matches!(&decision, Decision::PolicyDeny(_));

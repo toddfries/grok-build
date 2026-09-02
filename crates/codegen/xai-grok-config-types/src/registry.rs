@@ -46,6 +46,8 @@ pub enum Feature {
     /// Send model-authored follow-ups to an owned active descendant.
     ActiveAgentMessages,
     RepoStatusInSystemPrompt,
+    /// Consolidated panel dock above the prompt (Subagents / Tasks / Watchers / Queued).
+    Dock,
 }
 
 /// How one feature is written on each surface it can be set from.
@@ -226,6 +228,14 @@ pub const FEATURES: &[FeatureSpec] = &[
         env: "GROK_REPO_STATUS_IN_SYSTEM_PROMPT",
         default_enabled: true,
         remote: Some(|settings| settings.repo_status_in_system_prompt),
+    },
+    FeatureSpec {
+        id: Feature::Dock,
+        key: "dock",
+        path: "features.dock",
+        env: "GROK_DOCK",
+        default_enabled: false,
+        remote: Some(|settings| settings.dock_enabled),
     },
 ];
 

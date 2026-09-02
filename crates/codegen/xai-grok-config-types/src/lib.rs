@@ -603,6 +603,13 @@ pub struct RemoteSettings {
     /// There is no CLI override. See `session::acp_session::resolve_reminder_policy`.
     #[serde(default)]
     pub todo_gate_max_fires_per_prompt: Option<u32>,
+    /// Length-salvage continue budget for `max_tokens`-truncated turns.
+    /// `Some(0)` is explicit off and kills every tier, including the
+    /// always-on cursor one and the `GROK_LENGTH_SALVAGE` env opt-in.
+    /// Otherwise: cursor tier > env opt-in > this field > off. See
+    /// `session::acp_session_impl::length_salvage`.
+    #[serde(default)]
+    pub length_salvage_budget: Option<u32>,
     #[serde(default)]
     pub auto_wake_enabled: Option<bool>,
     #[serde(default)]
@@ -881,6 +888,11 @@ pub struct RemoteSettings {
     /// `GROK_VOICE_MODE` overrides it locally. The free-tier SuperGrok upsell is a separate client tier gate.
     #[serde(default)]
     pub voice_mode_enabled: Option<bool>,
+    /// Consolidated panel dock above the prompt. Off when absent.
+    /// `Some(true)` from `grok_build_settings.dock_enabled` turns it on for the targeted cohort.
+    /// `GROK_DOCK` (or the older `GROK_DOCK_V2`) overrides it locally.
+    #[serde(default)]
+    pub dock_enabled: Option<bool>,
     /// Whether ZDR (Zero Data Retention) users are allowed to use the product.
     /// The default is `false` (blocked) during beta.
     #[serde(default)]
@@ -1083,6 +1095,9 @@ pub struct ContextualHintsRemote {
     /// Word-select tip after a double-click fold or nav (helps users find the setting).
     #[serde(default)]
     pub word_select: Option<bool>,
+    /// Export/copy tip after three nearby drag-copies.
+    #[serde(default)]
+    pub export_copy: Option<bool>,
     /// SSH wrap session-load tip (recommend `grok wrap ssh` for remote sessions).
     #[serde(default)]
     pub ssh_wrap: Option<bool>,

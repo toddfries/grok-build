@@ -808,6 +808,15 @@ fn resolve_model_override_to_config(
     ctx: &SubagentSpawnContext,
 ) -> Option<(xai_grok_sampler::SamplerConfig, acp::ModelId)> {
     let entry = crate::agent::config::find_model_by_id(&ctx.available_models, model_id).cloned()?;
+    if !entry.info.user_selectable {
+        let user_picker_only = ctx
+            .agent_config
+            .as_ref()
+            .is_some_and(|c| !c.requirements.allowed_models.is_pinned());
+        if !user_picker_only {
+            return None;
+        }
+    }
     let canonical_model_id = if ctx.available_models.contains_key(model_id) {
         acp::ModelId::new(model_id)
     } else {

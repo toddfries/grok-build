@@ -160,7 +160,7 @@ impl SessionActor {
     }
 
     /// Persist and optionally notify the pager for a synthetic user message.
-    async fn persist_synthetic_user_message(
+    pub(super) async fn persist_synthetic_user_message(
         &self,
         text: &str,
         notify_pager: bool,
@@ -297,7 +297,15 @@ impl SessionActor {
                 self.promote_queued_as_interjections().await;
             }
         }
-        self.drain_pending_interjections().await
+        self.drain_admitted_messages_at_safe_point().await
+    }
+
+    /// Drain already-admitted human interjections and parent Steers.
+    /// Does not promote held queue rows; use after turn-end bookkeeping so
+    /// late admissions still inject into the running turn.
+    pub(super) async fn drain_admitted_messages_at_safe_point(&self) -> bool {
+        let drained_human = self.drain_pending_interjections().await;
+        self.drain_parent_messages_at_safe_point().await || drained_human
     }
 
     pub(super) async fn drain_pending_interjections(&self) -> bool {

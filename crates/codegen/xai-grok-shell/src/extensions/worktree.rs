@@ -13,6 +13,8 @@ use crate::session::worktree::{
     create_jj_workspace, create_worktree_async, create_worktree_from_worktree_async,
     rehydrate_session_in_worktree, resolve_session_repo_wide, resume_session_in_worktree,
 };
+use xai_grok_telemetry::instrument_task;
+use xai_grok_telemetry::region::Parent;
 
 type ExtResult = Result<acp::ExtResponse, acp::Error>;
 
@@ -183,9 +185,13 @@ pub async fn handle(
                     gateway: agent.gateway.clone(),
                 };
                 let copy_context = agent.background_copy_context();
-                tokio::task::spawn_local(async move {
-                    create_worktree_async(req, notifier, copy_context).await;
-                });
+                tokio::task::spawn_local(instrument_task!(
+                    "worktree.create",
+                    Parent::Root,
+                    async move {
+                        create_worktree_async(req, notifier, copy_context).await;
+                    }
+                ));
             }
             to_response(Ok(result))
         }
@@ -247,9 +253,13 @@ pub async fn handle(
                 let notifier = GatewayWorktreeNotifier {
                     gateway: agent.gateway.clone(),
                 };
-                tokio::task::spawn_local(async move {
-                    create_worktree_from_worktree_async(req, notifier).await;
-                });
+                tokio::task::spawn_local(instrument_task!(
+                    "worktree.create",
+                    Parent::Root,
+                    async move {
+                        create_worktree_from_worktree_async(req, notifier).await;
+                    }
+                ));
             }
 
             to_response(Ok(response))

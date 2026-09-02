@@ -57,6 +57,34 @@ async fn returns_immediately_for_default_template() {
         .await;
 }
 #[tokio::test(flavor = "current_thread")]
+async fn wait_for_mcp_initialized_parks_until_a_foreign_init_completes() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let actor = actor_with_mcp(
+                vec![dummy_stdio_config("linear")],
+                false,
+                vec!["linear".into()],
+            )
+            .await;
+            let wait = actor.wait_for_mcp_initialized();
+            tokio::pin!(wait);
+            tokio::select! {
+                _ = &mut wait => panic!("returned while the foreign init was still in flight"),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(60)) => {}
+            }
+            {
+                let mut state = actor.mcp_state.lock().await;
+                state.finish_init();
+                state.mark_all_servers_ready();
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(2), wait)
+                .await
+                .expect("must resolve once the foreign init completes");
+        })
+        .await;
+}
+#[tokio::test(flavor = "current_thread")]
 async fn resolved_repo_status_prefetch_builds_first_prefix_with_zero_wait() {
     use crate::session::repo_status_prefix::{
         RepoStatusInputs, RepoStatusPlan, RepoStatusPrefetch, RepoStatusPrefetchState,

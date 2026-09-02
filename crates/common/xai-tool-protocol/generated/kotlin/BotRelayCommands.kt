@@ -16,31 +16,45 @@ import kotlinx.serialization.json.jsonPrimitive
 
 val V1_COMMAND_ALLOWLIST: List<String> = listOf(
     "attachUpload",
+    "connectChannel",
     "createAgent",
     "createGroup",
     "deleteAgents",
+    "disconnectChannel",
     "dismissUserForm",
     "dismissWidget",
+    "generateAgentAvatarImage",
+    "getAgentAutomations",
     "getAgentAvatar",
+    "getAgentChannels",
     "getAgentThread",
     "getAgentTranscript",
     "getAgentTranscriptPage",
     "getAgentTranscriptTail",
     "getAgentTranscriptWindow",
     "getSubagents",
+    "getTeachRecordingStatus",
     "injectChromeCookies",
     "interruptAgentRun",
     "listAgents",
+    "listAllAutomations",
     "promptAcceptanceStatus",
     "reactToMessage",
     "readAttachmentChunk",
     "readAttachmentImage",
     "readAttachmentText",
     "readVoiceCallAgentContext",
+    "refreshChannel",
     "respondToWidget",
     "sendPrompt",
+    "setAgentAutomationEnabled",
+    "setAgentAvatarBytes",
+    "setAgentHiddenFromSidebar",
+    "setAgentNotificationsEnabled",
     "setAgentUnread",
     "setGroupMembers",
+    "startTeachRecording",
+    "stopTeachRecording",
     "submitUserForm",
     "updateAgent",
     "uploadAttachment",
@@ -61,6 +75,17 @@ sealed interface BotCommand {
     ) : BotCommand {
         companion object {
             const val NAME = "attachUpload"
+        }
+    }
+
+    @Serializable
+    data class ConnectChannel(
+        val agentId: String,
+        @EncodeDefault override val name: String = NAME,
+        val args: ArgsConnectChannel,
+    ) : BotCommand {
+        companion object {
+            const val NAME = "connectChannel"
         }
     }
 
@@ -98,6 +123,17 @@ sealed interface BotCommand {
     }
 
     @Serializable
+    data class DisconnectChannel(
+        val agentId: String,
+        @EncodeDefault override val name: String = NAME,
+        val args: ArgsDisconnectChannel,
+    ) : BotCommand {
+        companion object {
+            const val NAME = "disconnectChannel"
+        }
+    }
+
+    @Serializable
     data class DismissUserForm(
         val agentId: String,
         @EncodeDefault override val name: String = NAME,
@@ -120,6 +156,28 @@ sealed interface BotCommand {
     }
 
     @Serializable
+    data class GenerateAgentAvatarImage(
+        val agentId: String,
+        @EncodeDefault override val name: String = NAME,
+        val args: ArgsGenerateAgentAvatarImage,
+    ) : BotCommand {
+        companion object {
+            const val NAME = "generateAgentAvatarImage"
+        }
+    }
+
+    @Serializable
+    data class GetAgentAutomations(
+        val agentId: String,
+        @EncodeDefault override val name: String = NAME,
+        val args: SandAsyncTaskLabelParams,
+    ) : BotCommand {
+        companion object {
+            const val NAME = "getAgentAutomations"
+        }
+    }
+
+    @Serializable
     data class GetAgentAvatar(
         val agentId: String,
         @EncodeDefault override val name: String = NAME,
@@ -127,6 +185,17 @@ sealed interface BotCommand {
     ) : BotCommand {
         companion object {
             const val NAME = "getAgentAvatar"
+        }
+    }
+
+    @Serializable
+    data class GetAgentChannels(
+        val agentId: String,
+        @EncodeDefault override val name: String = NAME,
+        val args: SandAsyncTaskLabelParams,
+    ) : BotCommand {
+        companion object {
+            const val NAME = "getAgentChannels"
         }
     }
 
@@ -197,6 +266,17 @@ sealed interface BotCommand {
     }
 
     @Serializable
+    data class GetTeachRecordingStatus(
+        val agentId: String,
+        @EncodeDefault override val name: String = NAME,
+        val args: ArgsClearTrays,
+    ) : BotCommand {
+        companion object {
+            const val NAME = "getTeachRecordingStatus"
+        }
+    }
+
+    @Serializable
     data class InjectChromeCookies(
         val agentId: String,
         @EncodeDefault override val name: String = NAME,
@@ -226,6 +306,17 @@ sealed interface BotCommand {
     ) : BotCommand {
         companion object {
             const val NAME = "listAgents"
+        }
+    }
+
+    @Serializable
+    data class ListAllAutomations(
+        val agentId: String,
+        @EncodeDefault override val name: String = NAME,
+        val args: ArgsClearTrays,
+    ) : BotCommand {
+        companion object {
+            const val NAME = "listAllAutomations"
         }
     }
 
@@ -288,10 +379,21 @@ sealed interface BotCommand {
     data class ReadVoiceCallAgentContext(
         val agentId: String,
         @EncodeDefault override val name: String = NAME,
-        val args: ArgsReadVoiceCallAgentContext,
+        val args: SandAsyncTaskLabelParams,
     ) : BotCommand {
         companion object {
             const val NAME = "readVoiceCallAgentContext"
+        }
+    }
+
+    @Serializable
+    data class RefreshChannel(
+        val agentId: String,
+        @EncodeDefault override val name: String = NAME,
+        val args: ArgsDisconnectChannel,
+    ) : BotCommand {
+        companion object {
+            const val NAME = "refreshChannel"
         }
     }
 
@@ -318,6 +420,50 @@ sealed interface BotCommand {
     }
 
     @Serializable
+    data class SetAgentAutomationEnabled(
+        val agentId: String,
+        @EncodeDefault override val name: String = NAME,
+        val args: ArgsSetAgentAutomationEnabled,
+    ) : BotCommand {
+        companion object {
+            const val NAME = "setAgentAutomationEnabled"
+        }
+    }
+
+    @Serializable
+    data class SetAgentAvatarBytes(
+        val agentId: String,
+        @EncodeDefault override val name: String = NAME,
+        val args: ArgsSetAgentAvatarBytes,
+    ) : BotCommand {
+        companion object {
+            const val NAME = "setAgentAvatarBytes"
+        }
+    }
+
+    @Serializable
+    data class SetAgentHiddenFromSidebar(
+        val agentId: String,
+        @EncodeDefault override val name: String = NAME,
+        val args: ArgsSetAgentHiddenFromSidebar,
+    ) : BotCommand {
+        companion object {
+            const val NAME = "setAgentHiddenFromSidebar"
+        }
+    }
+
+    @Serializable
+    data class SetAgentNotificationsEnabled(
+        val agentId: String,
+        @EncodeDefault override val name: String = NAME,
+        val args: ArgsSetAgentNotificationsEnabled,
+    ) : BotCommand {
+        companion object {
+            const val NAME = "setAgentNotificationsEnabled"
+        }
+    }
+
+    @Serializable
     data class SetAgentUnread(
         val agentId: String,
         @EncodeDefault override val name: String = NAME,
@@ -336,6 +482,28 @@ sealed interface BotCommand {
     ) : BotCommand {
         companion object {
             const val NAME = "setGroupMembers"
+        }
+    }
+
+    @Serializable
+    data class StartTeachRecording(
+        val agentId: String,
+        @EncodeDefault override val name: String = NAME,
+        val args: ArgsStartTeachRecording,
+    ) : BotCommand {
+        companion object {
+            const val NAME = "startTeachRecording"
+        }
+    }
+
+    @Serializable
+    data class StopTeachRecording(
+        val agentId: String,
+        @EncodeDefault override val name: String = NAME,
+        val args: ArgsStopTeachRecording,
+    ) : BotCommand {
+        companion object {
+            const val NAME = "stopTeachRecording"
         }
     }
 
@@ -378,31 +546,45 @@ object BotCommandSerializer :
     override fun selectDeserializer(element: JsonElement): KSerializer<out BotCommand> {
         return when (element.jsonObject["name"]?.jsonPrimitive?.content) {
             BotCommand.AttachUpload.NAME -> BotCommand.AttachUpload.serializer()
+            BotCommand.ConnectChannel.NAME -> BotCommand.ConnectChannel.serializer()
             BotCommand.CreateAgent.NAME -> BotCommand.CreateAgent.serializer()
             BotCommand.CreateGroup.NAME -> BotCommand.CreateGroup.serializer()
             BotCommand.DeleteAgents.NAME -> BotCommand.DeleteAgents.serializer()
+            BotCommand.DisconnectChannel.NAME -> BotCommand.DisconnectChannel.serializer()
             BotCommand.DismissUserForm.NAME -> BotCommand.DismissUserForm.serializer()
             BotCommand.DismissWidget.NAME -> BotCommand.DismissWidget.serializer()
+            BotCommand.GenerateAgentAvatarImage.NAME -> BotCommand.GenerateAgentAvatarImage.serializer()
+            BotCommand.GetAgentAutomations.NAME -> BotCommand.GetAgentAutomations.serializer()
             BotCommand.GetAgentAvatar.NAME -> BotCommand.GetAgentAvatar.serializer()
+            BotCommand.GetAgentChannels.NAME -> BotCommand.GetAgentChannels.serializer()
             BotCommand.GetAgentThread.NAME -> BotCommand.GetAgentThread.serializer()
             BotCommand.GetAgentTranscript.NAME -> BotCommand.GetAgentTranscript.serializer()
             BotCommand.GetAgentTranscriptPage.NAME -> BotCommand.GetAgentTranscriptPage.serializer()
             BotCommand.GetAgentTranscriptTail.NAME -> BotCommand.GetAgentTranscriptTail.serializer()
             BotCommand.GetAgentTranscriptWindow.NAME -> BotCommand.GetAgentTranscriptWindow.serializer()
             BotCommand.GetSubagents.NAME -> BotCommand.GetSubagents.serializer()
+            BotCommand.GetTeachRecordingStatus.NAME -> BotCommand.GetTeachRecordingStatus.serializer()
             BotCommand.InjectChromeCookies.NAME -> BotCommand.InjectChromeCookies.serializer()
             BotCommand.InterruptAgentRun.NAME -> BotCommand.InterruptAgentRun.serializer()
             BotCommand.ListAgents.NAME -> BotCommand.ListAgents.serializer()
+            BotCommand.ListAllAutomations.NAME -> BotCommand.ListAllAutomations.serializer()
             BotCommand.PromptAcceptanceStatus.NAME -> BotCommand.PromptAcceptanceStatus.serializer()
             BotCommand.ReactToMessage.NAME -> BotCommand.ReactToMessage.serializer()
             BotCommand.ReadAttachmentChunk.NAME -> BotCommand.ReadAttachmentChunk.serializer()
             BotCommand.ReadAttachmentImage.NAME -> BotCommand.ReadAttachmentImage.serializer()
             BotCommand.ReadAttachmentText.NAME -> BotCommand.ReadAttachmentText.serializer()
             BotCommand.ReadVoiceCallAgentContext.NAME -> BotCommand.ReadVoiceCallAgentContext.serializer()
+            BotCommand.RefreshChannel.NAME -> BotCommand.RefreshChannel.serializer()
             BotCommand.RespondToWidget.NAME -> BotCommand.RespondToWidget.serializer()
             BotCommand.SendPrompt.NAME -> BotCommand.SendPrompt.serializer()
+            BotCommand.SetAgentAutomationEnabled.NAME -> BotCommand.SetAgentAutomationEnabled.serializer()
+            BotCommand.SetAgentAvatarBytes.NAME -> BotCommand.SetAgentAvatarBytes.serializer()
+            BotCommand.SetAgentHiddenFromSidebar.NAME -> BotCommand.SetAgentHiddenFromSidebar.serializer()
+            BotCommand.SetAgentNotificationsEnabled.NAME -> BotCommand.SetAgentNotificationsEnabled.serializer()
             BotCommand.SetAgentUnread.NAME -> BotCommand.SetAgentUnread.serializer()
             BotCommand.SetGroupMembers.NAME -> BotCommand.SetGroupMembers.serializer()
+            BotCommand.StartTeachRecording.NAME -> BotCommand.StartTeachRecording.serializer()
+            BotCommand.StopTeachRecording.NAME -> BotCommand.StopTeachRecording.serializer()
             BotCommand.SubmitUserForm.NAME -> BotCommand.SubmitUserForm.serializer()
             BotCommand.UpdateAgent.NAME -> BotCommand.UpdateAgent.serializer()
             BotCommand.UploadAttachment.NAME -> BotCommand.UploadAttachment.serializer()
@@ -418,31 +600,45 @@ object BotCommandSerializer :
  * Decode the result as the typealias for `name`.
  */
 typealias BotCommandReplyAttachUpload = SandUploadAttachmentResult
+typealias BotCommandReplyConnectChannel = SandChannelsView
 typealias BotCommandReplyCreateAgent = SandCreateAgentResult
 typealias BotCommandReplyCreateGroup = SandCreateAgentResult
 typealias BotCommandReplyDeleteAgents = SandDeleteAgentResult
+typealias BotCommandReplyDisconnectChannel = SandChannelsView
 typealias BotCommandReplyDismissUserForm = JsonElement
 typealias BotCommandReplyDismissWidget = SandWidgetAnswerResult
+typealias BotCommandReplyGenerateAgentAvatarImage = SandGeneratedAvatarImage
+typealias BotCommandReplyGetAgentAutomations = List<SandAutomation>
 typealias BotCommandReplyGetAgentAvatar = SandAgentAvatarResult
+typealias BotCommandReplyGetAgentChannels = SandChannelsView
 typealias BotCommandReplyGetAgentThread = SandAgentThread
 typealias BotCommandReplyGetAgentTranscript = List<SandTranscriptEntry>
 typealias BotCommandReplyGetAgentTranscriptPage = SandRetainedTranscriptPage
 typealias BotCommandReplyGetAgentTranscriptTail = SandTranscriptPage
 typealias BotCommandReplyGetAgentTranscriptWindow = SandTranscriptWindow
 typealias BotCommandReplyGetSubagents = List<SandSubagentInfo>
+typealias BotCommandReplyGetTeachRecordingStatus = SandTeachRecordingStatus
 typealias BotCommandReplyInjectChromeCookies = ReplyInjectChromeCookies
 typealias BotCommandReplyInterruptAgentRun = SandInterruptAgentRunResult
 typealias BotCommandReplyListAgents = List<SandAgentSummary>
+typealias BotCommandReplyListAllAutomations = List<SandScheduledAutomation>
 typealias BotCommandReplyPromptAcceptanceStatus = PromptAcceptanceLookup
 typealias BotCommandReplyReactToMessage = JsonElement
 typealias BotCommandReplyReadAttachmentChunk = SandAttachmentChunk?
 typealias BotCommandReplyReadAttachmentImage = ResolvedImageAttachment?
 typealias BotCommandReplyReadAttachmentText = ReplyReadAttachmentTextValue?
 typealias BotCommandReplyReadVoiceCallAgentContext = SandVoiceCallAgentContext
+typealias BotCommandReplyRefreshChannel = SandChannelsView
 typealias BotCommandReplyRespondToWidget = SandWidgetAnswerResult?
 typealias BotCommandReplySendPrompt = SandSendPromptResult?
+typealias BotCommandReplySetAgentAutomationEnabled = List<SandAutomation>
+typealias BotCommandReplySetAgentAvatarBytes = SandAgentSummary?
+typealias BotCommandReplySetAgentHiddenFromSidebar = JsonElement
+typealias BotCommandReplySetAgentNotificationsEnabled = JsonElement
 typealias BotCommandReplySetAgentUnread = JsonElement
 typealias BotCommandReplySetGroupMembers = SandAgentSummary?
+typealias BotCommandReplyStartTeachRecording = SandTeachRecordingStatus
+typealias BotCommandReplyStopTeachRecording = SandTeachRecordingStatus
 typealias BotCommandReplySubmitUserForm = JsonElement
 typealias BotCommandReplyUpdateAgent = SandAgentSummary?
 typealias BotCommandReplyUploadAttachment = SandUploadAttachmentResult

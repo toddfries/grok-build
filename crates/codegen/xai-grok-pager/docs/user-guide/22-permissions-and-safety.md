@@ -148,7 +148,7 @@ The operations below are treated as read-only and run without prompting, in ever
 - `grep` (content search)
 - `web_search`
 - `todo_write`
-- `get_command_or_subagent_output` / `wait_commands_or_subagents` / `kill_command_or_subagent` (subagent control)
+- `get_command_or_subagent_output` / `kill_command_or_subagent` (subagent control)
 - Invoking skills
 
 ### Read-Only Shell Commands

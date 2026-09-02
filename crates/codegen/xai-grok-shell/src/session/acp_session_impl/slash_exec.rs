@@ -25,11 +25,19 @@ impl SessionActor {
                 let actual = self.permissions.is_yolo_mode();
                 if let Some(actual) = yolo_toggle_report(was, actual) {
                     self.emit_event(crate::session::events::Event::YoloToggled { enabled: actual });
+                    let from_mode = if self.plan_mode.lock().is_active() {
+                        "plan"
+                    } else if was {
+                        "bypass_permissions"
+                    } else {
+                        "default"
+                    };
                     xai_grok_telemetry::session_ctx::log_event(
                         xai_grok_telemetry::events::YoloToggled {
                             enabled: actual,
                             previous_state: was,
                             trigger: xai_grok_telemetry::events::YoloTrigger::SlashCommand,
+                            from_mode: Some(from_mode.to_owned()),
                         },
                     );
                     tracing::info_span!(

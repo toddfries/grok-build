@@ -6,9 +6,11 @@
 //! right-aligned meta column; the Queued section embeds the queue pane as its
 //! body.
 //!
-//! Experimental, gated by `GROK_DOCK_V2=1` (`enabled`). Keyboard model: the
+//! Experimental, gated by remote `dock_enabled` (`enabled`). Keyboard model: the
 //! dock cursor walks [`visible_items`] (headers + rows); Enter toggles a
 //! section header or opens a subagent row.
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -21,8 +23,20 @@ use crate::theme::Theme;
 /// Rows shown inline per expanded section before its "N more" line.
 pub const MAX_SECTION_ROWS: usize = 2;
 
+/// Left pad for a section body row, past the header chevron so the diamond is the first glyph.
+const ROW_INDENT: &str = "    ";
+/// One step past [`ROW_INDENT`] so the overflow line nests under the visible rows.
+const MORE_INDENT: &str = "      ";
+
+/// Seeded at startup and on `x.ai/settings/update` from Feature::Dock.
+static ENABLED: AtomicBool = AtomicBool::new(false);
+
 pub fn enabled() -> bool {
-    std::env::var_os("GROK_DOCK_V2").is_some()
+    ENABLED.load(Ordering::Acquire)
+}
+
+pub fn set_enabled(on: bool) {
+    ENABLED.store(on, Ordering::Release);
 }
 
 pub struct DockRow {
@@ -264,7 +278,7 @@ pub fn render(buf: &mut Buffer, area: Rect, theme: &Theme, data: &DockData) {
             }
             Visual::More(n) => {
                 let line = Line::from(Span::styled(
-                    format!("    ▾ {n} more"),
+                    format!("{MORE_INDENT}▾ {n} more"),
                     Style::default().fg(theme.gray),
                 ));
                 buf.set_line(area.x, y, &line, area.width);
@@ -307,7 +321,7 @@ fn section_header(
     ])
 }
 
-/// `  ◆ Kind description — activity` with the right-aligned meta column; the
+/// `    ◆ Kind description — activity` with the right-aligned meta column; the
 /// selected row gains `[↗]` (subagents) and `[stop]` (killable) actions.
 fn paint_row(
     buf: &mut Buffer,
@@ -320,7 +334,8 @@ fn paint_row(
 ) {
     let accent = Style::default().fg(theme.accent_running);
     let mut spans = vec![
-        Span::styled("  ◆ ", accent),
+        Span::raw(ROW_INDENT),
+        Span::styled(format!("{} ", crate::glyphs::diamond_filled()), accent),
         Span::styled(row.kind.clone(), accent),
         Span::raw(" "),
         Span::styled(
@@ -455,6 +470,15 @@ mod tests {
 
         assert!(row_text(&buf, 0).starts_with("▾ Subagents 3 ─"));
         let first = row_text(&buf, 1);
+        let diamond = crate::glyphs::diamond_filled();
+        assert!(
+            first.starts_with(&format!("{ROW_INDENT}{diamond} Explore")),
+            "row must start with indent + diamond, got {first:?}"
+        );
+        assert!(
+            !first.trim_start().starts_with('.'),
+            "row must not start with '.', got {first:?}"
+        );
         assert!(
             first.contains("Explore find dashboard render path — reading render.rs"),
             "{first}"

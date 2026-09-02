@@ -539,6 +539,10 @@ pub(crate) fn is_active() -> bool {
     !DONE.load(Ordering::Relaxed) && current().is_some()
 }
 
+pub(crate) fn current_phase_span() -> Option<tracing::Span> {
+    current()?.lock().current_span.clone()
+}
+
 fn clear() {
     DONE.store(true, Ordering::Relaxed);
     *CURRENT.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -837,11 +841,10 @@ mod tests {
             );
         }
 
-        // Held spans never parent contextually: phases are explicit children of the root
-        // The sub-phase timer has no root handle, and its subphase span nests under it so the interval counts once
         for c in &log.closed {
             let expected_parent = match c.name.as_str() {
-                "startup" | "timer" => None,
+                "startup" => None,
+                "timer" => Some("startup.bootstrap"),
                 "startup.session_git_scan" => Some("timer"),
                 _ => Some("startup"),
             };

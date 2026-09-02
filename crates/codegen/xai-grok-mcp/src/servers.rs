@@ -48,6 +48,14 @@ use xai_grok_tools::util::{ProcessGroup, ProcessScope};
 /// Canonical definition lives in `xai_grok_workspace_types`; re-exported here for callers that historically imported it from this module.
 pub use xai_grok_workspace_types::MCP_TOOL_NAME_DELIMITER;
 
+/// Routing hint for first-party local app MCP endpoints: which agent/session
+/// a request belongs to. **Advisory only, never authentication** — any local
+/// process can set it, so receivers must not treat it as proof of identity.
+/// Caller-supplied configs cannot smuggle it: the header is stripped from
+/// every HTTP/SSE config and re-added only when the spawn context asks for
+/// it (mirroring the `GROK_SESSION_ID` env protection on stdio servers).
+pub const GROK_AGENT_ID_HEADER: &str = "X-Grok-Agent-ID";
+
 /// Reqwest 0.13 twin of the 0.12 adapters in `xai_grok_extra_ca`.
 fn with_extra_root_certificates(mut builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
     xai_grok_extra_ca::ensure_default_crypto_provider();
@@ -1795,7 +1803,31 @@ fn should_recover_service_error(
         )
 }
 
+/// How long a tool call may stay parked on `requestState`-only `input_required` rounds while an
+/// out-of-band URL elicitation completes in the browser. Matches the crate's browser OAuth
+/// deadline ([`crate::oauth`]'s `BROWSER_AUTH_TIMEOUT`): both wait on the same kind of user
+/// journey through an external page.
+const MRTR_PENDING_STATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Poll backoff for `requestState`-only rounds: 250ms doubling to a 5s ceiling.
+fn mrtr_pending_poll_delay(pending_polls: u32) -> std::time::Duration {
+    std::time::Duration::from_millis((250u64.saturating_mul(1 << pending_polls.min(5))).min(5_000))
+}
+
 impl McpErasedTool {
+    /// Dispatch one `tools/call`, driving SEP-2322 multi round-trip requests (protocol 2026-07-28).
+    ///
+    /// Each round is one wire request under the per-tool timeout; a round may come back as an
+    /// `input_required` result carrying elicitation requests plus an opaque `requestState`.
+    /// The user-facing input gathering between rounds is deliberately not on the clock
+    /// (matching other HITL interactions), and the retry echoes `requestState` verbatim.
+    ///
+    /// Two budgets bound the loop:
+    /// - rounds that carry `inputRequests` are interactive re-prompts, capped by count
+    ///   ([`rmcp::model::DEFAULT_MRTR_MAX_ROUNDS`]);
+    /// - rounds carrying only `requestState` mean an out-of-band interaction (URL elicitation)
+    ///   is still pending server-side, so they are polled with capped backoff and bounded by
+    ///   [`MRTR_PENDING_STATE_TIMEOUT`] instead — a browser flow takes minutes, not rounds.
     async fn try_call_tool(
         &self,
         client: &Arc<McpClient>,
@@ -1804,20 +1836,108 @@ impl McpErasedTool {
         is_timeout: &mut bool,
         ew: &xai_grok_session_events::EventWriter,
     ) -> Result<rmcp::model::CallToolResult, xai_tool_runtime::ToolError> {
-        let mcp_service = client
-            .ensure_initialized()
-            .await
-            .map_err(|e| xai_tool_runtime::ToolError::custom("process_manager", e.to_string()))?;
         let tool_timeout = client.tool_timeout_for(&self.tool.name);
         let timeout_duration = std::time::Duration::from_secs(tool_timeout);
         let mut params = CallToolRequestParams::new(self.tool.name.clone());
         params.arguments = raw.as_object().cloned();
 
+        let mut input_rounds = 0usize;
+        let mut pending_polls = 0u32;
+        let mut pending_since: Option<std::time::Instant> = None;
+        loop {
+            let response = self
+                .call_tool_round(
+                    client,
+                    params.clone(),
+                    timeout_duration,
+                    tool_timeout,
+                    reconnect_attempted,
+                    is_timeout,
+                    ew,
+                )
+                .await?;
+            let input_required = match response {
+                rmcp::model::CallToolResponse::Complete(call_result) => return Ok(call_result),
+                rmcp::model::CallToolResponse::InputRequired(input_required) => input_required,
+                // SEP-2663 tasks are never advertised by this client, so a conforming server
+                // cannot return one; `CallToolResponse` is also non_exhaustive.
+                _ => {
+                    return Err(xai_tool_runtime::ToolError::custom(
+                        "process_manager",
+                        format!(
+                            "MCP tool '{}' returned an unsupported response kind",
+                            self.tool.name
+                        ),
+                    ));
+                }
+            };
+
+            let has_input_requests = input_required
+                .input_requests
+                .as_ref()
+                .is_some_and(|requests| !requests.is_empty());
+            if has_input_requests {
+                input_rounds += 1;
+                if input_rounds > rmcp::model::DEFAULT_MRTR_MAX_ROUNDS {
+                    return Err(xai_tool_runtime::ToolError::custom(
+                        "process_manager",
+                        format!(
+                            "MCP tool '{}' kept requiring input beyond {} rounds",
+                            self.tool.name,
+                            rmcp::model::DEFAULT_MRTR_MAX_ROUNDS
+                        ),
+                    ));
+                }
+                pending_since = None;
+                pending_polls = 0;
+            } else {
+                let started = *pending_since.get_or_insert_with(std::time::Instant::now);
+                if started.elapsed() >= MRTR_PENDING_STATE_TIMEOUT {
+                    return Err(xai_tool_runtime::ToolError::custom(
+                        "process_manager",
+                        format!(
+                            "MCP tool '{}' still awaited an out-of-band interaction after {}s",
+                            self.tool.name,
+                            MRTR_PENDING_STATE_TIMEOUT.as_secs()
+                        ),
+                    ));
+                }
+                tokio::time::sleep(mrtr_pending_poll_delay(pending_polls)).await;
+                pending_polls = pending_polls.saturating_add(1);
+            }
+
+            let (input_responses, request_state) =
+                self.gather_input_responses(client, input_required).await?;
+            params.input_responses = input_responses;
+            params.request_state = request_state;
+        }
+    }
+
+    /// One wire round of [`Self::try_call_tool`]: timeout, transport recovery, and error
+    /// classification apply per round trip. The live session is re-resolved every round
+    /// because recovery (and re-initialization after long elicitation waits) replaces the
+    /// client's `RunningService` between rounds.
+    #[allow(clippy::too_many_arguments)]
+    async fn call_tool_round(
+        &self,
+        client: &Arc<McpClient>,
+        params: CallToolRequestParams,
+        timeout_duration: std::time::Duration,
+        tool_timeout: u64,
+        reconnect_attempted: &mut bool,
+        is_timeout: &mut bool,
+        ew: &xai_grok_session_events::EventWriter,
+    ) -> Result<rmcp::model::CallToolResponse, xai_tool_runtime::ToolError> {
+        let mcp_service = client
+            .ensure_initialized()
+            .await
+            .map_err(|e| xai_tool_runtime::ToolError::custom("process_manager", e.to_string()))?;
         let result =
-            tokio::time::timeout(timeout_duration, mcp_service.call_tool(params.clone())).await;
+            tokio::time::timeout(timeout_duration, mcp_service.call_tool_once(params.clone()))
+                .await;
 
         match result {
-            Ok(Ok(call_result)) => Ok(call_result),
+            Ok(Ok(response)) => Ok(response),
             Ok(Err(service_err))
                 if should_recover_service_error(
                     &service_err,
@@ -1859,6 +1979,64 @@ impl McpErasedTool {
         }
     }
 
+    /// Gather responses for an `input_required` round and hand back the opaque `requestState`
+    /// to echo verbatim on the retry.
+    async fn gather_input_responses(
+        &self,
+        client: &Arc<McpClient>,
+        result: rmcp::model::InputRequiredResult,
+    ) -> Result<(Option<rmcp::model::InputResponses>, Option<String>), xai_tool_runtime::ToolError>
+    {
+        let input_requests = result.input_requests.unwrap_or_default();
+        if input_requests.is_empty() && result.request_state.is_none() {
+            return Err(xai_tool_runtime::ToolError::custom(
+                "process_manager",
+                format!(
+                    "MCP tool '{}' returned input_required with neither inputRequests nor requestState",
+                    self.tool.name
+                ),
+            ));
+        }
+
+        let mut responses = rmcp::model::InputResponses::new();
+        for (key, request) in input_requests {
+            match request {
+                rmcp::model::InputRequest::Elicitation(elicit) => {
+                    tracing::info!(
+                        server = %self.tool.server_name,
+                        tool = %self.tool.name,
+                        "MCP elicitation received in input_required round"
+                    );
+                    let elicit_result = client.bridge_elicit(elicit.params).await;
+                    let value = serde_json::to_value(elicit_result).map_err(|e| {
+                        xai_tool_runtime::ToolError::custom(
+                            "process_manager",
+                            format!("failed to serialize elicitation response: {e}"),
+                        )
+                    })?;
+                    responses.insert(key, value);
+                }
+                // Sampling and roots are never advertised in our client capabilities,
+                // so a conforming server cannot request them (spec: servers MUST NOT).
+                _ => {
+                    return Err(xai_tool_runtime::ToolError::custom(
+                        "process_manager",
+                        format!(
+                            "MCP server '{}' requested an unsupported input kind ('{key}'); \
+                             this client only supports elicitation",
+                            self.tool.server_name
+                        ),
+                    ));
+                }
+            }
+        }
+
+        Ok((
+            (!responses.is_empty()).then_some(responses),
+            result.request_state,
+        ))
+    }
+
     /// On `recover()` failure surface the original error, else the retry error (preserves the auth signal managed re-auth reads from the string).
     #[allow(clippy::too_many_arguments)]
     async fn recover_and_retry(
@@ -1871,7 +2049,7 @@ impl McpErasedTool {
         reconnect_attempted: &mut bool,
         is_timeout: &mut bool,
         ew: &xai_grok_session_events::EventWriter,
-    ) -> Result<rmcp::model::CallToolResult, xai_tool_runtime::ToolError> {
+    ) -> Result<rmcp::model::CallToolResponse, xai_tool_runtime::ToolError> {
         *reconnect_attempted = true;
         tracing::warn!(
             server = self.tool.server_name.as_str(),
@@ -1905,8 +2083,8 @@ impl McpErasedTool {
                 ));
             }
         };
-        match tokio::time::timeout(timeout_duration, mcp_service.call_tool(params)).await {
-            Ok(Ok(call_result)) => Ok(call_result),
+        match tokio::time::timeout(timeout_duration, mcp_service.call_tool_once(params)).await {
+            Ok(Ok(response)) => Ok(response),
             Ok(Err(retry_err)) => Err(xai_tool_runtime::ToolError::custom(
                 "process_manager",
                 retry_err.to_string(),
@@ -2143,9 +2321,10 @@ async fn decide_http_auth_over_network(
     ctx: &McpSpawnCtx<'_>,
     discovery_timeout: std::time::Duration,
 ) -> HttpAuthDecision {
+    // No timer around the discovery await: `InstrumentationTimer` holds a
+    // Chrome-mode span guard that must not cross an await (`!Send`, and
+    // tracing's span stack is per-thread).
     let outcome = {
-        let _auth_discovery_timer =
-            xai_grok_telemetry::instrumentation::timer("mcp_http_auth_discovery");
         match tokio::time::timeout(
             discovery_timeout,
             discover_and_prepare_auth(server_name, url, ctx.mode),
@@ -2212,6 +2391,11 @@ async fn decide_http_auth_over_network(
 pub struct HttpConfig {
     pub url: String,
     pub headers: Vec<(String, String)>,
+    /// This server is a first-party local app endpoint addressed by
+    /// [`GROK_AGENT_ID_HEADER`]. Set only from the spawn context — never
+    /// inferred from headers — and it keys the transport hardening (no
+    /// proxy, no redirects) and the OAuth skip.
+    pub local_agent_endpoint: bool,
 }
 
 impl HttpConfig {
@@ -2658,6 +2842,11 @@ enum PendingTransport {
 /// The custom handler keeps the same protocol behavior (same `get_info`).
 /// It passes `tools/list_changed` / `resources/list_changed` notifications through to the session-actor dispatcher.
 pub type McpService = Arc<RunningService<RoleClient, GrokClientHandler>>;
+
+pub(crate) static MCP_SERVERS_CONNECTED: xai_grok_telemetry::activity::ActivityGauge =
+    xai_grok_telemetry::activity::ActivityGauge::residency(
+        xai_grok_telemetry::activity::MCP_SERVERS_CONNECTED_KEY,
+    );
 
 /// MCP client connection state machine.
 ///
@@ -3598,7 +3787,7 @@ impl McpClient {
                     let service = Arc::new(service);
                     *guard = ClientState::Ready {
                         service: service.clone(),
-                        _connected: xai_grok_telemetry::activity::MCP_SERVERS_CONNECTED.enter(),
+                        _connected: MCP_SERVERS_CONNECTED.enter(),
                     };
                     tracing::info!(
                         server = %self.server_name,
@@ -3685,7 +3874,16 @@ impl McpClient {
                 config,
                 auth_manager,
             } => {
-                // Authorization is injected per-request by `AuthClient`, never carried in `default_headers`
+                // Local app endpoints skip OAuth outright (`start_mcp_server`
+                // routes them to `NoOauthSupport`), so this transport must
+                // never see one — its client is built without the local
+                // no-proxy/no-redirect hardening.
+                debug_assert!(
+                    !config.local_agent_endpoint,
+                    "a local agent endpoint must not reach the OAuth transport"
+                );
+                // Authorization is injected per-request by `AuthClient`, never
+                // carried in `default_headers`.
                 let mut headers = parse_config_headers(
                     name,
                     "oauth-transport",
@@ -3786,9 +3984,11 @@ impl McpClient {
                 xai_grok_version::VERSION.to_string(),
             ),
         )
-        // This pin currently equals rmcp 2.1 LATEST
-        // The explicit setter must remain so a future rmcp bump cannot silently move the wire (including to 2026-07-28)
-        .with_protocol_version(rmcp::model::ProtocolVersion::V_2025_11_25)
+        // This pin currently equals rmcp 3.2 LATEST
+        // The explicit setter must remain so a future rmcp bump cannot silently move the wire
+        // 2026-07-28 brings SEP-2322 multi round-trip requests (`input_required` results); older
+        // servers negotiate down and keep the server-initiated `elicitation/create` flow
+        .with_protocol_version(rmcp::model::ProtocolVersion::V_2026_07_28)
     }
 
     /// Build the [`GrokClientHandler`] that drives `client.serve(...)`.
@@ -3817,6 +4017,16 @@ impl McpClient {
 
     pub fn set_elicitation_tx(&self, tx: Option<crate::elicitation::ElicitationInbox>) {
         *self.elicitation_tx.lock() = tx;
+    }
+
+    /// Bridge one elicitation request from an MRTR `input_required` round to the HITL UI.
+    /// Same inbox path as the server-initiated `elicitation/create` handler, so both protocol
+    /// generations share the coordinator, wire format, and card rendering.
+    pub(crate) async fn bridge_elicit(
+        &self,
+        params: rmcp::model::ElicitRequestParams,
+    ) -> rmcp::model::ElicitResult {
+        crate::elicitation::bridge_elicit(&self.elicitation_tx, &self.server_name, params).await
     }
 
     /// Snapshot the current event sender, if any.
@@ -3904,13 +4114,23 @@ impl McpClient {
         apply_user_agent_policy(&mut headers, server_name, &config.url);
         // reqwest 0.13; the policy chokepoint is typed for 0.12 and cannot wrap this builder.
         #[allow(clippy::disallowed_methods)]
-        let client = with_extra_root_certificates(
+        let mut builder = with_extra_root_certificates(
             reqwest::Client::builder()
                 .default_headers(headers)
                 .connect_timeout(HTTP_CONNECT_TIMEOUT),
-        )
-        .build()
-        .map_err(|e| McpError::ClientError(format!("Failed to build HTTP client: {e}")))?;
+        );
+        if config.local_agent_endpoint {
+            // A local app endpoint must never see its agent-id header travel
+            // through a proxy or follow a redirect off the machine.
+            builder = builder
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none());
+        }
+        // rmcp requires reqwest 0.13; the approved xai helper is typed for 0.12.
+        #[allow(clippy::disallowed_methods)]
+        let client = builder
+            .build()
+            .map_err(|e| McpError::ClientError(format!("Failed to build HTTP client: {e}")))?;
         let mcp_http_client =
             crate::mcp_http_client::McpHttpClient::new(client, server_name, warn_budget);
         let transport_config = StreamableHttpClientTransportConfig::with_uri(config.url.as_str());
@@ -4083,7 +4303,8 @@ impl McpClient {
         match &*guard {
             ClientState::Ready { service, .. } => service
                 .peer_info()
-                .map(|info| McpIcon::from_rmcp_list(info.server_info.icons.clone()))
+                .and_then(|info| info.server_info.clone())
+                .map(|server_info| McpIcon::from_rmcp_list(server_info.icons))
                 .unwrap_or_default(),
             _ => Vec::new(),
         }
@@ -4093,14 +4314,14 @@ impl McpClient {
         &self,
         mcp_state: Arc<Mutex<McpState>>,
     ) -> Result<Vec<McpToolRegistration>, McpError> {
-        let _ensure_init_timer =
-            xai_grok_telemetry::instrumentation::timer("mcp_ensure_initialized");
+        // No timers across the initialize / list awaits: `InstrumentationTimer`
+        // holds a Chrome-mode span guard that must not cross an await
+        // (`!Send`, and tracing's span stack is per-thread).
         let mcp_service = self.ensure_initialized().await?;
 
         let mut all_tools = Vec::new();
         let mut cursor: Option<String> = None;
 
-        let _list_tools_timer = xai_grok_telemetry::instrumentation::timer("mcp_list_tools");
         loop {
             let list_tools_result = mcp_service
                 .list_tools(Some(
@@ -4413,6 +4634,7 @@ pub struct McpSpawnCtx<'a> {
     pub(crate) mode: OauthInteractivity,
     pub(crate) scope: Option<&'a ProcessScope>,
     pub(crate) discovery: McpOauthDiscovery,
+    send_grok_agent_id_header: bool,
 }
 
 impl<'a> McpSpawnCtx<'a> {
@@ -4428,7 +4650,13 @@ impl<'a> McpSpawnCtx<'a> {
             mode,
             scope,
             discovery: McpOauthDiscovery::Disk,
+            send_grok_agent_id_header: false,
         }
+    }
+
+    pub fn with_grok_agent_id_header(mut self) -> Self {
+        self.send_grok_agent_id_header = true;
+        self
     }
 
     pub fn standalone(event_writer: &'a xai_grok_session_events::EventWriter) -> Self {
@@ -4438,6 +4666,7 @@ impl<'a> McpSpawnCtx<'a> {
             mode: OauthInteractivity::Interactive,
             scope: None,
             discovery: McpOauthDiscovery::Disk,
+            send_grok_agent_id_header: false,
         }
     }
 
@@ -4455,7 +4684,11 @@ pub async fn start_mcp_server(
     byo_config: Option<&McpOAuthConfig>,
     ctx: &McpSpawnCtx<'_>,
 ) -> Result<McpClient, McpError> {
-    let _per_server_timer = xai_grok_telemetry::instrumentation::timer("mcp_start_one_server");
+    // No whole-start timer here: `InstrumentationTimer` holds a
+    // Chrome-mode span guard that must not cross an await (it is `!Send`
+    // and tracing's span stack is per-thread), and this fn awaits on every
+    // transport. Durations are carried by the per-transport telemetry
+    // events instead.
     match mcp_server {
         acp::McpServer::Stdio(acp::McpServerStdio {
             name,
@@ -4471,22 +4704,29 @@ pub async fn start_mcp_server(
             let (startup_timeout, _, _) = McpClient::load_timeouts(overrides, meta_config);
             let command_str = command.to_string_lossy().into_owned();
             let spawn_start = std::time::Instant::now();
-            let _stdio_spawn_timer = xai_grok_telemetry::instrumentation::timer("mcp_stdio_spawn");
-            let path_override = stdio_path_override(&env);
-            let (program, spawn_args) = plan_stdio_spawn(&command_str, &args, cfg!(windows), |c| {
-                if let Some(path) = path_override
-                    && let Ok(cwd) = std::env::current_dir()
-                {
-                    which::which_in(c, Some(path), cwd).ok()
-                } else {
-                    which::which(c).ok()
-                }
-            });
-            let mut cmd = Command::new(&program);
-            cmd.kill_on_drop(true).args(&spawn_args);
-            apply_stdio_env(&mut cmd, &env, ctx.session_id);
-            xai_grok_tools::util::detach_command(&mut cmd);
-            xai_grok_sandbox::child_net::restrict_child_network(&mut cmd);
+            // Scoped to the sync spawn-planning prologue: the timer's
+            // Chrome-mode span guard must not cross the spawn await below.
+            let cmd = {
+                let _stdio_spawn_timer =
+                    xai_grok_telemetry::instrumentation::timer("mcp_stdio_spawn");
+                let path_override = stdio_path_override(&env);
+                let (program, spawn_args) =
+                    plan_stdio_spawn(&command_str, &args, cfg!(windows), |c| {
+                        if let Some(path) = path_override
+                            && let Ok(cwd) = std::env::current_dir()
+                        {
+                            which::which_in(c, Some(path), cwd).ok()
+                        } else {
+                            which::which(c).ok()
+                        }
+                    });
+                let mut cmd = Command::new(&program);
+                cmd.kill_on_drop(true).args(&spawn_args);
+                apply_stdio_env(&mut cmd, &env, ctx.session_id);
+                xai_grok_tools::util::detach_command(&mut cmd);
+                xai_grok_sandbox::child_net::restrict_child_network(&mut cmd);
+                cmd
+            };
 
             let (transport, stderr_handle) = SafeTokioChildProcess::spawn(
                 cmd,
@@ -4503,6 +4743,7 @@ pub async fn start_mcp_server(
                         error_type: xai_grok_telemetry::events::McpErrorType::SpawnFailed,
                         duration_ms: spawn_start.elapsed().as_millis() as u64,
                         timeout_sec: startup_timeout,
+                        error_message: Some(e.to_string()),
                     },
                 );
                 McpError::SpawnFailed {
@@ -4534,10 +4775,24 @@ pub async fn start_mcp_server(
                 tracing::info!(server = %name, %url, ?mc, "MCP http: meta config override");
             }
 
-            let headers = expand_session_id_headers(headers, ctx.session_id);
+            let mut headers = expand_session_id_headers(headers, ctx.session_id);
+            // Stripped unconditionally: the agent-id header identifies the
+            // session to first-party app endpoints, and a caller-supplied
+            // config must not be able to impersonate one (see
+            // [`GROK_AGENT_ID_HEADER`]). Re-added only from the spawn
+            // context, like `GROK_SESSION_ID` on stdio servers.
+            headers.retain(|(name, _)| !name.eq_ignore_ascii_case(GROK_AGENT_ID_HEADER));
+            let local_agent_endpoint = ctx.send_grok_agent_id_header;
+            if local_agent_endpoint && let Some(session_id) = ctx.session_id {
+                reqwest::header::HeaderValue::try_from(session_id).map_err(|error| {
+                    McpError::ClientError(format!("invalid {GROK_AGENT_ID_HEADER} value: {error}"))
+                })?;
+                headers.push((GROK_AGENT_ID_HEADER.to_owned(), session_id.to_owned()));
+            }
             let http_config = HttpConfig {
                 url: url.clone(),
                 headers,
+                local_agent_endpoint,
             };
 
             let auth_decision = if http_config.has_authorization_header() {
@@ -4545,6 +4800,11 @@ pub async fn start_mcp_server(
                     server = %name,
                     "Skipping OAuth discovery: server already has Authorization header"
                 );
+                HttpAuthDecision::NoOauthSupport
+            } else if http_config.local_agent_endpoint {
+                // First-party app endpoints addressed by agent id are local
+                // desktop processes that never speak OAuth; probing them
+                // would only add latency.
                 HttpAuthDecision::NoOauthSupport
             } else {
                 match ctx.discovery {
@@ -4595,6 +4855,8 @@ pub async fn start_mcp_server(
     }
 }
 
+/// Start every configured server concurrently (one future per server, no
+/// cap); results are returned in input order.
 pub async fn start_mcp_servers(
     mcp_servers: Vec<acp::McpServer>,
     overrides_map: &HashMap<String, McpClientTimeoutOverrides>,
@@ -4602,8 +4864,8 @@ pub async fn start_mcp_servers(
     oauth_config_map: &crate::oauth_config::McpOAuthConfigMap,
     ctx: &McpSpawnCtx<'_>,
 ) -> Vec<Result<McpClient, McpError>> {
-    let _mcp_start_timer = xai_grok_telemetry::instrumentation::timer("mcp_start_servers");
-
+    // No whole-batch timer: it would hold a Chrome-mode span guard across
+    // the `join_all` await (see `start_mcp_server`).
     if !meta_config_map.is_empty() {
         tracing::info!(
             count = mcp_servers.len(),
@@ -4612,12 +4874,15 @@ pub async fn start_mcp_servers(
         );
     }
 
+    // Uncapped on purpose (one future per server): the count is
+    // config-bounded, the work is I/O-bound, and any cap is a slot to wait
+    // on behind a stalled server.
     futures::future::join_all(mcp_servers.into_iter().map(|server| {
-        let server_name = mcp_server_name(&server);
-        let overrides = overrides_map.get(server_name);
-        let mc = meta_config_map.get(server_name);
-        let byo = oauth_config_map.get(server_name);
-        start_mcp_server(server, overrides, mc, byo, ctx)
+        let server_name = mcp_server_name(&server).to_owned();
+        let overrides = overrides_map.get(&server_name);
+        let mc = meta_config_map.get(&server_name);
+        let byo = oauth_config_map.get(&server_name);
+        async move { start_mcp_server(server, overrides, mc, byo, ctx).await }
     }))
     .await
 }
@@ -4679,6 +4944,7 @@ impl McpClient {
             PendingTransport::Http(HttpConfig {
                 url: String::new(),
                 headers: Vec::new(),
+                local_agent_endpoint: false,
             }),
             Some(&overrides),
             None,
@@ -4784,13 +5050,40 @@ impl ClientHandler for GrokClientHandler {
         }
     }
 
-    async fn on_url_elicitation_notification_complete(
+    // rmcp 3.x dropped the typed URL-elicitation completion handler; the
+    // notification (either the 2026-07-28 `notifications/elicitation/response`
+    // or the 2025-11-25 `notifications/elicitation/complete` spelling) now
+    // arrives through the custom-notification catch-all.
+    async fn on_custom_notification(
         &self,
-        params: rmcp::model::ElicitationResponseNotificationParam,
+        notification: rmcp::model::CustomNotification,
         _context: NotificationContext<RoleClient>,
     ) {
+        if notification.method != "notifications/elicitation/response"
+            && notification.method != "notifications/elicitation/complete"
+        {
+            tracing::debug!(
+                server = %self.server_name,
+                method = %notification.method,
+                "ignoring unknown MCP notification"
+            );
+            return;
+        }
+        let Some(elicitation_id) = notification
+            .params
+            .as_ref()
+            .and_then(|p| p.get("elicitationId"))
+            .and_then(|v| v.as_str())
+        else {
+            tracing::warn!(
+                server = %self.server_name,
+                method = %notification.method,
+                "elicitation completion notification without elicitationId; dropping"
+            );
+            return;
+        };
         if !xai_grok_tools::mcp_elicitation::chars_within(
-            &params.elicitation_id,
+            elicitation_id,
             xai_grok_tools::mcp_elicitation::MAX_ELICIT_ID_CHARS,
         ) {
             tracing::warn!(
@@ -4801,7 +5094,7 @@ impl ClientHandler for GrokClientHandler {
         }
         self.emit(McpClientEvent::ElicitationComplete {
             server: self.server_name.clone(),
-            elicitation_id: params.elicitation_id,
+            elicitation_id: elicitation_id.to_string(),
         });
     }
 

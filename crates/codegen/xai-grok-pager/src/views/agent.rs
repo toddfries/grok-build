@@ -34,7 +34,7 @@ pub enum ActivePane {
     Prompt,
     Tasks,
     Catalog,
-    /// Consolidated panel dock above the prompt (experimental `GROK_DOCK_V2`).
+    /// Consolidated panel dock above the prompt (remote `dock_enabled`).
     Dock,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -52,7 +52,7 @@ pub struct PaneAreas {
     pub prompt: Rect,
     pub tasks: Rect,
     pub catalog: Rect,
-    /// Consolidated panel dock (experimental `GROK_DOCK_V2`); the embedded
+    /// Consolidated panel dock (remote `dock_enabled`); the embedded
     /// queue body inside it hit-tests as `Queue` (checked first).
     pub dock: Rect,
 }
@@ -128,7 +128,7 @@ pub struct AgentViewLayoutParams {
     /// Force-suppressed on short terminals on the same rule as `cta_height`.
     pub follow_ups_height: u16,
     /// Consolidated panel dock (Subagents/Tasks/Watchers/Queued) directly
-    /// above the prompt. 0 = hidden (the default; experimental `GROK_DOCK_V2`).
+    /// above the prompt. 0 = hidden (the default; remote `dock_enabled`).
     pub dock_height: u16,
     /// 0 or 1: the gap row between turn status (or scrollback) and the prompt.
     pub prompt_gap: u16,

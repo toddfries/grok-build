@@ -266,6 +266,7 @@ impl ModelsManagerBuilder {
             inner: Arc::new(Inner {
                 catalog: RwLock::new(CatalogState {
                     prefetched: self.prefetched,
+                    allowlist_excludes_all: allowlist_matches_nothing(&self.cfg, &self.models),
                     models: self.models,
                     ..Default::default()
                 }),
@@ -335,6 +336,10 @@ impl ModelsManager {
         let has_prefetched = prefetched_models.is_some();
         let catalog = resolve_model_catalog(cfg, prefetched_models.clone());
 
+        // Only against a real catalog. A fleet pin on built-ins-only (custom
+        // endpoint, cold cache) would reject a valid policy before the first
+        // fetch. The catalog still marks unselectable entries; this check
+        // runs after prefetch / cache.
         if has_prefetched {
             validate_selectable(cfg, &catalog)?;
         }

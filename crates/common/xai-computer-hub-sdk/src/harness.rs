@@ -559,8 +559,17 @@ pub struct SessionBindReport {
     /// unknown, as does any set lacking
     /// [`xai_tool_protocol::IMAGE_CAPABILITIES_V1`].
     pub image_capabilities: Vec<String>,
-    /// Tool names the bind ack advertised. In-process projection of
-    /// [`xai_tool_protocol::SessionBindServerResult::tools`], not a wire field.
+    /// NATIVE (un-namespaced) tool names the bind ack advertised.
+    /// In-process projection of
+    /// [`xai_tool_protocol::SessionBindServerResult::tools`], not a wire
+    /// field. Namespaced tools are deliberately excluded: those are
+    /// dynamically registered (MCP) tools that may land in the ack when
+    /// their discovery finishes inside the bind window, and they
+    /// legitimately leave on reload/teardown — the bind-ack hold in
+    /// [`merge_discovered_remote_tools`] must not pin them, or a removed
+    /// MCP tool stays advertised agent-side forever. The hold's incident
+    /// class (a snapshot race wiping tools mid-bind) concerns the stable
+    /// native set, which this projection captures exactly.
     pub advertised_tool_names: Vec<String>,
 }
 
@@ -573,7 +582,12 @@ impl From<&xai_tool_protocol::SessionBindServerResult> for SessionBindReport {
             unserved_tool_ids: result.unserved_tool_ids.clone(),
             resolve_error: result.resolve_error.clone(),
             image_capabilities: result.image_capabilities.clone(),
-            advertised_tool_names: result.tools.iter().map(|t| t.name.clone()).collect(),
+            advertised_tool_names: result
+                .tools
+                .iter()
+                .filter(|t| t.namespace.is_none())
+                .map(|t| t.name.clone())
+                .collect(),
         }
     }
 }
@@ -2687,6 +2701,45 @@ mod tests {
         assert_eq!(
             report.advertised_tool_names,
             vec!["read_file", "get_terminal_command_output"]
+        );
+    }
+
+    /// The bind-ack hold protects the stable native set only: a namespaced
+    /// (dynamically registered MCP) tool that lands in the ack because its
+    /// discovery finished inside the bind window legitimately leaves on
+    /// reload/teardown, so it must not be projected into
+    /// `advertised_tool_names` — otherwise a refresh omitting it (the hub
+    /// unregistered it) would re-add it from the cache forever.
+    #[test]
+    fn session_bind_report_excludes_namespaced_ack_tools_from_hold() {
+        let mut mcp_tool = ToolDescription::new("gen0_tool", "an MCP tool");
+        mcp_tool.namespace = Some("gen0".to_owned());
+        let result = xai_tool_protocol::SessionBindServerResult {
+            tools: vec![ToolDescription::new("read_file", "read a file"), mcp_tool],
+            ..Default::default()
+        };
+        let report = SessionBindReport::from(&result);
+        assert_eq!(report.advertised_tool_names, vec!["read_file"]);
+
+        // End-to-end through the merge: the refresh omits both; only the
+        // native is held.
+        let harness = ToolHarness::local_only_with(
+            LocalRegistry::new(),
+            SessionId::new("bind-ack-mcp").expect("valid session"),
+            xai_tool_runtime::TypedExtensions::default(),
+        );
+        harness.seed_remote_tools_for_tests(result.tools.clone());
+        harness.seed_bind_report_for_tests(report);
+        harness.apply_discovered_remote_tools_for_tests(Vec::new());
+        let names: Vec<String> = harness
+            .list_remote_tools()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["read_file"],
+            "the hold keeps the native, never the removed MCP tool"
         );
     }
 

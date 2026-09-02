@@ -202,6 +202,7 @@ fn wedged_child_handle() -> (
         cmd_tx,
         persistence_tx,
         current_prompt_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        active_work: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_interactions: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         info: SessionInfo {
             id: acp::SessionId::new("test"),
@@ -209,6 +210,10 @@ fn wedged_child_handle() -> (
         },
         max_turns: None,
         resolved_tool_overrides: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+        spawn_snapshot: crate::session::SpawnSnapshot {
+            applied_tool_overrides: None,
+            scheduler_background_loops: true,
+        },
         hunk_tracker_handle,
         chat_state_handle: xai_chat_state::ChatStateHandle::noop(),
         signals_handle,
@@ -234,7 +239,6 @@ fn wedged_child_handle() -> (
             std::sync::Arc::new(crate::terminal::LocalTerminalRunner),
         ),
         model_id: acp::ModelId::new("test-model"),
-        scheduler_background_loops: true,
         reasoning_effort: None,
         yolo_mode: false,
         origin_client: None,
@@ -561,7 +565,8 @@ async fn subagent_inherits_session_cli_overrides() {
 #[test]
 fn subagent_bypass_permission_mode_gated_by_policy_pin() {
     use xai_grok_agent::config::PermissionMode;
-    const PIN: &str = xai_grok_workspace::permission::resolution::YOLO_PIN_REASON_REQUIREMENTS;
+    const PIN: &str = xai_grok_workspace::permission::resolution::YoloPinReason::DisableBypassPermissionsMode
+        .message();
     assert_eq!(
             resolve_subagent_permission_mode(PermissionMode::BypassPermissions, false, None),
             PermissionMode::BypassPermissions,

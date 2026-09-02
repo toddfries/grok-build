@@ -4,7 +4,7 @@ use super::*;
 use xai_grok_telemetry::instrument_task;
 use xai_grok_telemetry::region;
 use xai_grok_telemetry::region::Parent;
-use crate::auth::SilentRefresh;
+use crate::auth::{CachedTokenState, SilentRefresh};
 use crate::upload::trace::PromptMetadataParams;
 use crate::leader::protocol::InternalMethod;
 /// Which `x_search` sub-tools enforce the date cutoff, sent in `initialize`. `x_user_search` and
@@ -25,6 +25,57 @@ const TOOL_OVERRIDES_CAPABILITY: ToolOverridesCapability = ToolOverridesCapabili
 fn tool_overrides_capability() -> serde_json::Value {
     serde_json::to_value(TOOL_OVERRIDES_CAPABILITY)
         .expect("ToolOverridesCapability is always serializable")
+}
+impl MvpAgent {
+    pub(crate) async fn set_model_gated(
+        &self,
+        args: acp::SetSessionModelRequest,
+    ) -> Result<acp::SetSessionModelResponse, acp::Error> {
+        let model = match self.resolve_model_id(&args.model_id) {
+            Ok(model) => model,
+            Err(_) => {
+                self.models_manager.wait_for_first_catalog().await;
+                self.resolve_model_id(&args.model_id)?
+            }
+        };
+        if !model.info.user_selectable {
+            return Err(
+                acp::Error::invalid_params()
+                    .data(
+                        crate::agent::models::allowlist_denied_message(
+                                &self.cfg.borrow(),
+                            )
+                            .to_string(),
+                    ),
+            );
+        }
+        let session_id = args.session_id.clone();
+        let switch_effort = match parse_reasoning_effort_meta(args.meta.as_ref()) {
+            Some(effort) => {
+                crate::agent::handlers::model_switch::SwitchEffort::Set(Some(effort))
+            }
+            None => crate::agent::handlers::model_switch::SwitchEffort::Preserve,
+        };
+        let res = crate::agent::handlers::model_switch::apply(
+                self,
+                args,
+                switch_effort,
+                crate::agent::handlers::model_switch::ConfigNotice::Send,
+            )
+            .await;
+        if res.is_ok()
+            && let Some(unavailable) = self
+                .session_registry
+                .take_unavailable_model(&session_id)
+        {
+            tracing::info!(
+                session_id = %session_id.0,
+                previously_unavailable_model = %unavailable.0,
+                "set_session_model: user model switch cleared the model-unavailable block"
+            );
+        }
+        res
+    }
 }
 #[async_trait::async_trait(?Send)]
 impl acp::Agent for MvpAgent {
@@ -281,8 +332,9 @@ impl acp::Agent for MvpAgent {
             self.models_manager.models().values(),
             first_party_env_ok,
         );
-        let init_has_current = self.auth_manager.current().is_some();
-        let init_is_expired = self.auth_manager.is_expired();
+        let init_token_state = self.auth_manager.cached_token_state();
+        let init_has_current = matches!(init_token_state, CachedTokenState::Valid(_));
+        let init_is_expired = matches!(init_token_state, CachedTokenState::Expired);
         xai_grok_telemetry::unified_log::info(
             "auth init token state",
             None,
@@ -672,10 +724,12 @@ impl acp::Agent for MvpAgent {
                         }
                     }
                 }
-                let resolved = match self.auth_manager.current() {
-                    Some(auth) => Some(auth),
-                    None if !self.auth_manager.is_expired() => None,
-                    None => {
+                let token_state = self.auth_manager.cached_token_state();
+                let was_expired = matches!(token_state, CachedTokenState::Expired);
+                let resolved = match token_state {
+                    CachedTokenState::Valid(auth) => Some(*auth),
+                    CachedTokenState::Missing => None,
+                    CachedTokenState::Expired => {
                         match self.auth_manager.silent_refresh().await {
                             SilentRefresh::Renewed(auth) => Some(*auth),
                             SilentRefresh::Failed(remedy) if remedy.is_self_healing() => {
@@ -686,7 +740,7 @@ impl acp::Agent for MvpAgent {
                     }
                 };
                 let Some(auth) = resolved else {
-                    let message = if self.auth_manager.is_expired() {
+                    let message = if was_expired {
                         "Session expired, re-authentication required"
                     } else {
                         "No cached auth token found"
@@ -967,12 +1021,14 @@ impl acp::Agent for MvpAgent {
             .await
             .ok_or_else(|| acp::Error::invalid_params().data("unknown session id"))?;
         if self.models_manager.allowlist_excludes_all() {
+            let deny = crate::agent::models::allowlist_excludes_all_message(
+                &self.cfg.borrow(),
+            );
             self.send_model_auto_switched(
                     &arguments.session_id,
                     &acp::ModelId::new(String::new()),
                     &acp::ModelId::new(String::new()),
-                    "None of your models are allowed by allowed_models. \
-                 Broaden it or remove it from your config, then restart.",
+                    &deny,
                 )
                 .await;
             return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
@@ -1011,7 +1067,8 @@ impl acp::Agent for MvpAgent {
                             arguments.session_id.clone(),
                             restore_model_id.clone(),
                         ),
-                        None,
+                        crate::agent::handlers::model_switch::SwitchEffort::Preserve,
+                        crate::agent::handlers::model_switch::ConfigNotice::Send,
                     )
                     .await
                 {
@@ -1374,25 +1431,25 @@ impl acp::Agent for MvpAgent {
                 ..
             })
         ) {
+            let meta = build_prompt_response_meta(PromptResponseMetaArgs {
+                session_id: &arguments.session_id.to_string(),
+                prompt_id: &prompt_id,
+                total_tokens: 0,
+                model_id: &model,
+                last_turn_usage: None,
+                prompt_usage: None,
+                cancellation_category: None,
+                cancellation_context: None,
+                cancel_trigger: None,
+                structured_output: None,
+                tool_overrides: applied_tool_overrides.clone(),
+                completion_kind: Some(
+                    crate::session::commands::REMOVED_FROM_QUEUE_KIND.to_string(),
+                ),
+            });
             return Ok(
                 acp::PromptResponse::new(acp::StopReason::Cancelled)
-                    .meta(
-                        build_prompt_response_meta(PromptResponseMetaArgs {
-                                session_id: &arguments.session_id.to_string(),
-                                prompt_id: &prompt_id,
-                                total_tokens: 0,
-                                model_id: &model,
-                                last_turn_usage: None,
-                                prompt_usage: None,
-                                cancellation_category: None,
-                                cancellation_context: None,
-                                cancel_trigger: None,
-                                structured_output: None,
-                                tool_overrides: applied_tool_overrides.clone(),
-                            })
-                            .as_object()
-                            .cloned(),
-                    ),
+                    .meta(meta.as_object().cloned()),
             );
         }
         let cancel_trigger: Option<String> = stop_result
@@ -1937,6 +1994,7 @@ impl acp::Agent for MvpAgent {
                                     cancel_trigger,
                                     structured_output,
                                     tool_overrides: applied_tool_overrides,
+                                    completion_kind: None,
                                 })
                                 .as_object()
                                 .cloned(),
@@ -2194,39 +2252,13 @@ impl acp::Agent for MvpAgent {
         &self,
         args: acp::SetSessionModelRequest,
     ) -> Result<acp::SetSessionModelResponse, acp::Error> {
-        let model = match self.resolve_model_id(&args.model_id) {
-            Ok(model) => model,
-            Err(_) => {
-                self.models_manager.wait_for_first_catalog().await;
-                self.resolve_model_id(&args.model_id)?
-            }
-        };
-        if !model.info.user_selectable {
-            return Err(
-                acp::Error::invalid_params()
-                    .data("This model isn't allowed by your allowed_models setting."),
-            );
-        }
-        let session_id = args.session_id.clone();
-        let effort_override = parse_reasoning_effort_meta(args.meta.as_ref());
-        let res = crate::agent::handlers::model_switch::apply(
-                self,
-                args,
-                effort_override,
-            )
-            .await;
-        if res.is_ok()
-            && let Some(unavailable) = self
-                .session_registry
-                .take_unavailable_model(&session_id)
-        {
-            tracing::info!(
-                session_id = %session_id.0,
-                previously_unavailable_model = %unavailable.0,
-                "set_session_model: user model switch cleared the model-unavailable block"
-            );
-        }
-        res
+        self.set_model_gated(args).await
+    }
+    async fn set_session_config_option(
+        &self,
+        args: acp::SetSessionConfigOptionRequest,
+    ) -> Result<acp::SetSessionConfigOptionResponse, acp::Error> {
+        crate::agent::handlers::config_option::apply(self, args).await
     }
     #[tracing::instrument(
         name = "agent.ext_method",

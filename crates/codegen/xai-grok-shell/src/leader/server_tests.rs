@@ -1579,6 +1579,47 @@ fn extract_model_id_from_set_model_returns_none_for_missing_model() {
     assert_eq!(extract_model_id_from_set_model(&pv(&payload)), None);
 }
 
+fn set_config_option_envelope(
+    config_id: &'static str,
+    value: agent_client_protocol::SessionConfigOptionValue,
+) -> serde_json::Value {
+    let request = agent_client_protocol::SetSessionConfigOptionRequest::new(
+        agent_client_protocol::SessionId::from("sess-123"),
+        config_id,
+        value,
+    );
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": AGENT_METHOD_NAMES.session_set_config_option,
+        "id": 1,
+        "params": serde_json::to_value(&request).unwrap(),
+    })
+}
+
+#[test]
+fn extract_model_id_from_set_config_option_returns_value() {
+    let envelope = set_config_option_envelope("model", "grok-3-fast".into());
+    assert_eq!(
+        extract_model_id_from_set_config_option(&envelope),
+        Some("grok-3-fast".to_string())
+    );
+}
+
+#[test]
+fn extract_model_id_from_set_config_option_ignores_non_model_config() {
+    let envelope = set_config_option_envelope("reasoning_effort", "high".into());
+    assert_eq!(extract_model_id_from_set_config_option(&envelope), None);
+}
+
+#[test]
+fn extract_model_id_from_set_config_option_ignores_boolean_value() {
+    let envelope = set_config_option_envelope(
+        "model",
+        agent_client_protocol::SessionConfigOptionValue::boolean(true),
+    );
+    assert_eq!(extract_model_id_from_set_config_option(&envelope), None);
+}
+
 // ── patch_initialize_response_model tests ─────────────────────────
 
 #[test]
@@ -2117,16 +2158,14 @@ fn version_mismatch_notification_is_none_for_unknown_leader_version() {
     );
 }
 
-/// A session/setModel request updates the client's default_model capability, so the next session/new injects the updated model.
-#[tokio::test]
-async fn set_model_updates_default_model_for_next_session_new() {
+async fn model_injected_after_set_model(response: Option<serde_json::Value>) -> String {
     let temp = TempDir::new().unwrap();
-    let (sock_path, cancel, mut acp_rx) = setup_test_server(&temp).await;
+    let (sock_path, _cancel, response_tx, mut acp_rx) =
+        setup_persistent_server_with_agent(&temp).await;
 
     let stream = LeaderStream::connect(&sock_path).await.unwrap();
     let (mut reader, mut writer) = tokio::io::split(stream);
 
-    // Register with an initial default_model of "grok-original"
     write_message(
         &mut writer,
         &ClientMessage::Register {
@@ -2143,7 +2182,6 @@ async fn set_model_updates_default_model_for_next_session_new() {
     .unwrap();
     let _: ServerMessage = read_message(&mut reader).await.unwrap();
 
-    // 1. Send session/setModel to switch to "grok-4.5"
     let set_model_payload = format!(
         r#"{{"jsonrpc":"2.0","method":"{}","id":1,"params":{{"sessionId":"sess-1","modelId":"grok-4.5"}}}}"#,
         AGENT_METHOD_NAMES.session_set_model
@@ -2156,10 +2194,17 @@ async fn set_model_updates_default_model_for_next_session_new() {
     )
     .await
     .unwrap();
-    // Consume the forwarded message
-    let _ = acp_rx.recv().await.unwrap();
+    let forwarded = acp_rx.recv().await.unwrap();
 
-    // 2. Send session/new; the leader must inject the UPDATED model ("grok-4.5")
+    if let Some(mut response) = response {
+        let forwarded_id =
+            serde_json::from_str::<serde_json::Value>(&forwarded).unwrap()["id"].clone();
+        response["jsonrpc"] = serde_json::json!("2.0");
+        response["id"] = forwarded_id;
+        response_tx.send(response.to_string()).unwrap();
+        let _: ServerMessage = read_message(&mut reader).await.unwrap();
+    }
+
     let session_new_payload = format!(
         r#"{{"jsonrpc":"2.0","method":"{}","id":2,"params":{{"cwd":"/tmp"}}}}"#,
         AGENT_METHOD_NAMES.session_new
@@ -2175,13 +2220,53 @@ async fn set_model_updates_default_model_for_next_session_new() {
 
     let forwarded = acp_rx.recv().await.unwrap();
     let json: serde_json::Value = serde_json::from_str(&forwarded).unwrap();
+    json["params"]["_meta"]["modelId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
 
+#[tokio::test]
+async fn set_model_optimistically_updates_default_model_without_awaiting_response() {
+    let injected = model_injected_after_set_model(None).await;
     assert_eq!(
-        json["params"]["_meta"]["modelId"], "grok-4.5",
-        "Leader should inject the updated model after session/setModel, not the stale registration model"
+        injected, "grok-4.5",
+        "optimistic switch injects the new model"
     );
+}
 
-    cancel.cancel();
+#[tokio::test]
+async fn rejected_set_model_rolls_back_default_model() {
+    let injected = model_injected_after_set_model(Some(
+        serde_json::json!({ "error": { "code": -32602, "message": "unknown model" } }),
+    ))
+    .await;
+    assert_eq!(
+        injected, "grok-original",
+        "rejected switch rolls back to the previous model"
+    );
+}
+
+#[test]
+fn model_switch_tracker_keeps_newest_when_accepts_arrive_out_of_order() {
+    let mut tracker = ModelSwitchTracker::default();
+    tracker.seed_confirmed(Some("orig".to_string()));
+    tracker.record_forward("r1".to_string(), "a".to_string());
+    tracker.record_forward("r2".to_string(), "b".to_string());
+    assert!(tracker.resolve("r2", true));
+    assert!(tracker.resolve("r1", true));
+    assert_eq!(tracker.default_model().as_deref(), Some("b"));
+}
+
+#[test]
+fn model_switch_tracker_rejection_rolls_back_to_last_confirmed() {
+    let mut tracker = ModelSwitchTracker::default();
+    tracker.seed_confirmed(Some("orig".to_string()));
+    tracker.record_forward("r1".to_string(), "a".to_string());
+    assert!(tracker.resolve("r1", true));
+    tracker.record_forward("r2".to_string(), "b".to_string());
+    assert!(tracker.resolve("r2", false));
+    assert_eq!(tracker.default_model().as_deref(), Some("a"));
 }
 
 #[tokio::test]
@@ -4105,11 +4190,6 @@ async fn mid_load_child_delta_reaches_loader_via_request_side_backfill() {
     cancel.cancel();
 }
 
-/// A pending interaction must SURVIVE a full client disconnect and be replayed on reconnect.
-/// A session with a pending interaction has a running turn (the tool awaits the answer).
-/// The agent therefore keeps it resident across the disconnect with the reverse-request still parked (`session_has_live_work`).
-/// The leader must NOT drop its interaction cache on detach, or the reconnecting client gets no modal while the agent is still waiting.
-/// Regression for the "modal vanishes on reconnect" bug.
 #[tokio::test]
 async fn pending_interaction_survives_disconnect_and_replays_on_reconnect() {
     let temp = TempDir::new().unwrap();

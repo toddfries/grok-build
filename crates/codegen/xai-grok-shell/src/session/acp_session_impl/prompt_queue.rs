@@ -694,6 +694,9 @@ impl SessionActor {
         let Some(running_id) = running_front_id.as_deref() else {
             return;
         };
+        if crate::session::PromptOrigin::from_prompt_id(running_id).is_auto_wake() {
+            return;
+        }
         let running_owner = state
             .pending_inputs
             .iter()
