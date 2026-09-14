@@ -2335,10 +2335,6 @@ impl SessionActor {
         );
     }
 
-    /// Inspect `tool_calls` for a `StructuredOutput` call and decide the turn's
-    /// next step, pushing the call's `tool_result` (correction / retry error /
-    /// terminal) as a side effect. Validates the args against `validator` and
-    /// bumps `retries` on a non-conforming retry.
     /// Inspect `tool_calls` for a `StructuredOutput` call and decide the turn's next step, pushing the call's `tool_result` as a side effect.
     /// The pushed result is a correction, a retry error, or the terminal answer.
     /// Validates the args against `validator` and bumps `retries` on a non-conforming retry.
