@@ -2,10 +2,7 @@
 //! build, per-cwd in-flight sharing, flush-deadline detach, and manifest
 //! terminal records.
 use super::*;
-use crate::upload::trace::tests::{
-    assert_artifact_failed, read_tar_gz_entries, test_prompt_trace_ctx,
-};
-use crate::upload::trace::{ArchiveBuildFault, set_archive_build_fault, spawn_upload_queue};
+use crate::upload::trace::tests::read_tar_gz_entries;
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial(archive_build_fault)]
 async fn memory_archive_build_archives_seeded_root_off_runtime() {
