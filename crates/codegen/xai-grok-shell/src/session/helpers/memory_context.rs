@@ -239,6 +239,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_v2_context_always_contains_both_manifests_and_refreshes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let cwd = temp.path().join("workspace");
+        let root = temp.path().join("memory-v2");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let storage = crate::session::memory::MemoryStorage::new_for_mode(
+            &cwd,
+            Some(&root),
+            crate::config::MemoryMode::V2,
+        );
+        crate::session::memory::v2::ensure_scope_initialized(
+            &root,
+            storage.global_dir(),
+            crate::session::memory::V2MemoryScope::Global,
+        )
+        .unwrap();
+        crate::session::memory::v2::ensure_scope_initialized(
+            &root,
+            storage.workspace_dir(),
+            crate::session::memory::V2MemoryScope::Workspace,
+        )
+        .unwrap();
+
+        let empty = format_v2_memory_context(&storage).unwrap();
+        assert!(empty.contains("## Global memory manifest"));
+        assert!(empty.contains("## Workspace memory manifest"));
+        assert!(empty.contains(&storage.global_dir().display().to_string()));
+        assert!(empty.contains(&storage.workspace_dir().display().to_string()));
+
+        std::fs::write(
+            storage.workspace_dir().join("topics/new.md"),
+            "# New\n\nCurrent.",
+        )
+        .unwrap();
+        let refreshed = format_v2_memory_context(&storage).unwrap();
+        assert!(refreshed.contains("topics/new.md"));
+        assert_ne!(empty, refreshed);
+    }
+
+    #[test]
     fn test_format_empty() {
         assert_eq!(format_memory_reminder(&[]), None);
     }

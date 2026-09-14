@@ -21,8 +21,6 @@
 pub const SCHEMA_VERSION: u32 = 2;
 
 /// Generate the SQL schema for the memory index.
-///
-/// `dimensions` controls the embedding vector size for `chunks_vec`.
 /// If `vec_available` is false, the `chunks_vec` table is not created.
 ///
 /// Connection pragmas (busy_timeout, journal_mode) are applied on the open

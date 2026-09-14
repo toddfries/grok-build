@@ -15,7 +15,7 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::Once;
 
-use rusqlite::params;
+use rusqlite::{OptionalExtension as _, params};
 use xai_sqlite_journal::JournalMode;
 
 use super::chunker::{chunk_hash, chunk_markdown};
@@ -100,7 +100,6 @@ pub struct MemoryIndex {
 
 impl MemoryIndex {
     /// Open or create the index database at `db_path`.
-    ///
     /// `dimensions` sets the embedding vector size for the `chunks_vec` table.
     /// If sqlite-vec failed to load (call `init_sqlite_vec()` first), the
     /// index gracefully degrades to FTS-only mode.
@@ -136,7 +135,15 @@ impl MemoryIndex {
     ) -> Result<Self, rusqlite::Error> {
         // busy_timeout + journal pragma live in the helper (see JournalMode::open).
         let db = journal_mode.open(db_path)?;
+        Self::initialize(db, storage, config, dimensions)
+    }
 
+    fn initialize(
+        db: rusqlite::Connection,
+        storage: MemoryStorage,
+        config: MemoryIndexConfig,
+        dimensions: usize,
+    ) -> Result<Self, rusqlite::Error> {
         // Check if sqlite-vec loaded (graceful fallback if not)
         let vec_available =
             match db.query_row("SELECT vec_version()", [], |r| r.get::<_, String>(0)) {
@@ -234,6 +241,12 @@ impl MemoryIndex {
         path: &Path,
         source: &str,
     ) -> Result<ReindexResult, rusqlite::Error> {
+        let span = tracing::info_span!(
+            "memory.reindex_file",
+            bytes = tracing::field::Empty,
+            chunk_count = tracing::field::Empty,
+        );
+        let _g = span.enter();
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(e) => {
@@ -241,8 +254,10 @@ impl MemoryIndex {
                 return Ok(ReindexResult::default());
             }
         };
+        span.record("bytes", content.len() as i64);
 
         let new_chunks = chunk_markdown(&content, &self.chunk_config);
+        span.record("chunk_count", new_chunks.len() as i64);
         let path_str = path.to_string_lossy().to_string();
 
         // Load existing chunks for this path
@@ -407,6 +422,7 @@ impl MemoryIndex {
             return Ok(vec![]);
         }
 
+        let _g = tracing::info_span!("memory.fts_search").entered();
         let placeholders: Vec<String> = sources
             .iter()
             .enumerate()
@@ -643,6 +659,11 @@ impl MemoryIndex {
         if !self.vec_available {
             return Ok(vec![]);
         }
+        let span = tracing::info_span!(
+            "memory.vector_search",
+            candidate_count = tracing::field::Empty
+        );
+        let _g = span.enter();
         let query_bytes: Vec<u8> = query_embedding
             .iter()
             .flat_map(|f| f.to_le_bytes())
@@ -656,6 +677,7 @@ impl MemoryIndex {
                 Ok((row.get::<_, String>(0)?, row.get::<_, f32>(1)?))
             })?
             .collect::<Result<Vec<_>, _>>()?;
+        span.record("candidate_count", results.len() as i64);
         Ok(results)
     }
 

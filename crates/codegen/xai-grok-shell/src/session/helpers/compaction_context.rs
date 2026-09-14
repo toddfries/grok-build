@@ -14,11 +14,13 @@ use std::path::PathBuf;
 
 pub use xai_chat_state::compaction_utils::{
     BackgroundTaskSummary, CompactionInputs, CompactionServerSummary, CompactionStateContext,
-    RunningSubagentSummary, TodoSummary, TodoSummaryStatus, extract_last_user_query,
-    extract_messages_since_last_user, extract_user_query,
+    RunningSubagentSummary, ScheduledLoopSummary, TodoSummary, TodoSummaryStatus,
+    WorkflowRunSummary, extract_last_user_query, extract_messages_since_last_user,
+    extract_user_query,
 };
 use xai_grok_compaction::reminder::{
-    self, ActiveAgentReminderState, BackgroundTask, RunningSubagent, TodoItem, TodoStatus,
+    self, ActiveAgentReminderState, BackgroundTask, RunningSubagent, ScheduledLoop, TodoItem,
+    TodoStatus, WorkflowRun,
 };
 
 /// Resolved model-facing tool names for the MCP usage hint in compaction
@@ -224,11 +226,40 @@ fn to_system_reminder_inner(
             elapsed_secs: s.elapsed_ms / 1000,
         })
         .collect();
+    let scheduled_loops: Vec<_> = ctx
+        .scheduled_loops
+        .iter()
+        .map(|t| ScheduledLoop {
+            task_id: &t.task_id,
+            interval: &t.interval,
+            next_fire_at: &t.next_fire_at,
+            prompt: &t.prompt,
+            recurring: t.recurring,
+            durable: t.durable,
+        })
+        .collect();
+    let workflows: Vec<_> = ctx
+        .workflows
+        .iter()
+        .map(|w| WorkflowRun {
+            name: &w.name,
+            run_id: &w.run_id,
+            status: &w.status,
+            objective: Some(w.objective.as_str()).filter(|s| !s.is_empty()),
+            current_phase: w.current_phase.as_deref(),
+            agents_used: w.agents_used,
+            agent_budget: w.agent_budget,
+            elapsed_secs: w.elapsed_ms / 1000,
+        })
+        .collect();
     sections.extend(reminder::format_active_agent_sections(
         &ActiveAgentReminderState {
             running_commands: &commands,
             todos: &todos,
             running_subagents: &subagents,
+            scheduled_loops: &scheduled_loops,
+            workflows: &workflows,
+            workflow_tool: ctx.workflow_tool_name.as_deref(),
         },
         subagent_tool_names
             .map(|t| reminder::SubagentToolNames {
@@ -293,6 +324,9 @@ mod tests {
             running_tasks: vec![],
             connected_mcp_servers: vec![],
             todos: vec![],
+            scheduled_loops: vec![],
+            workflows: vec![],
+            workflow_tool_name: None,
         }
     }
 
@@ -306,9 +340,10 @@ mod tests {
         let result = to_system_reminder_sync(&ctx, &[], &[], Some(&names), None, None);
         let text = result.expect("should produce a reminder");
         assert!(
-            text.contains("Running Subagents"),
+            text.contains("## Running Subagents"),
             "missing subagent section"
         );
+        assert!(text.contains("- \"sub-1\":"), "missing subagent id");
         assert!(text.contains("get_command_or_subagent_output"));
         assert!(text.contains("kill_command_or_subagent"));
         assert!(text.contains("sub-1"));
@@ -338,6 +373,9 @@ mod tests {
             running_tasks: vec![],
             running_subagents: vec![],
             todos: vec![],
+            scheduled_loops: vec![],
+            workflows: vec![],
+            workflow_tool_name: None,
         };
         let result = to_system_reminder_sync(&ctx, &[], &[], None, None, None);
         let text = result.expect("should produce a reminder");
@@ -372,6 +410,9 @@ mod tests {
             running_subagents: vec![],
             connected_mcp_servers: vec![],
             todos: vec![],
+            scheduled_loops: vec![],
+            workflows: vec![],
+            workflow_tool_name: None,
         };
         let text = to_system_reminder_sync(&ctx, &[], &[], None, None, None)
             .expect("should produce a reminder");
@@ -409,6 +450,9 @@ mod tests {
             running_tasks: vec![],
             running_subagents: vec![],
             connected_mcp_servers: vec![],
+            scheduled_loops: vec![],
+            workflows: vec![],
+            workflow_tool_name: None,
         }
     }
 
@@ -492,6 +536,9 @@ mod tests {
             running_subagents: vec![],
             connected_mcp_servers: vec![],
             todos: vec![],
+            scheduled_loops: vec![],
+            workflows: vec![],
+            workflow_tool_name: None,
         };
         let skills = [xai_grok_tools::implementations::skills::types::SkillInfo {
             name: "commit".into(),
@@ -515,6 +562,56 @@ mod tests {
     }
 
     /// No actionable items (all completed/cancelled) → no TODO section.
+    #[test]
+    fn system_reminder_includes_scheduled_loops_and_live_workflows() {
+        let ctx = CompactionStateContext {
+            cwd_generation: 0,
+            destination_project_instructions: None,
+            agent_message_anchor: None,
+            recent_messages: vec![],
+            last_user_query: None,
+            agent_edited_paths: vec![],
+            running_tasks: vec![],
+            running_subagents: vec![],
+            connected_mcp_servers: vec![],
+            todos: vec![],
+            scheduled_loops: vec![ScheduledLoopSummary {
+                task_id: "01a046ad3877".into(),
+                interval: "every 20 minutes".into(),
+                next_fire_at: "in 12m".into(),
+                prompt: "monitor job".into(),
+                recurring: true,
+                durable: true,
+            }],
+            workflows: vec![WorkflowRunSummary {
+                name: "review-changes".into(),
+                run_id: "wf-1".into(),
+                status: "active".into(),
+                objective: "review the PR".into(),
+                current_phase: Some("Smoke".into()),
+                agents_used: 3,
+                agent_budget: Some(128),
+                elapsed_ms: 12_000,
+            }],
+            workflow_tool_name: Some("workflow".into()),
+        };
+        let text = to_system_reminder_sync(&ctx, &[], &[], None, None, None)
+            .expect("should produce a reminder");
+        let bg = text.find("## Running Background Tasks").expect("bg");
+        assert!(
+            text[bg..].contains("- \"01a046ad3877\": `monitor job`"),
+            "got:\n{text}"
+        );
+        assert!(text[bg..].contains("run id `wf-1`"), "got:\n{text}");
+        assert!(!text.contains("## Scheduled Loops"), "got:\n{text}");
+        assert!(text.contains("## Running Workflows"), "got:\n{text}");
+        assert!(!text.contains("## Active Workflows"), "got:\n{text}");
+        assert!(
+            text.contains("Use `workflow` to inspect or resume"),
+            "got:\n{text}"
+        );
+    }
+
     #[test]
     fn system_reminder_omits_todos_when_none_active() {
         let ctx = ctx_with_todos(vec![

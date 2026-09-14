@@ -209,8 +209,6 @@ fn temporal_decay_multiplier(
 }
 
 /// Run a hybrid search across the memory index.
-///
-/// Combines FTS5 keyword search with optional vector KNN similarity.
 /// Falls back to FTS-only when vector search is unavailable.
 ///
 /// Structured so that `&MemoryIndex` is never held across `.await` points,
@@ -289,6 +287,8 @@ pub(super) fn hybrid_search_merge(
     config: &MemorySearchConfig,
     filter: &SearchFilter,
 ) -> Result<SearchMerge, Box<dyn std::error::Error>> {
+    let span = tracing::info_span!("memory.merge_rank", candidate_count = tracing::field::Empty);
+    let _g = span.enter();
     let candidate_limit = config.max_results * 3;
 
     let (vec_results, is_vector_degraded) = if let Some(embedding) = query_embedding {
@@ -365,6 +365,7 @@ pub(super) fn hybrid_search_merge(
     // Collect all unique chunk IDs across both result sets.
     let all_chunk_ids: std::collections::HashSet<&String> =
         fts_scores.keys().chain(vec_scores.keys()).collect();
+    span.record("candidate_count", all_chunk_ids.len() as i64);
 
     for chunk_id in all_chunk_ids {
         let fts = fts_scores.get(chunk_id).copied().unwrap_or(0.0);
