@@ -23,17 +23,66 @@ mod yolo_toggle_report_tests {
         assert_eq!(yolo_toggle_report(true, true), None);
     }
 }
+fn spawn_dream_check(session: &Arc<SessionActor>) -> tokio::task::JoinHandle<()> {
+    let session = session.clone();
+    tokio::task::spawn_local(async move {
+        session.memory.await_init_reindex().await;
+        session.maybe_run_dream().await;
+    })
+}
+/// Abort a still-running dream and wait for it to stop, so session-end index work never overlaps it.
+/// A finished dream makes this a no-op; a live one is parked on the model call, so the abort returns
+/// at once without stamping the marker, leaving the gate open for the next launch.
+async fn stop_dream(dream_task: &mut Option<tokio::task::JoinHandle<()>>) {
+    if let Some(handle) = dream_task.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
+}
 /// Best-effort removal of this session's scratch staging on teardown.
 /// A no-op in builds without a scratch producer.
 fn cleanup_session_scratch(_session: &SessionActor) {}
+const DEFERRED_START_CANCEL_JOIN: std::time::Duration = std::time::Duration::from_millis(500);
+pub(super) struct DeferredStart {
+    cancel: tokio_util::sync::CancellationToken,
+    task: Option<tokio_util::task::AbortOnDropHandle<()>>,
+}
+impl DeferredStart {
+    pub(super) fn new() -> Self {
+        Self {
+            cancel: tokio_util::sync::CancellationToken::new(),
+            task: None,
+        }
+    }
+    fn arm(&mut self, handle: tokio::task::JoinHandle<()>) {
+        let handle = tokio_util::task::AbortOnDropHandle::new(handle);
+        if self.cancel.is_cancelled() {
+            drop(handle);
+            return;
+        }
+        self.task = Some(handle);
+    }
+    async fn seal_and_join(&mut self) {
+        self.cancel.cancel();
+        if let Some(mut start) = self.task.take() {
+            tokio::select! {
+                biased;
+                _ = &mut start => {}
+                _ = tokio::time::sleep(DEFERRED_START_CANCEL_JOIN) => {}
+            }
+        }
+    }
+}
 /// SessionEnd hooks and stop dispatch.
 /// Shared so the channel-closed and Shutdown paths cannot drift on hook ordering (memory save still runs after this).
 pub(super) async fn fire_session_end_hooks(
     session: &SessionActor,
     reason: &str,
     timer: &SharedSessionEndTimer,
+    start: &mut DeferredStart,
 ) {
     let span = session_end::span(Phase::Hooks);
+    start.seal_and_join().await;
     let envelope = session.fire_hook(
         xai_grok_hooks::event::HookEventName::SessionEnd,
         None,
@@ -55,7 +104,7 @@ pub(super) async fn fire_session_end_hooks(
         )
         .await;
         session
-            .send_hook_execution("session_end", None, None, &results)
+            .send_hook_execution(&HookBatch::from_envelope(&envelope), &results)
             .await;
     }
     let _stop = session_end::timed_child(timer, Phase::HooksStop, span.span());
@@ -63,7 +112,6 @@ pub(super) async fn fire_session_end_hooks(
 }
 /// Cancel the feedback sync loop, drain/sync under exit budgets, persist background-task state, and drop scratch.
 /// Owns the single final signal sync via [`FeedbackManager::shutdown`]; the sync loop cancel arm does not sync.
-///
 /// `FeedbackManager::shutdown` short-circuits force_sync/drain when telemetry is off or the session is empty with nothing pending.
 async fn finish_session_exit_feedback(session: &SessionActor, timer: &SharedSessionEndTimer) {
     let span = session_end::span(Phase::Feedback);
@@ -79,7 +127,7 @@ async fn finish_session_exit_feedback(session: &SessionActor, timer: &SharedSess
     }
     if !session.startup_hints.is_subagent {
         let _tasks = session_end::timed_child(timer, Phase::BackgroundTasksSave, span.span());
-        session.persist_background_task_manifest().await;
+        session.persist_resume_status().await;
     }
     cleanup_session_scratch(session);
 }
@@ -140,6 +188,9 @@ impl SessionActor {
     }
 }
 async fn shutdown_workflows(session: &SessionActor, timer: &SharedSessionEndTimer) {
+    if !session.startup_hints.is_subagent {
+        session.persist_resume_status().await;
+    }
     let span = session_end::span(Phase::Workflows);
     {
         let _drain = session_end::timed_child(timer, Phase::WorkflowsDrain, span.span());
@@ -204,6 +255,102 @@ async fn emit_session_end_timings(timer: &SharedSessionEndTimer, is_subagent: bo
     )
     .await;
 }
+/// The deferred startup jobs, owned by the run loop so a session ending mid-startup aborts them instead of leaving them detached.
+struct StartupTasks {
+    _mcp_init_prompt_promote: crate::util::AbortOnDrop,
+    _context_snapshot: Option<crate::util::AbortOnDrop>,
+    mcp_startup: StartupTaskSet,
+}
+/// Startup tasks handed over by `&self` actor methods, each holding a strong `Arc` to the actor. Owned by the run
+/// loop, so no task keeps the session alive past it.
+pub(super) struct StartupTaskSet(std::rc::Rc<std::cell::RefCell<tokio::task::JoinSet<()>>>);
+impl StartupTaskSet {
+    pub(super) fn install(actor: &SessionActor) -> Self {
+        let set = Self(std::rc::Rc::default());
+        actor
+            .startup_tasks
+            .0
+            .set(std::rc::Rc::downgrade(&set.0))
+            .unwrap_or_else(|_| unreachable!("one run loop installs the startup set once"));
+        set
+    }
+}
+/// The actor's side of a [`StartupTaskSet`]: empty until the run loop installs one.
+#[derive(Default)]
+pub(crate) struct StartupTaskHandle(
+    std::cell::OnceCell<std::rc::Weak<std::cell::RefCell<tokio::task::JoinSet<()>>>>,
+);
+/// Before any run loop the future is handed back to run inline; after the run loop has ended it is dropped.
+pub(super) enum StartupHandoff<F> {
+    Spawned,
+    NoRunLoopYet(F),
+    RunLoopEnded,
+}
+impl StartupTaskHandle {
+    pub(super) fn spawn_local<F: Future<Output = ()> + 'static>(
+        &self,
+        fut: F,
+    ) -> StartupHandoff<F> {
+        let Some(set) = self.0.get() else {
+            return StartupHandoff::NoRunLoopYet(fut);
+        };
+        let Some(set) = set.upgrade() else {
+            return StartupHandoff::RunLoopEnded;
+        };
+        spawn_after_reaping(&mut set.borrow_mut(), fut);
+        StartupHandoff::Spawned
+    }
+}
+impl StartupTaskSet {
+    pub(super) fn spawn_local<F: Future<Output = ()> + 'static>(&self, fut: F) {
+        spawn_after_reaping(&mut self.0.borrow_mut(), fut);
+    }
+}
+pub(super) fn spawn_after_reaping<F: Future<Output = ()> + 'static>(
+    tasks: &mut tokio::task::JoinSet<()>,
+    fut: F,
+) {
+    while let Some(finished) = tasks.try_join_next() {
+        if let Err(e) = finished
+            && e.is_panic()
+        {
+            tracing::warn!(error = %e, "MCP startup task panicked");
+        }
+    }
+    tasks.spawn_local(fut);
+}
+impl StartupTasks {
+    fn spawn(
+        session: &Arc<SessionActor>,
+        completion_tx: mpsc::UnboundedSender<super::turn_task::TurnCompletionMsg>,
+    ) -> Self {
+        let mcp_startup = StartupTaskSet::install(session);
+        let session_for_mcp = session.clone();
+        let mcp_init_prompt_promote =
+            crate::util::AbortOnDrop(tokio::task::spawn_local(async move {
+                session_for_mcp.ensure_mcp_tools_initialized().await;
+                SessionActor::maybe_start_running_task(session_for_mcp.clone(), completion_tx)
+                    .await;
+            }));
+        let context_snapshot = if session.startup_hints.is_subagent {
+            tracing::info!("session_context_snapshot: skipped (subagent)");
+            None
+        } else {
+            let s = session.clone();
+            Some(crate::util::AbortOnDrop(tokio::task::spawn_local(
+                instrument_task!("session.context_snapshot", Parent::Inherit, async move {
+                    s.wait_for_mcp_initialized().await;
+                    s.emit_session_context_snapshot().await;
+                }),
+            )))
+        };
+        Self {
+            _mcp_init_prompt_promote: mcp_init_prompt_promote,
+            _context_snapshot: context_snapshot,
+            mcp_startup,
+        }
+    }
+}
 pub(super) async fn run_session(
     session: Arc<SessionActor>,
     mut cmd_rx: mpsc::UnboundedReceiver<SessionCommand>,
@@ -236,6 +383,7 @@ pub(super) async fn run_session(
     }
     let _workflow_watch = crate::config::watcher::ProjectDiscoveryWatcher::start(
         std::path::Path::new(session.session_info.cwd.as_str()),
+        &crate::util::grok_home::grok_home(),
     )
     .map(|(mut watcher, mut changes)| {
         let session = session.clone();
@@ -247,7 +395,9 @@ pub(super) async fn run_session(
                         session.reload_skills_from_disk().await;
                     }
                     crate::config::watcher::DiscoveryChange::Workflows => {
-                        session.send_available_commands_update().await;
+                        session
+                            .send_available_commands_update(AdvertiseTrigger::WorkflowsChanged)
+                            .await;
                     }
                 }
             }
@@ -272,12 +422,6 @@ pub(super) async fn run_session(
     {
         let s = session.clone();
         tokio::task::spawn_local(async move { s.maybe_notify_git_branch().await });
-    }
-    if session.startup_hints.is_subagent {
-        tracing::info!("session_context_snapshot: skipped (subagent)");
-    } else {
-        session.wait_for_mcp_initialized().await;
-        session.emit_session_context_snapshot().await;
     }
     tokio::task::spawn_local(super::status_line::run_status_emitter(Arc::downgrade(
         &session,
@@ -356,13 +500,7 @@ pub(super) async fn run_session(
             .await;
         });
     }
-    let session_for_mcp = session.clone();
-    let completion_tx_for_mcp = completion_tx.clone();
-    tokio::task::spawn_local(async move {
-        session_for_mcp.ensure_mcp_tools_initialized().await;
-        SessionActor::maybe_start_running_task(session_for_mcp.clone(), completion_tx_for_mcp)
-            .await;
-    });
+    let startup_tasks = StartupTasks::spawn(&session, completion_tx.clone());
     let mut model_switch_rx = session.models_manager.subscribe_model_switch();
     let _ = *model_switch_rx.borrow_and_update();
     let idle_flush_sleep = match session.idle_flush_timeout {
@@ -375,12 +513,17 @@ pub(super) async fn run_session(
         None => tokio::time::sleep(std::time::Duration::MAX),
     };
     tokio::pin!(dream_check_sleep);
+    let mut dream_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut deferred_start = DeferredStart::new();
+    if !session.startup_hints.is_subagent && session.memory.uses_legacy_pipeline() {
+        dream_task = Some(spawn_dream_check(&session));
+    }
     loop {
         tokio::select! {
                 biased;
                 // Idle flush timer fired: run background flush
                 _ = &mut idle_flush_sleep, if session.idle_flush_timeout.is_some()
-                    && session.memory.is_enabled()
+                    && session.memory.uses_legacy_pipeline()
                     && !session.memory.is_flushing.load(std::sync::atomic::Ordering::Relaxed) => {
                     // Skip if no new messages since last idle flush
                     let current_len = session.chat_state_handle.get_conversation_len().await;
@@ -411,15 +554,15 @@ pub(super) async fn run_session(
                 }
                 // Dream check timer: periodically run dream consolidation
                 _ = &mut dream_check_sleep, if session.dream_check_timeout.is_some()
-                    && session.memory.is_enabled() => {
+                    && session.memory.uses_legacy_pipeline()
+                    && !session.startup_hints.is_subagent => {
                     tracing::debug!(target: xai_grok_telemetry::memory_log::TARGET,
                         "MEMORY_DREAM_CHECK: timer fired");
-                    tokio::task::spawn_local({
-                        let session = session.clone();
-                        async move {
-                            session.maybe_run_dream().await;
-                        }
-                    });
+                    // Only start a new dream when the previous one has finished; a shorter check
+                    // interval must not abort an in-flight consolidation.
+                    if dream_task.as_ref().is_none_or(|h| h.is_finished()) {
+                        dream_task = Some(spawn_dream_check(&session));
+                    }
                     if let Some(timeout) = session.dream_check_timeout {
                         dream_check_sleep.as_mut().reset(tokio::time::Instant::now() + timeout);
                     }
@@ -508,12 +651,19 @@ pub(super) async fn run_session(
                 }
                 maybe_cmd = cmd_rx.recv() => {
                     let Some(cmd) = maybe_cmd else {
+                        session
+                            .settle_all_parent_messages(
+                                xai_message_delivery_core::TerminalCause::ActorDrop,
+                            )
+                            .await;
                         // ── session_end (channel-closed path) ────────
                         // Queued reports first, so an earlier turn's report precedes the session-end `Stop`
                         // Hooks fire BEFORE memory auto-save
                         let end_timer = session_end::SessionEndTimer::new_shared();
                         turn_end_queue.flush().await;
-                        fire_session_end_hooks(&session, "channel_closed", &end_timer).await;
+                        fire_session_end_hooks(&session, "channel_closed", &end_timer, &mut deferred_start).await;
+                        // Stop the dream before the end-pipeline reindex so their index writes cannot race.
+                        stop_dream(&mut dream_task).await;
                         session
                             .run_session_end_memory_pipeline(
                                 "channel closed, session summary saved",
@@ -536,12 +686,13 @@ pub(super) async fn run_session(
                         SessionCommand::Initialize { system_prompt } => {
                             session.initialize(system_prompt).await;
                             let s = session.clone();
+                            let full_wait = session.requires_full_mcp_wait();
                             let handle = tokio::task::spawn_local(instrument_task!(
                                 "session.prefix_task",
                                 Parent::Inherit,
-                                async move { s.build_prefix_background().await }
+                                async move { s.build_prefix_after_mcp_wait(full_wait).await }
                             ));
-                            session.deferred_prefix.arm(handle);
+                            session.deferred_prefix.arm(handle, full_wait);
                         }
                         SessionCommand::ReplaceSystemPrompt { system_prompt } => {
                             session.handle_replace_system_prompt(system_prompt).await;
@@ -550,11 +701,9 @@ pub(super) async fn run_session(
                             session.emit_status_snapshot_detached();
                         }
                         SessionCommand::RestorePlanApproval => {
-                            // Spawn the restored plan-approval round-trip so the command loop is not blocked on the open-ended user decision
-                            //
-                            // Detaching the handle is safe: the task lives on this session's `LocalSet` and is dropped when the session ends
-                            // Dropping it cancels the `request_plan_approval` future and clears `awaiting` via the guard
-                            // `resume_plan_approval` also self-guards against a concurrent or duplicate restore via `pending_interactions`
+                            // Spawn the restored plan-approval round-trip so the command loop is not blocked on the open-ended user decision.
+                            // Detaching the handle is safe: the task lives on this session's `LocalSet` and is dropped when the session ends.
+                            // Dropping it cancels the `request_plan_approval` future and clears `awaiting` via the guard `resume_plan_approval` also self-guards against a concurrent or duplicate restore via `pending_interactions`.
                             let s = session.clone();
                             let completion_tx = completion_tx.clone();
                             tokio::task::spawn_local(async move {
@@ -606,13 +755,9 @@ pub(super) async fn run_session(
                                     Some(session.session_info.id.0.as_ref()),
                                     Some(serde_json::json!({ "reason": "user_intake" })),
                                 );
-                                // Layer-3 LazinessDetector wake: bump the monotonic counter
-                                // Any classifier poll-loop already running snapshots a stale value and aborts
-                                // Synthetic prompts (NotificationDrain, GoalSummary, auto-wake) are not real user input and must NOT bump it
-                                // `AcqRel` (not bare `Release`): `fetch_add` is a read-modify-write
-                                // `AcqRel` publishes our write and synchronizes the read half
-                                // A reader chaining off the returned counter value then sees all prior writes from other threads
-                                // Costs nothing on x86, costs little on ARM
+                                // Layer-3 LazinessDetector wake: bump the monotonic counter.
+                                // Any classifier poll-loop already running snapshots a stale value and aborts.
+                                // Synthetic prompts (NotificationDrain, GoalSummary, auto-wake) are not real user input and must NOT bump it.
                                 session
                                     .user_input_generation
                                     .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -690,6 +835,10 @@ pub(super) async fn run_session(
                         }
                         SessionCommand::SetSessionModel { sampling_config, use_concise, is_family_switch, apply_prompt_override, skip_prompt_rewrite, auto_compact_threshold_percent, responds_to } => {
                             let updated_model_id = session.handle_set_session_model(sampling_config, use_concise, is_family_switch, apply_prompt_override, skip_prompt_rewrite, auto_compact_threshold_percent).await;
+                            let _ = responds_to.send(updated_model_id);
+                        }
+                        SessionCommand::SetReasoningEffort { effort, responds_to } => {
+                            let updated_model_id = session.handle_set_reasoning_effort(effort).await;
                             let _ = responds_to.send(updated_model_id);
                         }
                         SessionCommand::RebuildAgentForDefinition { definition, responds_to } => {
@@ -773,10 +922,17 @@ pub(super) async fn run_session(
                             let _ = respond_to.send(result);
                         }
                         SessionCommand::ListTasks { respond_to } => {
-                            let result = session.agent.borrow().tool_bridge()
-                                .list_tasks()
-                                .await;
+                            let result = session.tool_bridge_handle().list_tasks().await;
                             let _ = respond_to.send(result);
+                        }
+                        SessionCommand::EmitBackgroundTasksSnapshot {
+                            respond_to,
+                            pending,
+                        } => {
+                            session.emit_background_tasks_snapshot(pending).await;
+                            if let Some(respond_to) = respond_to {
+                                let _ = respond_to.send(());
+                            }
                         }
                         SessionCommand::GetHooksList { respond_to } => {
                             let hooks = crate::extensions::hooks::current_hook_infos(
@@ -854,11 +1010,8 @@ pub(super) async fn run_session(
                         }
                         SessionCommand::InjectNotification { prompt_id, prompt_blocks, priority, source } => {
                             let is_turn_active = session
-                                .tool_context
-                                .is_turn_active
-                                .as_ref()
-                                .map(|f| f.load(std::sync::atomic::Ordering::Relaxed))
-                                .unwrap_or(false);
+                                .session_turn_active
+                                .load(std::sync::atomic::Ordering::SeqCst);
 
                             if is_turn_active && priority == NotificationPriority::Next {
                                 // Mid-turn and `Next` priority: push to the shared buffer for the turn loop's `inject_pending_monitor_events`
@@ -982,20 +1135,17 @@ pub(super) async fn run_session(
                             }
                         }
                         SessionCommand::Cancel(options) => {
-                            // Flush the actor-owned replay buffer before tearing down the running turn
-                            // Chunks still pending at cancel (notably AgentThoughtChunk reasoning text) then get committed to updates.jsonl
-                            // A long reasoning stream's tail can sit in the buffer when the user hits Ctrl+C
-                            // It must reach disk before the trace upload snapshots the session directory
-                            // Mirrors the pattern in `FlushComplete` below.
+                            // Flush the actor-owned replay buffer before tearing down the running turn.
+                            // Chunks still pending at cancel (notably.
+                            // Ctrl+C It must reach disk before the trace upload snapshots the session directory.
                             if let Some(notification) = replay_buffer.flush() {
                                 session.emit_buffered(notification).await;
                             }
                             // Clear, don't flush: converting interjections to prompt turns would restart the model after a stop
                             session.pending_interjections.clear();
-                            // Do not abort turn summary here
-                            // Summaries spawn only after a successful turn, so a summary call still running describes that prior success
-                            // Cancel targets the current turn; the prior summary line shows until replaced, so it should still finish
-                            // New real prompts and rewind abort separately
+                            // Do not abort turn summary here.
+                            // Summaries spawn only after a successful turn, so a summary call still running describes that prior success.
+                            // Cancel targets the current turn; the prior summary line shows until replaced, so it should still finish.
                             let is_rewind = matches!(
                                 &options.history,
                                 crate::session::CancelHistoryDisposition::RewindIfNoOutput { .. }
@@ -1034,10 +1184,6 @@ pub(super) async fn run_session(
                             });
                         }
                         SessionCommand::ReloadPlugins { registry } => {
-                            // Eager fan-out: a plugin was added/removed/reloaded in another session
-                            // Adopt the pushed snapshot so this session's hooks, MCP, skills, and the client's slash-command catalog match
-                            // This is the same refresh the originating session gets, so switching here needs no lazy refetch
-                            // Subagents inherit the parent registry
                             if !session.startup_hints.is_subagent {
                                 // Fan-outs rebuild without per-session `_meta.pluginDirs`; re-merge this session's own dirs before adopting
                                 let registry = session.preserve_session_plugin_dirs(registry);
@@ -1045,11 +1191,9 @@ pub(super) async fn run_session(
                             }
                         }
                         SessionCommand::ReloadHooks => {
-                            // Re-discover the session's project hooks on the now-flipped folder-trust verdict (e.g. after a trust grant).
-                            // Reuses the same path as `/hooks reload`; subagents inherit via the parent
-                            // Run INLINE on the serialized command loop (not a spawned task) like `ReloadPlugins`
-                            // `reload_hooks_impl` mutates `hook_registry`
-                            // The file-header `await_holding_refcell_ref` allow assumes no concurrent mutation; spawning would race turn tasks
+                            // Re-discover the session's project hooks on the now-flipped folder-trust verdict.
+                            // Run INLINE on the serialized command loop (not a spawned task) like `ReloadPlugins` `reload_hooks_impl` mutates `hook_registry`.
+                            // The file-header `await_holding_refcell_ref` allow assumes no concurrent mutation; spawning would race turn tasks.
                             if !session.startup_hints.is_subagent {
                                 let _ = session.reload_hooks_impl().await;
                             }
@@ -1065,9 +1209,12 @@ pub(super) async fn run_session(
                                     &skills_config,
                                     pr.as_deref(),
                                     s.rebuild_spec.compat,
+                                    crate::agent::folder_trust::project_scope_allowed(
+                                        s.tool_context.cwd.as_path(),
+                                    ),
                                 )
                                 .await;
-                                tracing::info!(skills = new_skills.len(), "refreshed skill baseline after bundle sync");
+                                tracing::info!(skills = new_skills.len(), "refreshed skill baseline");
                                 let bridge = s.agent.borrow().tool_bridge().clone();
                                 bridge.update_skill_baseline(new_skills).await;
                                 if let Some(effects) = bridge.apply_pending_skill_update().await {
@@ -1225,11 +1372,9 @@ pub(super) async fn run_session(
                                 });
                         }
                         SessionCommand::CopyFile { respond_to } => {
-                            // Flush the actor-owned replay buffer first
-                            // Buffered notifications must reach updates.jsonl before the persistence task snapshots the session directory
-                            // Reasoning chunks streamed during sampler teardown after a cancel are one such case
-                            // `PersistenceMsg` is FIFO on `persistence_tx`, so the `Update` from `emit_buffered` lands before `CopyFile`
-                            // `flush_and_sync` on the persistence side then sees it on disk
+                            // Flush the actor-owned replay buffer before tearing down the running turn.
+                            // Chunks still pending at cancel (notably AgentThoughtChunk reasoning text) then get committed to updates.jsonl.
+                            // A long reasoning stream's tail can sit in the buffer when the user hits Ctrl+C.
                             if let Some(notification) = replay_buffer.flush() {
                                 session.emit_buffered(notification).await;
                             }
@@ -1238,14 +1383,7 @@ pub(super) async fn run_session(
                                 .send(PersistenceMsg::CopyFile { one_shot: respond_to });
                         }
                         SessionCommand::IsBusy { respond_to } => {
-                            // "Any work pending?" means a running turn or queued inputs
-                            // Consulted by the leader's idle-unload decision
-                            // Cheap: a single state lock
-                            let busy = {
-                                let state = session.state.lock().await;
-                                state_is_busy(&state)
-                            };
-                            let _ = respond_to.send(busy);
+                            let _ = respond_to.send(session.is_busy().await);
                         }
                         SessionCommand::FlushComplete { respond_to } => {
                             // Flush the actor-owned replay buffer inline
@@ -1303,24 +1441,20 @@ pub(super) async fn run_session(
                                 mcp_servers.len()
                             );
 
-                            // Re-seed the session-scoped MCP output cap
-                            // (repo `[mcp] max_output_bytes`) BEFORE the
-                            // unchanged-diff early-exit below: this command
-                            // also fires for `<cwd>/.grok/config.toml` edits,
-                            // and a cap-only edit changes no server configs.
+                            // Re-seed the session-scoped MCP output cap (repo `[mcp] max_output_bytes`) BEFORE the unchanged-diff early-exit below: this command also fires for `<cwd>/.grok/config.toml` edits, and a cap-only edit changes no server.
                             session.reseed_mcp_output_cap().await;
 
                             // Capture the dispatcher's event sender alongside the diff
                             // `McpClientEvent::ConfigDiff` can then fan out right after the in-memory swap
                             // The emit happens without holding the `mcp_state` lock
-                            let (diff, dispatch_event_tx) = {
+                            let (change, dispatch_event_tx) = {
                                 let mut mcp_state = session.mcp_state.lock().await;
-                                let diff = mcp_state.update_configs_diff(mcp_servers);
+                                let change = session.update_mcp_configs(&mut mcp_state, mcp_servers);
                                 let tx = mcp_state.client_event_tx();
-                                (diff, tx)
+                                (change, tx)
                             };
 
-                            let Some(diff) = diff else {
+                            let Some(change) = change else {
                                 tracing::debug!(
                                     "MCP configs unchanged for session '{}', skipping re-initialization",
                                     session.session_info.id.0
@@ -1329,42 +1463,12 @@ pub(super) async fn run_session(
                                 continue;
                             };
 
-                            // Emit one `ConfigDiff` so the `StatusDispatcher` fans out per-server `mcp/server_status`
-                            // The reason is `ConfigAdded` or `ConfigRemoved`
-                            // Best-effort: a dropped dispatcher means `mcp.liveness_watchers` is off or the session has shut down
-                            // The tool-bridge tear-down and re-init below still happen
-                            if (!diff.added.is_empty() || !diff.removed.is_empty())
-                                && let Some(tx) = &dispatch_event_tx
-                            {
-                                let _ = tx.send(
-                                    xai_grok_mcp::servers::McpClientEvent::ConfigDiff {
-                                        added: diff.added.clone(),
-                                        removed: diff.removed.clone(),
-                                    },
-                                );
-                            }
-
-                            for name in &diff.removed {
-                                let prefix = format!(
-                                    "{}{}",
-                                    name,
-                                    crate::session::mcp_servers::MCP_TOOL_NAME_DELIMITER
-                                );
-                                let removed_count = session
-                                    .agent
-                                    .borrow()
-                                    .tool_bridge()
-                                    .unregister_tools_by_prefix(&prefix);
-                                tracing::info!(
-                                    server = name.as_str(),
-                                    tools_removed = removed_count,
-                                    "Unregistered tools for removed MCP server"
-                                );
-                            }
-
+                            session.apply_mcp_config_diff(&change.diff, dispatch_event_tx);
                             let session_for_mcp = session.clone();
-                            tokio::task::spawn_local(async move {
-                                session_for_mcp.ensure_mcp_tools_initialized().await;
+                            startup_tasks.mcp_startup.spawn_local(async move {
+                                session_for_mcp
+                                    .start_mcp_servers_after_config_change(change)
+                                    .await;
                                 let _ = respond_to.send(Ok(()));
                             });
                         }
@@ -1403,52 +1507,22 @@ pub(super) async fn run_session(
                                 configs.retain(|c| crate::session::mcp_servers::mcp_server_name(c) != server_name);
                             }
 
-                            let diff = mcp_state.update_configs_diff(configs);
+                            let change = session.update_mcp_configs(&mut mcp_state, configs);
                             // Snapshot the dispatcher sender BEFORE dropping the lock so the emit below survives any later mutation
                             let dispatch_event_tx = mcp_state.client_event_tx();
                             drop(mcp_state);
 
-                            let Some(diff) = diff else {
+                            let Some(change) = change else {
                                 let _ = respond_to.send(Ok(()));
                                 continue;
                             };
 
-                            // ToggleMcpServer mirrors UpdateMcpServers: fan out per-server status via the dispatcher
-                            // The reason codes on `mcp/server_status` are `ConfigAdded` and `ConfigRemoved`
-                            if (!diff.added.is_empty() || !diff.removed.is_empty())
-                                && let Some(tx) = &dispatch_event_tx
-                            {
-                                let _ = tx.send(
-                                    xai_grok_mcp::servers::McpClientEvent::ConfigDiff {
-                                        added: diff.added.clone(),
-                                        removed: diff.removed.clone(),
-                                    },
-                                );
-                            }
-
-                            for name in &diff.removed {
-                                let prefix = format!(
-                                    "{}{}",
-                                    name,
-                                    crate::session::mcp_servers::MCP_TOOL_NAME_DELIMITER
-                                );
-                                let removed_count = session
-                                    .agent
-                                    .borrow()
-                                    .tool_bridge()
-                                    .unregister_tools_by_prefix(&prefix);
-                                tracing::info!(
-                                    server = name.as_str(),
-                                    tools_removed = removed_count,
-                                    "Unregistered tools for toggled MCP server"
-                                );
-                            }
-
+                            session.apply_mcp_config_diff(&change.diff, dispatch_event_tx);
                             let session_for_mcp = session.clone();
                             let sname = server_name.clone();
                             let session_cwd = session.session_info.cwd.clone();
+                            // The preference outlives the session, so its write does not ride on startup.
                             tokio::task::spawn_local(async move {
-                                session_for_mcp.ensure_mcp_tools_initialized().await;
                                 if let Err(e) = crate::util::config::save_mcp_server_enabled_in(
                                     &sname,
                                     enabled,
@@ -1462,6 +1536,11 @@ pub(super) async fn run_session(
                                         "Failed to persist server enabled state to config"
                                     );
                                 }
+                            });
+                            startup_tasks.mcp_startup.spawn_local(async move {
+                                session_for_mcp
+                                    .start_mcp_servers_after_config_change(change)
+                                    .await;
                                 let _ = respond_to.send(Ok(()));
                             });
                         }
@@ -1564,7 +1643,6 @@ pub(super) async fn run_session(
                                     let bridge = session.agent.borrow().tool_bridge().clone();
                                     if let Err(e) = bridge
                                         .register_mcp_tools(reg.name, reg.tool, Some(reg.input_schema))
-                                        .await
                                     {
                                         tracing::warn!(
                                             tool = qualified.as_str(),
@@ -1632,10 +1710,9 @@ pub(super) async fn run_session(
                                         "Failed to persist disabled_tools to config"
                                     );
                                 }
-                                // Emit the typed McpToolsChanged shape with `sessionId` populated so the pager can route via `find_session_match`
-                                // The toggle-tool path is not server-scoped
-                                // The disable mask applies to one server, but the pager refetches the full catalog
-                                // So `server_name` / `tools` stay empty, and skip-if-empty drops them from the wire
+                                // Emit the typed.
+                                // The toggle-tool path is not server-scoped.
+                                // So `server_name` / `tools` stay empty, and skip-if-empty drops them from the wire.
                                 let payload = crate::extensions::mcp::McpToolsChanged {
                                     session_id: session_id.to_string(),
                                     server_name: String::new(),
@@ -1767,8 +1844,8 @@ pub(super) async fn run_session(
                                 .notifications.persistence_tx
                                 .send(PersistenceMsg::Feedback(*entry));
                         }
-                        SessionCommand::AdvertiseCommands => {
-                            session.send_available_commands_update().await;
+                        SessionCommand::AdvertiseCommands { trigger } => {
+                            session.send_available_commands_update(trigger).await;
                         }
                         SessionCommand::GetWorkflowCatalogState { respond_to } => {
                             let tool_names = session.registered_tool_names().await;
@@ -1802,25 +1879,56 @@ pub(super) async fn run_session(
                             });
                         }
                         SessionCommand::DispatchSessionStartHook { source } => {
-                            let envelope = session.fire_hook(
-                                xai_grok_hooks::event::HookEventName::SessionStart,
-                                None,
-                                xai_grok_hooks::event::HookPayload::SessionStart {
-                                    source,
-                                    model_id: None,
-                                    agent_type: None,
-                                },
-                            );
-                            if let Some(registry) = session.hook_registry.borrow().clone() {
-                                let ctx = session.hook_run_ctx();
-                                let results = xai_grok_hooks::dispatcher::dispatch_non_blocking(
-                                    &registry,
-                                    xai_grok_hooks::event::HookEventName::SessionStart,
-                                    &envelope,
-                                    &ctx,
-                                )
-                                .await;
-                                session.send_hook_execution("session_start", None, None, &results).await;
+                            // Observe hooks cannot gate; don't hold session/new on the command loop.
+                            if !deferred_start.cancel.is_cancelled() {
+                                let s = session.clone();
+                                let cancel = deferred_start.cancel.clone();
+                                let handle = tokio::task::spawn_local(async move {
+                                    xai_grok_hooks::runner::command::join_hook_group_reaps(async {
+                                        let run = async {
+                                            if cancel.is_cancelled() {
+                                                return;
+                                            }
+                                            let envelope = s.fire_hook(
+                                                xai_grok_hooks::event::HookEventName::SessionStart,
+                                                None,
+                                                xai_grok_hooks::event::HookPayload::SessionStart {
+                                                    source,
+                                                    model_id: None,
+                                                    agent_type: None,
+                                                },
+                                            );
+                                            let Some(registry) = s.hook_registry.borrow().clone()
+                                            else {
+                                                return;
+                                            };
+                                            let ctx = s.hook_run_ctx();
+                                            let results =
+                                                xai_grok_hooks::dispatcher::dispatch_non_blocking(
+                                                    &registry,
+                                                    xai_grok_hooks::event::HookEventName::SessionStart,
+                                                    &envelope,
+                                                    &ctx,
+                                                )
+                                                .await;
+                                            if cancel.is_cancelled() {
+                                                return;
+                                            }
+                                            s.send_hook_execution(
+                                                &HookBatch::from_envelope(&envelope),
+                                                &results,
+                                            )
+                                            .await;
+                                        };
+                                        tokio::select! {
+                                            biased;
+                                            _ = cancel.cancelled() => {}
+                                            _ = run => {}
+                                        }
+                                    })
+                                    .await;
+                                });
+                                deferred_start.arm(handle);
                             }
                         }
                         SessionCommand::GetFeedbackContext { turn_number, responds_to } => {
@@ -2047,10 +2155,9 @@ pub(super) async fn run_session(
                             let _ = respond_to.send(result);
                         }
                         SessionCommand::TakeStreamingCapture { prompt_id, respond_to } => {
-                            // Out-of-band: never touches `chat_state`
-                            // The live slot is the only source of truth; there is no stash
-                            // A queued prompt's `StreamStarted` racing this take resets the slot to the new prompt-id
-                            // We then log a tripwire before returning `None`
+                            // Out-of-band: never touches `chat_state`.
+                            // The live slot is the only source of truth; there is no stash A queued prompt's `StreamStarted` racing this take resets the slot to the new prompt-id.
+                            // We then log a tripwire before returning `None`.
                             let taken = {
                                 let mut cap = session.streaming_turn_capture.lock();
                                 if cap.prompt_id.as_deref() == Some(prompt_id.as_str()) {
@@ -2084,13 +2191,17 @@ pub(super) async fn run_session(
                                 PersistenceMsg::GitHead { commit, branch },
                             );
                         }
+                        SessionCommand::PersistResumeStatus { respond_to } => {
+                            session.persist_resume_status().await;
+                            let _ = respond_to.send(());
+                        }
                         SessionCommand::Shutdown(kind) => {
                             let end_timer = session_end::SessionEndTimer::new_shared();
+                            session.persist_resume_status().await;
                             shutdown_workflows(&session, &end_timer).await;
-                            // Flush the actor-owned replay buffer so streamed chunks still pending at shutdown are committed to updates.jsonl
-                            // That covers reasoning text from a sampler stream racing a CLI exit or harness teardown
-                            // The commit must precede the session-directory snapshot for trace upload
-                            // Mirrors the same flush in the Cancel, CopyFile, and FlushComplete arms
+                            // Flush the actor-owned replay buffer so streamed chunks still pending at shutdown are committed to updates.jsonl.
+                            // The commit must precede the session-directory snapshot for trace upload.
+                            // Mirrors the same flush in the.
                             if let Some(notification) = replay_buffer.flush() {
                                 session.emit_buffered(notification).await;
                             }
@@ -2110,17 +2221,22 @@ pub(super) async fn run_session(
                                     })
                                     .await;
                             }
-                            // Drop any queued synthetic auto-wake prompts and pending notifications before running hooks
-                            // A synthetic prompt can slip through the per-tool-result sweep
-                            // A later persistence path would then flush it to chat_history.jsonl
-                            // That leaves a trailing `<system-reminder>` with no assistant reply
-                            // Placed BEFORE hook dispatch so the cleanup runs even if hooks abort
+                            session
+                                .settle_all_parent_messages(
+                                    xai_message_delivery_core::TerminalCause::HardTeardown,
+                                )
+                                .await;
+                            // Drop any queued synthetic auto-wake prompts and pending notifications before running hooks A synthetic prompt can slip through the per-tool-result sweep A later persistence path would then flush it to chat_history.jsonl.
+                            // That leaves a trailing `<system-reminder>` with no assistant reply.
+                            // Placed BEFORE hook dispatch so the cleanup runs even if hooks abort.
                             session.drop_pending_synthetic_items().await;
 
                             // ── session_end (shutdown path) ────────────
                             // Hooks fire BEFORE memory auto-save
                             turn_end_queue.flush().await;
-                            fire_session_end_hooks(&session, "shutdown", &end_timer).await;
+                            fire_session_end_hooks(&session, "shutdown", &end_timer, &mut deferred_start).await;
+                            // Stop the dream before the end-pipeline reindex so their index writes cannot race.
+                            stop_dream(&mut dream_task).await;
                             session
                                 .run_session_end_memory_pipeline(
                                     "session summary saved",
@@ -2148,11 +2264,18 @@ pub(super) async fn run_session(
                         processed,
                     }) = maybe_completion
                     else {
+                        session
+                            .settle_all_parent_messages(
+                                xai_message_delivery_core::TerminalCause::ActorDrop,
+                            )
+                            .await;
                         // Completion channel closed: full feedback teardown so the final signal sync and upload drain still run
                         // Cancel alone does not force-sync; shutdown owns that
                         // No session-end hooks here, but the flush still precedes `shutdown_workflows`, which makes a queued report's entry durable
                         let end_timer = session_end::SessionEndTimer::new_shared();
                         turn_end_queue.flush().await;
+                        // Stop the dream so it does not outlive the session holding the mutex.
+                        stop_dream(&mut dream_task).await;
                         shutdown_workflows(&session, &end_timer).await;
                         turn_end_queue.drain().await;
                         finish_session_exit_feedback(&session, &end_timer).await;
@@ -2202,12 +2325,9 @@ pub(super) async fn run_session(
                     session
                         .handle_turn_end(turn_succeeded, suppress_goal_continuation)
                         .await;
-                    // Interjections that arrived during turn-end bookkeeping raced past the turn's final drain and have no turn left to merge into
-                    // Convert them to front-of-queue prompt turns so the message runs instead of stranding
-                    //
-                    // INVARIANT: this flush must only ever see interjections aimed at the turn that just completed
-                    // This arm runs in the same serialized actor loop as `SessionCommand::Interject`, so no live turn's buffer is stolen mid-stream
-                    // Both cancel paths drain the buffer before their completion arrives
+                    // Convert them to front-of-queue prompt turns so the message runs instead of stranding.
+                    // INVARIANT: this flush must only ever see interjections aimed at the turn that just completed.
+                    // Both cancel paths drain the buffer before their completion arrives.
                     let flushed_interjections = session.flush_stranded_interjections().await;
                     if flushed_interjections > 0 {
                         tracing::info!("Flushed stranded interjection(s) into prompt turns");
@@ -2225,20 +2345,18 @@ pub(super) async fn run_session(
                     // If no user prompt started, check for pending notifications
                     SessionActor::maybe_drain_notifications(session.clone(), completion_tx.clone()).await;
                     session.emit_session_idle_if_idle().await;
-                    // Layer-3 LazinessDetector: spawn an idle-triggered classifier dispatch
-                    // The method is a no-op when the per-model `laziness_detector.enabled = false` (the v1 default for every model)
-                    // No classification cost is incurred without explicit opt-in
-                    // Spawned via `spawn_local` so the actor loop can continue accepting commands while the classifier idle-waits
+                    // LazinessDetector: spawn an idle-triggered classifier dispatch.
+                    // The method is a no-op when the per-model `laziness_detector.enabled = false` (the v1 default for every model).
+                    // No classification cost is incurred without explicit opt-in.
                     {
                         let s = session.clone();
                         tokio::task::spawn_local(async move {
                             s.maybe_fire_laziness_check().await;
                         });
                     }
-                    // Per-turn dashboard summary (display-only side-call); spawned so the actor loop keeps accepting commands
-                    // `turn_succeeded` keeps cancelled/errored/refused turns from triggering a fresh model call
-                    // A user who hit Ctrl+C wants model activity to stop
-                    // Stale completions already `continue`d above, so a turn the Cancel path finalized never reaches this summary
+                    // Per-turn dashboard summary (display-only side-call); spawned so the actor loop keeps accepting commands.
+                    // `turn_succeeded` keeps cancelled/errored/refused turns from triggering a fresh model call.
+                    // A user who hit Ctrl+C wants model activity to stop.
                     if turn_ran && turn_succeeded {
                         session.restart_turn_summary(completed_prompt_id);
                         // Early-session auto-title refresh (turns 3 and 6), then frozen
