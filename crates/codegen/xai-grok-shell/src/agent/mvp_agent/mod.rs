@@ -9,7 +9,8 @@ use std::{
 use tokio::sync::mpsc;
 /// A `'static` reference to a value on a single-threaded `LocalSet`. Encapsulates the raw-pointer pattern used when `spawn_local` tasks need `&T` but the borrow checker requires `'static`.
 /// The pointer is valid as long as: `T` is heap-allocated and never moved (e.g., behind `Rc` or owned by the ACP connection for the process lifetime). All access happens on the **same** `LocalSet` thread (no `Send`).
-/// The `LocalRef` does not outlive the `LocalSet`. These invariants are upheld by construction. `LocalRef` is `!Send` (via `*const T`) and is only used inside `spawn_local` closures on the agent's `LocalSet`.
+/// The `LocalRef` does not outlive the `LocalSet`. `LocalRef` is `!Send` (via `*const T`) and is only used inside `spawn_local` closures on the agent's `LocalSet`.
+/// Every entrypoint that builds a `MvpAgent` must hold an `Rc` to it, declared before the `LocalSet`, so the agent outlives every task on the set on normal exit and unwind alike.
 pub(crate) struct LocalRef<T> {
     ptr: *const T,
 }
@@ -50,6 +51,7 @@ use xai_grok_sampling_types::{
 };
 use crate::agent::update_chunk_merge;
 use xai_grok_login::AuthManager;
+use xai_grok_login::backend::AuthBackend as _;
 use crate::config::StorageMode;
 use crate::extensions::notification::{SessionNotification, SessionUpdate};
 use xai_grok_telemetry::id::{agent_id, agent_instance_id};
@@ -219,6 +221,8 @@ pub(crate) struct SessionSpawnOptions<'a> {
     pub initial_client_mcp_servers: Vec<acp::McpServer>,
     pub mcp_meta_config_map: McpMetaConfigMap,
     pub persistence: PersistenceHandle,
+    pub(super) root_identity: Option<agent_directory::PendingRootIdentity>,
+    pub(super) attach_waiter: Option<&'a tokio::sync::watch::Receiver<bool>>,
     pub chat_history: Vec<crate::sampling::ConversationItem>,
     pub rewind_points_file_path: Option<std::path::PathBuf>,
     pub initial_total_tokens: u64,
@@ -239,6 +243,7 @@ pub(crate) struct SessionSpawnOptions<'a> {
         crate::session::announcement_state::AnnouncementState,
     >,
     pub session_meta: Option<&'a acp::Meta>,
+    pub persisted_agent_profile: Option<xai_grok_agent::AgentDefinition>,
     pub model_agent_type: Option<&'a str>,
     pub session_model_id: acp::ModelId,
     /// A `session/new` reasoning-effort hint applied to the spawn sampling; `None` for loads.
@@ -366,6 +371,8 @@ pub(crate) fn chat_session_spawn_options<'a>(
         initial_client_mcp_servers: Vec::new(),
         mcp_meta_config_map: Default::default(),
         persistence: crate::session::persistence::PersistenceHandle::noop(),
+        root_identity: None,
+        attach_waiter: None,
         chat_history: Vec::new(),
         rewind_points_file_path: None,
         initial_total_tokens: 0,
@@ -381,6 +388,7 @@ pub(crate) fn chat_session_spawn_options<'a>(
         persisted_workflow_runs: Vec::new(),
         persisted_announcement_state: None,
         session_meta,
+        persisted_agent_profile: None,
         model_agent_type,
         session_model_id,
         initial_reasoning_effort: None,
@@ -552,6 +560,10 @@ struct SettingsUpdateNotification {
     subscription_watch_interval_secs: Option<u64>,
     dock_enabled: Option<bool>,
     terminal_theme_enabled: Option<bool>,
+    /// The remote tier the pager's settings row shows beside the saved `[features]` key.
+    /// Omitted while the agent has no settings (the pager keeps the tier it seeded itself); `null` once fetched settings lack the key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subagent_model_inheritance_enabled: Option<Option<bool>>,
 }
 /// When the announcements push gate emits despite an unchanged visible list.
 #[derive(Clone, Copy, Debug)]
@@ -718,8 +730,9 @@ pub struct MvpAgent {
     pub(crate) trace_upload_live: Arc<std::sync::atomic::AtomicBool>,
     /// Shell-issued one-shot upload capabilities. Each token is bound to one session and consumed before archive I/O.
     feedback_trace_upload_grants: RefCell<VecDeque<(String, acp::SessionId)>>,
-    /// Memory system configuration (None when memory is disabled).
-    memory_config: Option<crate::config::MemoryConfig>,
+    /// Memory system configuration for future session spawns.
+    /// Replaced after runtime config is re-resolved; running sessions retain their cloned snapshot.
+    memory_config: RefCell<Option<crate::config::MemoryConfig>>,
     /// Optional channel to the leader's `ConfigFileWatcher` for dynamic per-cwd registration as new sessions open.
     /// Each successful session insert in `spawn_and_register_session` sends the session's cwd to the watcher task spawned in `agent/app.rs`.
     /// That task calls [`crate::config::watcher::ConfigFileWatcher::watch_path`] (a **non-recursive** watch on `<cwd>/` and `<cwd>/.grok/`). `None` outside leader mode and in tests; the registration is a no-op in that case. That is fine: the existing per-extra-path loop already covers the leader's startup cwd. Plain `Option` (not `RefCell`). It is only read thereafter, so no interior mutability is required.
@@ -1072,38 +1085,6 @@ impl AuthRequestMeta {
             .unwrap_or_default()
     }
 }
-/// Every authenticated request to cli-chat-proxy (web search, image gen, and any future tools that go through the proxy) must carry these headers.
-/// Headers injected: `x-grok-client-version`: required by the proxy's version-gate check. Uses `client_version` when provided, otherwise falls back to cli-chat-proxy compile-time `CARGO_PKG_VERSION`.
-/// `X-XAI-Token-Auth` / `x-authenticateresponse`: required by the cli-chat-proxy auth middleware when the `base_url` is a known proxy URL. Existing entries are never overwritten so callers can pre-set a value.
-fn inject_proxy_headers(
-    headers: &mut indexmap::IndexMap<String, String>,
-    client_version: Option<&str>,
-    alpha_test_key: Option<&str>,
-    base_url: &str,
-) {
-    headers
-        .entry("x-grok-client-version".to_string())
-        .or_insert_with(|| {
-            client_version
-                .map(String::from)
-                .unwrap_or_else(|| xai_grok_version::VERSION.to_string())
-        });
-    headers
-        .entry("x-grok-client-identifier".to_string())
-        .or_insert_with(crate::http::process_client_identifier);
-    if crate::util::is_cli_chat_proxy_url(base_url) {
-        headers
-            .entry("X-XAI-Token-Auth".to_string())
-            .or_insert_with(|| "xai-grok-cli".to_string());
-        headers
-            .entry("x-authenticateresponse".to_string())
-            .or_insert_with(|| "authenticate-response".to_string());
-        headers
-            .entry(crate::http::CLIENT_MODE_HEADER.to_string())
-            .or_insert_with(|| crate::http::process_client_mode().to_string());
-    }
-    let _ = (alpha_test_key, base_url);
-}
 fn resolve_inference_idle_timeout_secs(
     models: &indexmap::IndexMap<String, crate::agent::config::ModelEntry>,
     model: &str,
@@ -1220,7 +1201,7 @@ pub(super) const DRAIN_OLD_THREAD_WAIT: std::time::Duration = std::time::Duratio
 pub(crate) struct SessionLoadGuard<'a> {
     agent: &'a MvpAgent,
     session_id: acp::SessionId,
-    rx: tokio::sync::watch::Receiver<bool>,
+    pub(super) rx: tokio::sync::watch::Receiver<bool>,
     /// Dropped with the guard; closes the watch channel, waking waiters.
     _tx: tokio::sync::watch::Sender<bool>,
 }
@@ -1229,6 +1210,7 @@ impl Drop for SessionLoadGuard<'_> {
         self.agent.session_registry.settle_attach(&self.session_id, &self.rx);
     }
 }
+mod agent_directory;
 mod agent_runtime;
 mod code_nav;
 mod folder_trust_prompt;
@@ -1241,10 +1223,13 @@ mod acp_agent;
 pub(crate) mod reasoning_effort;
 mod sampler_prewarm;
 mod session_setup;
+pub use session_setup::SessionSetupPhase;
 mod subagent_spawn;
 pub(crate) mod test_hooks;
 mod turn_end;
-use session_registry::SessionRegistry;
+use session_registry::{
+    IdentityStamp, SessionRegistry, StampResolution, WithdrawnInstall,
+};
 pub(crate) use session_lifecycle::RegistrySnapshot;
 pub(super) use super::ext_parsers;
 /// Named `auth.lifecycle` (not `auth`) to avoid colliding with the pre-existing per-request `AuthManager::auth()` `#[instrument]` span.
@@ -1305,26 +1290,37 @@ impl MvpAgent {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
                 continue;
             };
-            let update = &v["params"]["update"];
-            match update["sessionUpdate"].as_str() {
+            let Some(update) = v.get("params").and_then(|p| p.get("update")) else {
+                continue;
+            };
+            match update.get("sessionUpdate").and_then(|s| s.as_str()) {
                 Some(tag) if tag == *TASK_BACKGROUNDED => {
-                    if let Some(id) = update["task_id"].as_str() {
+                    if let Some(id) = update.get("task_id").and_then(|v| v.as_str()) {
                         pending
                             .insert(
                                 id.to_string(),
                                 OrphanedTask {
                                     task_id: id.to_string(),
-                                    command: update["command"]
-                                        .as_str()
+                                    command: update
+                                        .get("command")
+                                        .and_then(|v| v.as_str())
                                         .unwrap_or_default()
                                         .to_string(),
-                                    cwd: update["cwd"].as_str().unwrap_or_default().to_string(),
+                                    cwd: update
+                                        .get("cwd")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default()
+                                        .to_string(),
                                 },
                             );
                     }
                 }
                 Some(tag) if tag == *TASK_COMPLETED => {
-                    if let Some(id) = update["task_snapshot"]["task_id"].as_str() {
+                    if let Some(id) = update
+                        .get("task_snapshot")
+                        .and_then(|s| s.get("task_id"))
+                        .and_then(|v| v.as_str())
+                    {
                         pending.remove(id);
                     }
                 }
@@ -1357,7 +1353,9 @@ impl MvpAgent {
                 output_file: std::path::PathBuf::new(),
                 truncated: false,
                 exit_code: None,
-                signal: Some("session_restart".to_string()),
+                signal: Some(
+                    xai_grok_tools::computer::types::SESSION_RESTART_SIGNAL.to_string(),
+                ),
                 completed: true,
                 kind: xai_grok_tools::computer::types::TaskKind::Bash,
                 block_waited: false,
@@ -1728,14 +1726,18 @@ impl MvpAgent {
                     email: auth.email.clone(),
                     auth_mode: Some(format!("{:?}", auth.auth_mode)),
                     team_id: auth.team_id.clone(),
+                    is_team_principal: auth.is_team_principal(),
                     team_name: auth.team_name.clone(),
                     is_zdr: auth.is_zdr_team(),
                     team_role: auth.team_role.clone(),
                     coding_data_retention_opt_out: auth.coding_data_retention_opt_out,
+                    can_administer_team: auth.can_administer_team,
                     show_resolved_model,
                     gate,
                     subscription_tier,
                     feedback_trace_offer: self.feedback_trace_offer(),
+                    backend_billed: !xai_grok_login::backend::ActiveAuthBackend::default()
+                        .is_xai_authority(),
                 };
                 serde_json::to_value(auth_meta)
                     .ok()
@@ -1876,6 +1878,10 @@ impl MvpAgent {
                     .and_then(|s| s.subscription_watch_interval_secs),
                 dock_enabled: rs.and_then(|s| s.dock_enabled),
                 terminal_theme_enabled: rs.and_then(|s| s.terminal_theme_enabled),
+                subagent_model_inheritance_enabled: rs
+                    .map(|s| {
+                        config::Feature::SubagentModelInheritance.remote_value(Some(s))
+                    }),
             }
         };
         if let Ok(params) = serde_json::value::to_raw_value(&payload) {

@@ -18,19 +18,14 @@ fn dispatch_span(event: HookEventName, hook_count: usize) -> tracing::Span {
     )
 }
 
-/// The one per-spec disable rule: a user-disabled spec is skipped unless it is managed policy, which cannot be disabled.
-pub(crate) fn is_disabled(spec: &HookSpec, disabled: &DisabledHooks) -> bool {
-    (!spec.enabled || disabled.contains(&spec.name)) && !spec.is_managed_policy()
-}
-
 fn eligible_or_record_skip(
     spec: &HookSpec,
     match_value: Option<&str>,
     results: &mut Vec<HookRunResult>,
     disabled: &DisabledHooks,
 ) -> bool {
-    if is_disabled(spec, disabled) {
-        tracing::info!(hook_name = %spec.name, "hook skipped (disabled)");
+    if let Some(reason) = disabled.skip_reason(spec) {
+        tracing::info!(hook_name = %spec.name, skip_reason = ?reason, "hook skipped");
         results.push(HookRunResult::Skipped {
             hook_name: spec.name.clone(),
         });
@@ -50,7 +45,7 @@ pub fn runnable_count(
     registry
         .hooks_for_canonical(envelope.hook_event_name)
         .into_iter()
-        .filter(|spec| !is_disabled(spec, ctx.disabled()))
+        .filter(|spec| !ctx.disabled().blocks(spec))
         .filter(|spec| crate::matcher::matcher_allows(spec.matcher.as_ref(), match_value))
         .count()
 }
@@ -1158,7 +1153,10 @@ mod tests {
         .await;
         assert_eq!(result.decision, HookDecision::Allow);
         let rewrite = result.updated_input.expect("updatedInput carried");
-        assert_eq!(rewrite.input["command"], "two");
+        assert_eq!(
+            rewrite.input.get("command").and_then(|v| v.as_str()),
+            Some("two")
+        );
         assert_eq!(rewrite.hook_name, "second");
     }
 
@@ -1239,7 +1237,10 @@ mod tests {
         let rewrite = result
             .updated_input
             .expect("the earlier rewrite must survive a later failure");
-        assert_eq!(rewrite.input["command"], "one");
+        assert_eq!(
+            rewrite.input.get("command").and_then(|v| v.as_str()),
+            Some("one")
+        );
         assert_eq!(rewrite.hook_name, "rewriter");
     }
 
@@ -1315,7 +1316,10 @@ mod tests {
         .await;
         assert!(matches!(result.decision, HookDecision::Ask { .. }));
         let rewrite = result.updated_input.expect("ask carries updatedInput");
-        assert_eq!(rewrite.input["command"], "safe");
+        assert_eq!(
+            rewrite.input.get("command").and_then(|v| v.as_str()),
+            Some("safe")
+        );
     }
 
     #[tokio::test]
@@ -1457,11 +1461,14 @@ mod tests {
         .await;
         assert_eq!(result.decision, HookDecision::Allow);
         assert!(matches!(
-            &result.results[0],
+            result.results.first().unwrap_or_else(|| panic!("expected results item 0")),
             HookRunResult::Success { system_message: Some(msg), .. } if msg == "heads up"
         ));
         assert!(matches!(
-            &result.results[1],
+            result
+                .results
+                .get(1)
+                .unwrap_or_else(|| panic!("expected results item 1")),
             HookRunResult::Success {
                 system_message: None,
                 ..
@@ -1509,7 +1516,7 @@ mod tests {
             ref other => panic!("expected Block, got {other:?}"),
         }
         assert!(
-            matches!(result.results[0], HookRunResult::Blocked { .. }),
+            matches!(result.results.first(), Some(HookRunResult::Blocked { .. })),
             "a block must record HookRunResult::Blocked for telemetry"
         );
     }
@@ -1542,7 +1549,10 @@ mod tests {
         let registry = registry_from_specs(vec![spec]);
         let result = dispatch_prompt_gate(&registry, &prompt_submit_envelope(), &run_ctx()).await;
         assert_eq!(result.decision, PromptDecision::Allow);
-        assert!(matches!(result.results[0], HookRunResult::Failed { .. }));
+        assert!(matches!(
+            result.results.first(),
+            Some(HookRunResult::Failed { .. })
+        ));
     }
 
     #[tokio::test]
@@ -1551,7 +1561,10 @@ mod tests {
         let registry = registry_from_specs(vec![spec]);
         let result = dispatch_prompt_gate(&registry, &prompt_submit_envelope(), &run_ctx()).await;
         assert_eq!(result.decision, PromptDecision::Allow);
-        assert!(matches!(result.results[0], HookRunResult::Success { .. }));
+        assert!(matches!(
+            result.results.first(),
+            Some(HookRunResult::Success { .. })
+        ));
     }
 
     #[tokio::test]
@@ -1661,7 +1674,7 @@ mod tests {
         );
         assert_eq!(result.results.len(), 1);
         assert!(
-            matches!(&result.results[0], HookRunResult::Failed { hook_name, .. } if hook_name == "crasher"),
+            matches!(result.results.first(), Some(HookRunResult::Failed { hook_name, .. }) if hook_name == "crasher"),
             "the failure must still appear in run_results for UI scrollback, got {:?}",
             result.results
         );
@@ -1691,10 +1704,10 @@ mod tests {
         }
         assert_eq!(result.results.len(), 2);
         assert!(
-            matches!(&result.results[1], HookRunResult::Blocked { detail, .. }
+            matches!(result.results.get(1), Some(HookRunResult::Blocked { detail, .. })
                 if detail == "denied: nope"),
             "a deny is the hook's decision, not a failure: {:?}",
-            result.results[1]
+            result.results.get(1)
         );
     }
 
@@ -1830,7 +1843,10 @@ mod tests {
             dispatch_stop(&registry, HookEventName::Stop, &stop_envelope(), &run_ctx()).await;
         assert!(result.wants_continuation());
         assert_eq!(result.blocks.len(), 1);
-        assert_eq!(result.blocks[0].reason, "fix the build");
+        assert_eq!(
+            result.blocks.first().map(|b| b.reason.as_str()),
+            Some("fix the build")
+        );
         assert_eq!(result.additional_context, ["note"]);
     }
 
@@ -1866,9 +1882,9 @@ mod tests {
             "timeout must not block the stop"
         );
         assert!(
-            matches!(&result.results[0], HookRunResult::Failed { .. }),
+            matches!(result.results.first(), Some(HookRunResult::Failed { .. })),
             "the timeout is recorded as a failure, got {:?}",
-            result.results[0]
+            result.results.first()
         );
     }
 
@@ -1958,7 +1974,10 @@ mod tests {
         )
         .await;
         assert_eq!(result.blocks.len(), 1, "only the matching spec runs");
-        assert_eq!(result.blocks[0].reason, "from explorer");
+        assert_eq!(
+            result.blocks.first().map(|b| b.reason.as_str()),
+            Some("from explorer")
+        );
     }
 
     #[tokio::test]
@@ -1977,8 +1996,18 @@ mod tests {
         )
         .await;
         assert_eq!(results.len(), 2);
-        assert!(matches!(results[0], HookRunResult::Failed { .. }));
-        assert!(matches!(results[1], HookRunResult::Success { .. }));
+        assert!(matches!(
+            results
+                .first()
+                .unwrap_or_else(|| panic!("expected results item 0: {results:?}")),
+            HookRunResult::Failed { .. }
+        ));
+        assert!(matches!(
+            results
+                .get(1)
+                .unwrap_or_else(|| panic!("expected results item 1: {results:?}")),
+            HookRunResult::Success { .. }
+        ));
     }
 
     #[test]
@@ -2124,7 +2153,14 @@ mod tests {
             .builtin_replacement
             .as_ref()
             .expect("the later same-kind write wins the built-in slot");
-        assert_eq!(selected.replacement.value["command"], "second");
+        assert_eq!(
+            selected
+                .replacement
+                .value
+                .get("command")
+                .and_then(|v| v.as_str()),
+            Some("second")
+        );
         assert_eq!(selected.run_index, 1);
         assert!(result.mcp_replacement.is_none());
     }
@@ -2181,10 +2217,13 @@ mod tests {
 
     #[test]
     fn disabled_hooks_file_cannot_skip_managed_policy_hook() {
-        let disabled = crate::trust::DisabledHooks::from_names([
-            "requirements/system:pre_tool_use[0].hooks[0]".to_string(),
-            "global/user-hook".to_string(),
-        ]);
+        let disabled = crate::trust::DisabledHooks::new(
+            [
+                "requirements/system:pre_tool_use[0].hooks[0]".to_string(),
+                "global/user-hook".to_string(),
+            ],
+            false,
+        );
 
         let mut results = Vec::new();
         let mut managed = make_command_spec(
@@ -2205,15 +2244,54 @@ mod tests {
             !eligible_or_record_skip(&user, None, &mut results, &disabled),
             "a user hook with the same disabled-hooks treatment must be filtered"
         );
-        assert!(matches!(results[0], HookRunResult::Skipped { .. }));
-
-        assert!(
-            !crate::trust::hook_disabled_for_display_with(&managed, &disabled),
-            "managed-policy hooks must never display as disabled"
-        );
-        assert!(crate::trust::hook_disabled_for_display_with(
-            &user, &disabled
+        assert!(matches!(
+            results
+                .first()
+                .unwrap_or_else(|| panic!("expected results item 0: {results:?}")),
+            HookRunResult::Skipped { .. }
         ));
+    }
+
+    /// Under `allow_managed_hooks_only` every non-managed hook is skipped, whatever the disabled-hooks file says, and managed policy still runs.
+    #[test]
+    fn managed_only_lockdown_skips_every_non_managed_hook() {
+        use crate::config::HookProvenance;
+        use crate::trust::{DisabledHooks, HookSkipReason};
+        let lockdown = DisabledHooks::new([], true);
+
+        for layer in [HookProvenance::SystemManaged, HookProvenance::Requirements] {
+            let mut managed = make_command_spec("managed", None, true, "echo ok");
+            managed.layer = layer;
+            assert_eq!(lockdown.skip_reason(&managed), None, "{layer:?}");
+        }
+
+        for layer in [
+            HookProvenance::Managed,
+            HookProvenance::UserRequirements,
+            HookProvenance::User,
+            HookProvenance::File,
+            HookProvenance::Plugin,
+            HookProvenance::Unknown,
+        ] {
+            let mut spec = make_command_spec("non-managed", None, true, "echo ok");
+            spec.layer = layer;
+            assert_eq!(
+                lockdown.skip_reason(&spec),
+                Some(HookSkipReason::ManagedOnly),
+                "{layer:?}"
+            );
+        }
+
+        // The lockdown outranks a user disable as the reported reason; without it the user reason stands.
+        let user_disabled = make_command_spec("global/off", None, false, "echo ok");
+        assert_eq!(
+            lockdown.skip_reason(&user_disabled),
+            Some(HookSkipReason::ManagedOnly)
+        );
+        assert_eq!(
+            DisabledHooks::new([], false).skip_reason(&user_disabled),
+            Some(HookSkipReason::UserDisabled)
+        );
     }
 
     #[tokio::test]
@@ -2259,19 +2337,28 @@ mod tests {
             make_command_spec("e", None, true, "true"),
             managed,
         ]);
-        let ctx = RunContext {
-            disabled: std::sync::Arc::new(DisabledHooks::from_names(["e".to_string()])),
-            ..run_ctx()
-        };
-        // read_file: a, b, managed (flagged disabled but exempt); d is disabled, e is in the snapshot, c misses the matcher
-        for (tool, expected) in [("read_file", 3), ("grep", 2)] {
+        // read_file: a, b, managed (flagged disabled but exempt); d is disabled, e is in the snapshot, c misses the matcher.
+        // Under the managed-only lockdown only the managed hook is left.
+        for (managed_only, tool, expected) in [
+            (false, "read_file", 3),
+            (false, "grep", 2),
+            (true, "read_file", 1),
+        ] {
+            let ctx = RunContext {
+                disabled: std::sync::Arc::new(DisabledHooks::new(["e".to_string()], managed_only)),
+                ..run_ctx()
+            };
             let envelope = pre_tool_use_envelope(tool);
             let count = runnable_count(&registry, &envelope, &ctx);
-            assert_eq!(count, expected, "{tool}");
+            assert_eq!(count, expected, "{tool} managed_only={managed_only}");
             let result = dispatch_pre_tool_use(&registry, &envelope, &ctx).await;
-            assert_eq!(count, ran(&result.results), "{tool}");
+            assert_eq!(
+                count,
+                ran(&result.results),
+                "{tool} managed_only={managed_only}"
+            );
         }
-        assert_eq!(runnable_count(&registry, &stop_envelope(), &ctx), 0);
+        assert_eq!(runnable_count(&registry, &stop_envelope(), &run_ctx()), 0);
     }
 
     /// Non-tool events match on their own payload field, so a count that ignored the payload would over-announce.

@@ -23,7 +23,6 @@ use xai_grok_workspace::permission::mcp_pretty_name_if_qualified;
 
 use crate::acp::tracker::{TurnActivity, WaitingReason};
 use crate::app::agent::{AgentCommand, AgentState};
-use crate::app::agent_view::McpInitProgress;
 use crate::render::line_utils::truncate_str;
 use crate::theme::Theme;
 
@@ -36,6 +35,10 @@ pub(crate) const SPINNER_DIVISOR: u64 = 4;
 /// Its `○ ◎ ◉ ◎` cycle therefore runs at roughly half the speed (~1.07s per loop).
 pub(crate) const MONITOR_PULSE_DIVISOR: u64 = 8;
 
+/// Rows narrower than this hide the phase timer, which would sit beside the right-aligned turn
+/// timer and read as one confusing pair of numbers. The turn timer stays.
+pub(crate) const PHASE_TIMER_MIN_WIDTH: u16 = 60;
+
 /// Pulse speed for every "waiting on you" diamond. Always route diamond rendering through
 /// [`pending_diamond_color`] so the three call sites can never silently drift apart.
 pub(crate) const USER_WAITING_PULSE_SPEED: f32 = 0.08;
@@ -46,10 +49,6 @@ pub(crate) fn pending_diamond_color(theme: &Theme, accent: Color, tick: u64) -> 
     crate::render::color::blend_color(theme.bg_base, accent, 0.3 + brightness * 0.7)
         .unwrap_or(accent)
 }
-
-// ---------------------------------------------------------------------------
-// Output
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Default)]
 pub struct TurnStatusOutput {
@@ -168,7 +167,8 @@ pub struct TurnStatusArgs<'a> {
     pub has_running_execute: bool,
     /// Context-window tokens used, shown as `⇣Nk`.
     pub total_tokens: Option<u64>,
-    pub mcp_init_progress: Option<&'a McpInitProgress>,
+    /// When the session create was dispatched; `Some` until the id binds or the create fails
+    pub session_starting_since: Option<Instant>,
     pub is_bash_turn: bool,
     pub is_pending_user_input: bool,
     pub goal_verifying: bool,
@@ -199,7 +199,7 @@ pub fn render_turn_status(
         buttons,
         has_running_execute,
         total_tokens,
-        mcp_init_progress,
+        session_starting_since,
         is_bash_turn,
         is_pending_user_input,
         goal_verifying,
@@ -219,16 +219,12 @@ pub fn render_turn_status(
 
     let theme = Theme::current();
 
-    // An MCP startup seed (total == 0) while idle shows "Starting session…" above the prompt until the shell reports real server counts
-    // Real MCP progress (total > 0) renders as the compact top-bar chip instead, not here
-    // The seed auto-expires via `is_visible()` if the shell never reports
+    // Idle with a session create in flight shows "Starting session…" above the prompt
     if state.is_idle()
         && !drain_blocked
-        && let Some(progress) = mcp_init_progress
-        && progress.total == 0
-        && progress.is_visible()
+        && let Some(started) = session_starting_since
     {
-        render_starting_session(buf, area, progress, tick, &theme);
+        render_starting_session(buf, area, started, tick, &theme);
         return TurnStatusOutput::default();
     }
 
@@ -273,7 +269,10 @@ pub fn render_turn_status(
             // The agent is idle, so this breath runs slower than the active turn spinner (see MONITOR_PULSE_DIVISOR)
             let frames = crate::glyphs::monitor_icon_frames();
             let frame_idx = (tick / MONITOR_PULSE_DIVISOR) as usize % frames.len();
-            let icon = format!("{} ", frames[frame_idx]);
+            let Some(frame) = frames.get(frame_idx) else {
+                return TurnStatusOutput::default();
+            };
+            let icon = format!("{frame} ");
             let label_fg = if buttons.is_some_and(|b| b.watching_hovered) {
                 theme.text_primary
             } else {
@@ -306,7 +305,6 @@ pub fn render_turn_status(
                 | AgentState::CommandCancelling { .. }
         );
 
-    // ── Compute activity style and label ──
     let (activity_style, label, is_tool) =
         compute_activity(&theme, state, activity, is_bash_turn, goal_verifying);
 
@@ -315,7 +313,7 @@ pub fn render_turn_status(
         return TurnStatusOutput::default();
     }
 
-    // ── Build right-aligned content first (to know how much space is left) ──
+    // Build right-aligned content first (to know how much space is left)
     // Format: `1m20s` or `1m20s ⇣12k` (with tokens).
     let turn_timer_str = match (turn_elapsed, total_tokens) {
         (Some(d), Some(tokens)) if tokens > 0 => {
@@ -362,7 +360,6 @@ pub fn render_turn_status(
 
     let right_width = turn_timer_width + bg_width + cancel_width;
 
-    // ── Build components ──
     // While a tool is blocked on a permission prompt or `ask_user_question`, swap the running braille spinner for a pulsing `◆`
     // The drain-blocked and plan-approval indicators already use this animation, so every "your turn" status reads with one consistent visual cue
     let spinner_str = if is_pending_user_input {
@@ -370,7 +367,10 @@ pub fn render_turn_status(
     } else {
         let frames = crate::glyphs::braille_spinner_frames();
         let frame_idx = (tick / SPINNER_DIVISOR) as usize % frames.len();
-        format!("{} ", frames[frame_idx])
+        match frames.get(frame_idx) {
+            Some(frame) => format!("{frame} "),
+            None => String::new(),
+        }
     };
     let spinner_width = spinner_str.width();
 
@@ -382,8 +382,8 @@ pub fn render_turn_status(
                 if title.starts_with("Ask: ") || title.starts_with("Ask ")
         );
 
-    // Phase timer (gray, same as turn timer); hidden for ask tools
-    let phase_timer_str = if is_asking {
+    // Phase timer (gray, same as turn timer); hidden for ask tools and on narrow rows
+    let phase_timer_str = if is_asking || area.width < PHASE_TIMER_MIN_WIDTH {
         String::new()
     } else {
         activity_started_at
@@ -414,7 +414,6 @@ pub fn render_turn_status(
         .saturating_sub(right_width)
         .saturating_sub(2);
 
-    // ── Render left side: spinner + label (truncated) + phase_timer + queued_hint ──
     let mut left_spans: Vec<Span<'static>> = Vec::with_capacity(5);
 
     // Spinner color: usually inherits the activity color (green for tools, secondary for thinking/responding, yellow for retries)
@@ -513,11 +512,9 @@ pub fn render_turn_status(
         left_spans.push(hint);
     }
 
-    // Render left side
     let left_line = Line::from(left_spans);
     buf.set_line(area.x, area.y, &left_line, area.width);
 
-    // ── Render right side: turn_timer + bg + cancel ──
     let right_start_x = area.x + area.width.saturating_sub(right_width as u16);
 
     // Helper: build a fully-specified right-side style (fg, bg, cleared modifiers)
@@ -695,28 +692,23 @@ fn compute_activity(
     }
 }
 
-/// Whether the idle "Starting session…" indicator wants the turn-status row. True only for a fresh
-/// `total == 0` startup seed (gated by [`McpInitProgress::is_visible`] so an orphaned seed
-/// expires).
-fn starting_session_visible(progress: Option<&McpInitProgress>) -> bool {
-    progress.is_some_and(|p| p.total == 0 && p.is_visible())
-}
-
-/// Shown only while the MCP init progress is a startup seed (`total == 0`), before the shell
-/// reports real server counts.
+/// Shown from the session create dispatch until the id binds or the create fails.
 fn render_starting_session(
     buf: &mut Buffer,
     area: Rect,
-    progress: &McpInitProgress,
+    started: Instant,
     tick: u64,
     theme: &Theme,
 ) {
     let frames = crate::glyphs::braille_spinner_frames();
     let frame_idx = (tick / SPINNER_DIVISOR) as usize % frames.len();
-    let timer_str = format!(" {}", format_turn_timer(progress.started_at.elapsed()));
+    let Some(frame) = frames.get(frame_idx) else {
+        return;
+    };
+    let timer_str = format!(" {}", format_turn_timer(started.elapsed()));
     let style = Style::default().fg(theme.gray_dim);
     let spans = vec![
-        Span::styled(format!("{} ", frames[frame_idx]), style),
+        Span::styled(format!("{frame} "), style),
         Span::styled("Starting session…", style),
         Span::styled(timer_str, style),
     ];
@@ -728,17 +720,14 @@ fn render_starting_session(
 pub fn should_show(
     state: &AgentState,
     drain_blocked: bool,
-    mcp_init_progress: Option<&McpInitProgress>,
+    session_starting_since: Option<Instant>,
     watchers: Watchers,
     parked: bool,
 ) -> bool {
     if parked {
         return true;
     }
-    !state.is_idle()
-        || drain_blocked
-        || starting_session_visible(mcp_init_progress)
-        || watchers.total() > 0
+    !state.is_idle() || drain_blocked || session_starting_since.is_some() || watchers.total() > 0
 }
 
 /// Format a duration for the turn/phase timer.
@@ -925,6 +914,38 @@ mod tests {
     }
 
     #[test]
+    fn family_switch_compact_label_matches_loader() {
+        let theme = Theme::current();
+        let state = AgentState::CommandRunning {
+            command: AgentCommand::SwitchModelCompact,
+            started_at: Instant::now(),
+        };
+        let (_, label, _) = compute_activity(&theme, &state, &None, false, false);
+        assert_eq!(label, "Switching model…");
+        assert!(should_show(&state, false, None, Watchers::default(), false));
+    }
+
+    #[test]
+    fn family_switch_compact_renders_elapsed_timer() {
+        let state = AgentState::CommandRunning {
+            command: AgentCommand::SwitchModelCompact,
+            started_at: Instant::now(),
+        };
+        let mut args = idle_args(Watchers::default());
+        args.state = &state;
+        args.turn_elapsed = Some(Duration::from_secs(12));
+        let text = render_row_text(args, 80);
+        assert!(
+            text.contains("Switching model…"),
+            "status line must keep the family-switch copy, got: {text:?}"
+        );
+        assert!(
+            text.contains("12s"),
+            "family-switch compact must show the elapsed timer like /compact, got: {text:?}"
+        );
+    }
+
+    #[test]
     fn format_hours() {
         assert_eq!(format_turn_timer(Duration::from_secs(3600)), "1h0m");
         assert_eq!(format_turn_timer(Duration::from_secs(3725)), "1h2m");
@@ -972,7 +993,7 @@ mod tests {
                 buttons: Some(MouseButtons::default()),
                 has_running_execute: false,
                 total_tokens: None,
-                mcp_init_progress: None,
+                session_starting_since: None,
                 is_bash_turn: false,
                 is_pending_user_input: false,
                 goal_verifying: false,
@@ -1060,51 +1081,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn should_show_when_starting_session() {
-        // A fresh total == 0 seed shows "Starting session…" above the prompt.
-        let seed = McpInitProgress {
-            total: 0,
-            connected: 0,
-            started_at: Instant::now(),
-        };
-        assert!(should_show(
-            &AgentState::Idle,
-            false,
-            Some(&seed),
-            Watchers::default(),
-            false
-        ));
-
-        // Real progress (total > 0) is the top-bar chip; it must NOT drive this row
-        let connecting = McpInitProgress {
-            total: 3,
-            connected: 1,
-            started_at: Instant::now(),
-        };
-        assert!(!should_show(
-            &AgentState::Idle,
-            false,
-            Some(&connecting),
-            Watchers::default(),
-            false
-        ));
-
-        // An expired seed must not drive the row either.
-        let expired = McpInitProgress {
-            total: 0,
-            connected: 0,
-            started_at: Instant::now() - McpInitProgress::SEED_EXPIRE - Duration::from_secs(1),
-        };
-        assert!(!should_show(
-            &AgentState::Idle,
-            false,
-            Some(&expired),
-            Watchers::default(),
-            false
-        ));
-    }
-
     /// Collect every rendered glyph in `area` into a single string.
     fn buffer_text(buf: &Buffer, area: Rect) -> String {
         (area.y..area.y + area.height)
@@ -1129,7 +1105,7 @@ mod tests {
             buttons: Some(MouseButtons::default()),
             has_running_execute: false,
             total_tokens: None,
-            mcp_init_progress: None,
+            session_starting_since: None,
             is_bash_turn: false,
             is_pending_user_input: false,
             goal_verifying: false,
@@ -1155,10 +1131,10 @@ mod tests {
         buffer_text(&buf, buf.area)
     }
 
-    /// Invoke `render_turn_status` for an idle agent with the given MCP seed.
-    fn render_idle_with_mcp(progress: &McpInitProgress) -> String {
+    /// Invoke `render_turn_status` for an idle agent whose `session/new` is unanswered.
+    fn render_idle_starting_session() -> String {
         let mut args = idle_args(Watchers::default());
-        args.mcp_init_progress = Some(progress);
+        args.session_starting_since = Some(Instant::now());
         render_row_text(args, 60)
     }
 
@@ -1471,6 +1447,33 @@ mod tests {
     }
 
     #[test]
+    fn narrow_row_drops_phase_timer_keeping_turn_timer() {
+        let activity = Some(TurnActivity::Waiting(WaitingReason::Model));
+        let render = |width: u16| {
+            let mut args = idle_args(Watchers::default());
+            args.state = &AgentState::TurnRunning;
+            args.activity = &activity;
+            args.activity_started_at = Some(Instant::now() - Duration::from_secs(240));
+            args.turn_elapsed = Some(Duration::from_secs(11));
+            render_row_text(args, width)
+        };
+        let wide = render(PHASE_TIMER_MIN_WIDTH);
+        assert!(
+            wide.contains("Waiting for response… 4m0s") && wide.contains("11s"),
+            "a wide row keeps both timers, got: {wide:?}"
+        );
+        let narrow = render(PHASE_TIMER_MIN_WIDTH - 1);
+        assert!(
+            narrow.contains("Waiting for response…") && narrow.contains("11s"),
+            "the narrow row keeps the label and turn timer, got: {narrow:?}"
+        );
+        assert!(
+            !narrow.contains("4m0s"),
+            "the narrow row must drop the phase timer, got: {narrow:?}"
+        );
+    }
+
+    #[test]
     fn still_running_label_lists_only_nonzero_kinds() {
         assert_eq!(
             still_running_label(Watchers {
@@ -1539,44 +1542,11 @@ mod tests {
     }
 
     #[test]
-    fn idle_zero_server_seed_renders_starting_session() {
-        // A total == 0 seed renders "Starting session…" above the prompt
-        let text = render_idle_with_mcp(&McpInitProgress {
-            total: 0,
-            connected: 0,
-            started_at: Instant::now(),
-        });
+    fn idle_starting_session_renders_the_row() {
+        let text = render_idle_starting_session();
         assert!(
             text.contains("Starting session"),
-            "idle 0-server seed must render 'Starting session…', got: {text:?}"
-        );
-    }
-
-    #[test]
-    fn idle_active_mcp_progress_renders_nothing_in_turn_status() {
-        // total > 0 is the top-bar chip; the turn-status row stays empty
-        let text = render_idle_with_mcp(&McpInitProgress {
-            total: 3,
-            connected: 1,
-            started_at: Instant::now(),
-        });
-        assert!(
-            text.trim().is_empty(),
-            "active MCP progress must NOT render in the turn-status row, got: {text:?}"
-        );
-    }
-
-    #[test]
-    fn expired_seed_renders_nothing() {
-        // An expired total == 0 seed renders nothing; the render path checks expiry itself
-        let text = render_idle_with_mcp(&McpInitProgress {
-            total: 0,
-            connected: 0,
-            started_at: Instant::now() - McpInitProgress::SEED_EXPIRE - Duration::from_secs(1),
-        });
-        assert!(
-            text.trim().is_empty(),
-            "expired seed must render nothing, got: {text:?}"
+            "an unanswered session/new must render 'Starting session…', got: {text:?}"
         );
     }
 
