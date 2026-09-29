@@ -177,29 +177,11 @@ async fn start_bundle_server(
 fn test_auth() -> GrokAuth {
     GrokAuth {
         key: "token".to_string(),
-        auth_mode: xai_grok_login::AuthMode::Oidc,
-        create_time: chrono::Utc::now(),
         user_id: "user-1".to_string(),
         email: Some("test@example.com".to_string()),
-        first_name: None,
-        last_name: None,
-        profile_image_asset_id: None,
-        principal_type: None,
-        principal_id: None,
-        team_id: None,
-        team_name: None,
-        team_role: None,
-        organization_id: None,
-        organization_name: None,
-        organization_role: None,
-        user_blocked_reason: None,
-        team_blocked_reasons: vec![],
         coding_data_retention_opt_out: false,
-        has_grok_code_access: None,
-        refresh_token: None,
         expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
-        oidc_issuer: None,
-        oidc_client_id: None,
+        ..GrokAuth::default()
     }
 }
 fn test_auth_manager() -> Arc<xai_grok_login::AuthManager> {
@@ -396,10 +378,15 @@ fn parse_reads_reasoning_efforts_list() {
         ]
     });
     let result = parse_remote_model_value(&value, "https://default.url").unwrap();
-    assert_eq!(result.reasoning_efforts.len(), 2);
-    assert_eq!(result.reasoning_efforts[0].id, "deep");
-    assert_eq!(result.reasoning_efforts[0].value, ReasoningEffort::Xhigh);
-    assert_eq!(result.reasoning_efforts[1].value, ReasoningEffort::Low);
+    let [deep, low] = result.reasoning_efforts.as_slice() else {
+        panic!(
+            "expected two reasoning efforts: {:?}",
+            result.reasoning_efforts
+        );
+    };
+    assert_eq!(deep.id, "deep");
+    assert_eq!(deep.value, ReasoningEffort::Xhigh);
+    assert_eq!(low.value, ReasoningEffort::Low);
     for value in [
         serde_json::json!({
             "model": "m", "context_window": 256_000,
@@ -411,12 +398,90 @@ fn parse_reads_reasoning_efforts_list() {
         }),
     ] {
         let result = parse_remote_model_value(&value, "https://default.url").unwrap();
-        assert_eq!(result.reasoning_efforts.len(), 1);
-        assert_eq!(result.reasoning_efforts[0].value, ReasoningEffort::High);
+        let [effort] = result.reasoning_efforts.as_slice() else {
+            panic!(
+                "expected one reasoning effort: {:?}",
+                result.reasoning_efforts
+            );
+        };
+        assert_eq!(effort.value, ReasoningEffort::High);
     }
     let value = serde_json::json!({"model": "x", "context_window": 256_000});
     let result = parse_remote_model_value(&value, "https://default.url").unwrap();
     assert!(result.reasoning_efforts.is_empty());
+}
+/// A public `/v1/models` row carries the menu under `capabilities`; labels come from the shared `effort_label` table.
+#[test]
+fn parse_reads_reasoning_efforts_from_capabilities() {
+    use xai_grok_sampling_types::{ReasoningEffort, ReasoningEffortOption};
+    let option =
+        |id: &str, value: ReasoningEffort, label: &str, default: bool| ReasoningEffortOption {
+            id: id.to_string(),
+            value,
+            label: label.to_string(),
+            description: None,
+            default,
+        };
+    let value = serde_json::json!({
+        "id": "grok-4.6",
+        "object": "model",
+        "owned_by": "xai",
+        "capabilities": {
+            "reasoning_effort": ["low", "medium", "high", "xhigh"],
+            "default_reasoning_effort": "high"
+        }
+    });
+    let result = parse_remote_model_value(&value, "https://default.url").unwrap();
+    assert_eq!(
+        result.reasoning_efforts,
+        vec![
+            option("low", ReasoningEffort::Low, "Low", false),
+            option("medium", ReasoningEffort::Medium, "Medium", false),
+            option("high", ReasoningEffort::High, "High", true),
+            option("xhigh", ReasoningEffort::Xhigh, "X-High", false),
+        ]
+    );
+    assert!(!result.reasoning_effort_server_default);
+    let value = serde_json::json!({
+        "id": "grok-4.6",
+        "reasoning_efforts": ["low"],
+        "capabilities": { "reasoning_effort": ["high"], "default_reasoning_effort": "high" }
+    });
+    let result = parse_remote_model_value(&value, "https://default.url").unwrap();
+    assert_eq!(
+        result.reasoning_efforts,
+        vec![option("low", ReasoningEffort::Low, "Low", false)]
+    );
+    let value = serde_json::json!({
+        "id": "grok-4.6",
+        "reasoning_efforts": [{ "value": "quantum" }],
+        "capabilities": { "reasoning_effort": ["high"], "default_reasoning_effort": "high" }
+    });
+    let result = parse_remote_model_value(&value, "https://default.url").unwrap();
+    assert_eq!(
+        result.reasoning_efforts,
+        vec![option("high", ReasoningEffort::High, "High", true)]
+    );
+    let value = serde_json::json!({
+        "id": "grok-4.6",
+        "capabilities": { "reasoning_effort": ["low", "quantum", "high"] }
+    });
+    let result = parse_remote_model_value(&value, "https://default.url").unwrap();
+    assert_eq!(
+        result.reasoning_efforts,
+        vec![
+            option("low", ReasoningEffort::Low, "Low", false),
+            option("high", ReasoningEffort::High, "High", false),
+        ]
+    );
+    assert!(result.reasoning_effort_server_default);
+    let value = serde_json::json!({
+        "id": "grok-4.6",
+        "capabilities": { "reasoning_effort": ["low", "high"], "default_reasoning_effort": "medium" }
+    });
+    let result = parse_remote_model_value(&value, "https://default.url").unwrap();
+    assert!(result.reasoning_efforts.iter().all(|o| !o.default));
+    assert!(result.reasoning_effort_server_default);
 }
 #[test]
 fn parse_reads_meta_fallback_fields() {
@@ -709,8 +774,14 @@ fn get_object_returns_some_for_actual_object() {
     let obj = value.as_object().unwrap();
     let nested = get_object(obj, "nested").expect("nested key should resolve to object");
     assert!(nested.is_object());
-    assert_eq!(nested["a"], serde_json::json!(1));
-    assert_eq!(nested["b"], serde_json::json!("two"));
+    assert_eq!(
+        nested.pointer("/a").unwrap_or(&serde_json::Value::Null),
+        &serde_json::json!(1)
+    );
+    assert_eq!(
+        nested.pointer("/b").unwrap_or(&serde_json::Value::Null),
+        &serde_json::json!("two")
+    );
 }
 fn endpoints(
     proxy: &str,

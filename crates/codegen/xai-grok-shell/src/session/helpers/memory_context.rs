@@ -263,10 +263,19 @@ mod tests {
         .unwrap();
 
         let empty = format_v2_memory_context(&storage).unwrap();
-        assert!(empty.contains("## Global memory manifest"));
-        assert!(empty.contains("## Workspace memory manifest"));
-        assert!(empty.contains(&storage.global_dir().display().to_string()));
-        assert!(empty.contains(&storage.workspace_dir().display().to_string()));
+        assert!(empty.content.contains("## Global memory manifest"));
+        assert!(empty.content.contains("## Workspace memory manifest"));
+        assert!(
+            empty
+                .content
+                .contains(&storage.global_dir().display().to_string())
+        );
+        assert!(
+            empty
+                .content
+                .contains(&storage.workspace_dir().display().to_string())
+        );
+        assert_eq!(empty.workspace_entry_count, 0);
 
         std::fs::write(
             storage.workspace_dir().join("topics/new.md"),
@@ -274,8 +283,9 @@ mod tests {
         )
         .unwrap();
         let refreshed = format_v2_memory_context(&storage).unwrap();
-        assert!(refreshed.contains("topics/new.md"));
-        assert_ne!(empty, refreshed);
+        assert!(refreshed.content.contains("topics/new.md"));
+        assert_ne!(empty.content, refreshed.content);
+        assert!(refreshed.workspace_entry_count >= 1);
     }
 
     #[test]

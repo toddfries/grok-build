@@ -145,11 +145,13 @@ fn is_structurally_empty(text: &str) -> bool {
     let mut without_comments = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = rest.find("<!--") {
-        match rest[start + "<!--".len()..].find("-->") {
+        match rest.get(start + "<!--".len()..).and_then(|s| s.find("-->")) {
             Some(end) => {
-                without_comments.push_str(&rest[..start]);
+                if let Some(prefix) = rest.get(..start) {
+                    without_comments.push_str(prefix);
+                }
                 let after = start + "<!--".len() + end + "-->".len();
-                rest = &rest[after..];
+                rest = rest.get(after..).unwrap_or("");
             }
             None => {
                 // Unterminated comment: keep the remainder as literal text so a
@@ -576,11 +578,14 @@ mod tests {
             .unwrap();
 
         assert!(!results.is_empty(), "should find results via FTS");
-        assert!(results[0].snippet.contains("Rust"));
+        let Some(first) = results.first() else {
+            panic!("expected FTS results: {results:?}");
+        };
+        assert!(first.snippet.contains("Rust"));
         assert!(
-            results[0].created_at > 0,
+            first.created_at > 0,
             "created_at must propagate from ChunkRecord (got {})",
-            results[0].created_at,
+            first.created_at,
         );
     }
 
@@ -707,7 +712,10 @@ mod tests {
         let chunk_id = format!("{path_str}:0");
         let chunk = idx.get_chunk(&chunk_id).unwrap().unwrap();
         let embeddings = mock.embed_batch(&[&chunk.text]).await.unwrap();
-        idx.upsert_embedding(&chunk_id, &embeddings[0]).unwrap();
+        let Some(emb0) = embeddings.first() else {
+            panic!("embed_batch returns one vector per input: {embeddings:?}");
+        };
+        idx.upsert_embedding(&chunk_id, emb0).unwrap();
 
         // Search — should use both FTS and vector paths
         let config = MemorySearchConfig {
@@ -725,9 +733,12 @@ mod tests {
         .unwrap();
 
         assert!(!results.is_empty(), "hybrid search should find results");
-        assert!(results[0].snippet.contains("Rust"));
+        let Some(first) = results.first() else {
+            panic!("expected hybrid results: {results:?}");
+        };
+        assert!(first.snippet.contains("Rust"));
         // With both FTS and vector results, score should combine both weights
-        assert!(results[0].score > 0.0, "score should be positive");
+        assert!(first.score > 0.0, "score should be positive");
     }
 
     // -----------------------------------------------------------------------
@@ -954,14 +965,12 @@ mod tests {
         // scores are exactly 1.0 (the collision the split resolves). The rank
         // ordering above therefore can only come from the unclamped score.
         assert!(
-            (results[pos_a].score - 1.0).abs() < 1e-9,
-            "unaccessed display score ({:.6}) must clamp to exactly 1.0",
-            results[pos_a].score,
+            (score_a - 1.0).abs() < 1e-9,
+            "unaccessed display score ({score_a:.6}) must clamp to exactly 1.0",
         );
         assert!(
-            (results[pos_b].score - 1.0).abs() < 1e-9,
-            "accessed display score ({:.6}) must clamp to exactly 1.0",
-            results[pos_b].score,
+            (score_b - 1.0).abs() < 1e-9,
+            "accessed display score ({score_b:.6}) must clamp to exactly 1.0",
         );
     }
 
@@ -1078,10 +1087,13 @@ mod tests {
             !results.is_empty(),
             "FTS-only results must pass min_score=0.3 threshold"
         );
+        let Some(first) = results.first() else {
+            panic!("expected FTS-only results: {results:?}");
+        };
         assert!(
-            results[0].score > 0.3,
+            first.score > 0.3,
             "FTS-only score ({:.4}) must exceed 0.3",
-            results[0].score,
+            first.score,
         );
     }
 
@@ -1115,10 +1127,13 @@ mod tests {
             !results.is_empty(),
             "global source results must pass min_score=0.25 threshold"
         );
+        let Some(first) = results.first() else {
+            panic!("expected global source results: {results:?}");
+        };
         assert!(
-            results[0].score > 0.25,
+            first.score > 0.25,
             "global chunk score ({:.4}) must exceed 0.25",
-            results[0].score,
+            first.score,
         );
     }
 
@@ -1145,7 +1160,10 @@ mod tests {
         let chunk_a_id = format!("{path_a}:0");
         let chunk_a = idx.get_chunk(&chunk_a_id).unwrap().unwrap();
         let embeddings = mock.embed_batch(&[&chunk_a.text]).await.unwrap();
-        idx.upsert_embedding(&chunk_a_id, &embeddings[0]).unwrap();
+        let Some(emb0) = embeddings.first() else {
+            panic!("embed_batch returns one vector per input: {embeddings:?}");
+        };
+        idx.upsert_embedding(&chunk_a_id, emb0).unwrap();
 
         // File B: FTS only (no embedding)
         let file_b = tmp.path().join("unembedded.md");
@@ -1214,7 +1232,10 @@ mod tests {
 
         // Use the mock to get a consistent embedding
         let embedding = mock.embed_batch(&["test"]).await.unwrap();
-        idx.upsert_embedding(&chunk_id, &embedding[0]).unwrap();
+        let Some(emb0) = embedding.first() else {
+            panic!("embed_batch returns one vector per input: {embedding:?}");
+        };
+        idx.upsert_embedding(&chunk_id, emb0).unwrap();
 
         // Search with vector — the mock returns deterministic embeddings
         let fts_results = idx.search_fts("content test", 10).unwrap_or_default();
@@ -1240,9 +1261,9 @@ mod tests {
         // substantially above zero (mock embeddings produce deterministic
         // but varying values).
         assert!(
-            results[0].score > 0.1,
+            first.score > 0.1,
             "hybrid score ({:.4}) should be meaningful with absolute normalization",
-            results[0].score,
+            first.score,
         );
     }
 
@@ -1515,9 +1536,9 @@ mod tests {
         // The top chunk is a top FTS match (base 1.0) × workspace weight (1.0)
         // × boost (>1.0) → unclamped > 1.0 → display score clamped to exactly 1.0.
         assert!(
-            (results[0].score - 1.0).abs() < 1e-9,
+            (first.score - 1.0).abs() < 1e-9,
             "display score ({:.6}) must clamp to exactly 1.0",
-            results[0].score,
+            first.score,
         );
         for r in &results {
             assert!(

@@ -1,8 +1,13 @@
 //! Cross-session memory for Grok.
 //!
-//! Memory files are markdown under `~/.grok/memory/`, one global file plus a subdirectory per workspace.
+//! Two isolated pipelines. They do not share files, search, flush, or Dream.
+//! See the crate `AGENTS.md` before changing either path.
 //!
-//! ## Data Layout
+//! - **Legacy:** markdown under `~/.grok/memory/` (tree below).
+//! - **v2:** `~/.grok/memory-v2/` topics, observation inbox, and generated
+//!   `MEMORY.md`. See `v2.rs`. v2 never reads or writes the legacy tree.
+//!
+//! ## Legacy data layout
 //!
 //! ```text
 //! ~/.grok/memory/
@@ -15,8 +20,11 @@
 //!
 //! ## Feature Flag
 //!
-//! Memory is enabled through `GROK_MEMORY`, `[memory] enabled`, or remote settings.
+//! Resolve enablement through `MemoryConfig::resolve_settings`.
+//! `GROK_MEMORY`, `[memory] enabled`, and `[memory_v2] enabled` all participate.
 //! When disabled, this crate is not initialized by the host.
+
+#![deny(clippy::indexing_slicing)]
 
 pub mod archive;
 pub mod backend;
@@ -40,6 +48,10 @@ pub mod text_utils;
 pub mod v2;
 mod v2_access;
 pub mod v2_capture;
+pub mod v2_carryover;
+mod v2_clock;
+pub mod v2_consolidation;
+mod v2_maintenance;
 pub mod watcher;
 
 #[cfg(test)]

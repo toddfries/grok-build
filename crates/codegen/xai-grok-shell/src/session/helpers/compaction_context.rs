@@ -327,6 +327,7 @@ mod tests {
             scheduled_loops: vec![],
             workflows: vec![],
             workflow_tool_name: None,
+            images: Default::default(),
         }
     }
 
@@ -376,6 +377,7 @@ mod tests {
             scheduled_loops: vec![],
             workflows: vec![],
             workflow_tool_name: None,
+            images: Default::default(),
         };
         let result = to_system_reminder_sync(&ctx, &[], &[], None, None, None);
         let text = result.expect("should produce a reminder");
@@ -413,6 +415,7 @@ mod tests {
             scheduled_loops: vec![],
             workflows: vec![],
             workflow_tool_name: None,
+            images: Default::default(),
         };
         let text = to_system_reminder_sync(&ctx, &[], &[], None, None, None)
             .expect("should produce a reminder");
@@ -453,6 +456,7 @@ mod tests {
             scheduled_loops: vec![],
             workflows: vec![],
             workflow_tool_name: None,
+            images: Default::default(),
         }
     }
 
@@ -539,6 +543,7 @@ mod tests {
             scheduled_loops: vec![],
             workflows: vec![],
             workflow_tool_name: None,
+            images: Default::default(),
         };
         let skills = [xai_grok_tools::implementations::skills::types::SkillInfo {
             name: "commit".into(),
@@ -594,15 +599,19 @@ mod tests {
                 elapsed_ms: 12_000,
             }],
             workflow_tool_name: Some("workflow".into()),
+            images: Default::default(),
         };
         let text = to_system_reminder_sync(&ctx, &[], &[], None, None, None)
             .expect("should produce a reminder");
         let bg = text.find("## Running Background Tasks").expect("bg");
+        let Some(bg_section) = text.get(bg..) else {
+            panic!("bg heading offset is not a char boundary: {text}");
+        };
         assert!(
-            text[bg..].contains("- \"01a046ad3877\": `monitor job`"),
+            bg_section.contains("- \"01a046ad3877\": `monitor job`"),
             "got:\n{text}"
         );
-        assert!(text[bg..].contains("run id `wf-1`"), "got:\n{text}");
+        assert!(bg_section.contains("run id `wf-1`"), "got:\n{text}");
         assert!(!text.contains("## Scheduled Loops"), "got:\n{text}");
         assert!(text.contains("## Running Workflows"), "got:\n{text}");
         assert!(!text.contains("## Active Workflows"), "got:\n{text}");

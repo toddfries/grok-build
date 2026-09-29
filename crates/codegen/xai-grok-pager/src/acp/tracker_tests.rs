@@ -316,13 +316,6 @@ fn finish_turn_clears_state() {
     );
 }
 #[test]
-fn user_message_replay() {
-    let mut sb = ScrollbackState::new();
-    let mut tracker = AcpUpdateTracker::new();
-    tracker.handle_update(user_message("What is Rust?"), &meta(), &mut sb);
-    assert_eq!(sb.len(), 1);
-}
-#[test]
 fn empty_chunks_ignored() {
     let mut sb = ScrollbackState::new();
     let mut tracker = AcpUpdateTracker::new();
@@ -1264,17 +1257,15 @@ fn test_search_tool_call_flow() {
     if let RenderBlock::ToolCall(ToolCallBlock::Search(search)) = &entry.block {
         assert_eq!(search.pattern, "fn main");
         assert_eq!(search.match_count, 1);
-        assert_eq!(search.file_matches.len(), 1);
-        assert_eq!(
-            search.file_matches[0].path,
-            "/Users/alice/dev/rust/foo/src/main.rs"
-        );
-        assert_eq!(search.file_matches[0].matches.len(), 1);
-        assert_eq!(search.file_matches[0].matches[0].line_number, 54);
-        assert_eq!(
-            search.file_matches[0].matches[0].content,
-            "fn main() -> Result<()> {"
-        );
+        let [file_match] = search.file_matches.as_slice() else {
+            panic!("expected 1 file match: {:?}", search.file_matches);
+        };
+        assert_eq!(file_match.path, "/Users/alice/dev/rust/foo/src/main.rs");
+        let [m] = file_match.matches.as_slice() else {
+            panic!("expected 1 match: {:?}", file_match.matches);
+        };
+        assert_eq!(m.line_number, 54);
+        assert_eq!(m.content, "fn main() -> Result<()> {");
     } else {
         panic!(
             "Expected Search block after completion, got: {:?}",
@@ -1282,7 +1273,7 @@ fn test_search_tool_call_flow() {
         );
     }
 }
-/// ScrollbackState with an explicit `expanded_by_default` shape override (flag-independent: the `Some` beats the `collapsed_edit_blocks` cache).
+/// Scrollback with pager.toml `expanded_by_default` set. Does not touch the flag cache.
 fn edit_config_scrollback(expanded_by_default: bool) -> ScrollbackState {
     use crate::appearance::AppearanceConfig;
     let mut sb = ScrollbackState::new();
@@ -1309,6 +1300,11 @@ fn pending_other_tool_call(tc_id: &Arc<str>) -> acp::SessionUpdate {
 /// leave a stale mode in place.
 #[test]
 fn edit_tool_upgrade_resets_display_mode_to_default() {
+    std::thread::spawn(edit_tool_upgrade_resets_display_mode_to_default_body)
+        .join()
+        .unwrap();
+}
+fn edit_tool_upgrade_resets_display_mode_to_default_body() {
     use crate::scrollback::types::DisplayMode;
     /// Drive Pending(Other) through InProgress(Edit) to Completed.
     /// Returns the display mode observed after the InProgress upgrade and after completion.
@@ -1359,6 +1355,7 @@ fn edit_tool_upgrade_resets_display_mode_to_default() {
         );
         entry.display_mode
     }
+    crate::appearance::cache::set_collapsed_edit_blocks(false);
     let (upgraded, completed) = upgrade_path("toolu_edit_001", false);
     assert_eq!(
         upgraded,
@@ -1688,8 +1685,10 @@ fn overlapping_adjacent_edits_stitch_into_single_hunk() {
             edit.edit_count, 5,
             "the (N edits) fallback counts merged calls, not stitched hunks"
         );
-        let rows: Vec<(similar::ChangeTag, usize)> =
-            edit.hunks[0].iter().map(|l| (l.tag, l.ln)).collect();
+        let Some(hunk) = edit.hunks.first() else {
+            panic!("expected a hunk");
+        };
+        let rows: Vec<(similar::ChangeTag, usize)> = hunk.iter().map(|l| (l.tag, l.ln)).collect();
         let expected: Vec<(similar::ChangeTag, usize)> = (5..=9)
             .flat_map(|ln| {
                 [
@@ -2068,10 +2067,10 @@ fn stream_start_breaks_agent_msg_across_streams() {
         2,
         "Should have 2 separate agent message entries"
     );
-    assert_ne!(
-        sb.get(agent_indices[0]).unwrap().id,
-        sb.get(agent_indices[1]).unwrap().id,
-    );
+    let [i0, i1] = agent_indices.as_slice() else {
+        panic!("expected 2 agent indices: {agent_indices:?}");
+    };
+    assert_ne!(sb.get(*i0).unwrap().id, sb.get(*i1).unwrap().id,);
 }
 /// Same stream_start_ms should NOT break messages: chunks append normally.
 #[test]
@@ -2316,7 +2315,11 @@ fn execute_block_keeps_full_command_sets_header_display_when_peeled() {
             serde_json::json!({ "command": "cd /proj && echo hi" }),
         ))
         .locations(vec![]);
-    let block = tool_call_to_block(&tc, Some(Path::new("/proj")));
+    let block = tool_call_to_block(
+        &tc,
+        Some(Path::new("/proj")),
+        &SubagentLabelRegistry::default(),
+    );
     match &block {
         RenderBlock::ToolCall(ToolCallBlock::Execute(exec)) => {
             assert_eq!(exec.command, "cd /proj && echo hi");
@@ -2330,6 +2333,46 @@ fn execute_block_keeps_full_command_sets_header_display_when_peeled() {
         searchable.contains("cd /proj && echo hi"),
         "searchable_text must retain full command: {searchable}"
     );
+}
+#[test]
+fn read_text_content_becomes_numbered_lines_with_the_sent_range() {
+    const TEXT: &str = "fn main() {}\nfn run() {}\n";
+    let range = || Some(LineRange::new(10, 11));
+    let counts = serde_json::json!({ "totalLines": 40, "range": { "start": 10, "end": 11 } });
+    let read = |raw_output: Option<serde_json::Value>, content: Vec<acp::ToolCallContent>| {
+        let call = acp::ToolCall::new(
+            acp::ToolCallId::new(Arc::from("read-1")),
+            "src/main.rs".to_string(),
+        )
+        .kind(acp::ToolKind::Read)
+        .status(acp::ToolCallStatus::Completed)
+        .raw_input(Some(serde_json::json!({ "path": "src/main.rs" })))
+        .raw_output(raw_output)
+        .content(content)
+        .locations(vec![]);
+        match tool_call_to_block(&call, None, &SubagentLabelRegistry::default()) {
+            RenderBlock::ToolCall(ToolCallBlock::Read(block)) => {
+                (block.content, block.total_lines, block.line_range)
+            }
+            other => panic!("expected read block, got {other:?}"),
+        }
+    };
+    assert_eq!(
+        read(Some(counts.clone()), vec![TEXT.into()]),
+        (Some(TEXT.to_owned()), Some(40), range())
+    );
+    assert_eq!(
+        read(None, vec![TEXT.into()]),
+        (Some(TEXT.to_owned()), Some(2), None)
+    );
+    assert_eq!(
+        read(
+            Some(serde_json::json!({ "type": "Text", "text": "**File:** rust.md\n1 | # Rust\n" })),
+            vec![TEXT.into()],
+        ),
+        (None, None, None)
+    );
+    assert_eq!(read(Some(counts), vec![]), (None, Some(40), range()));
 }
 #[test]
 fn memory_v2_metadata_groups_ordinary_file_activity_without_losing_details() {
@@ -2354,7 +2397,9 @@ fn memory_v2_metadata_groups_ordinary_file_activity_without_losing_details() {
         "Read memory",
         serde_json::json!({ "path": "/memory-v2/global/topics/rust.md" }),
     );
-    let RenderBlock::ToolCall(ToolCallBlock::Read(read)) = tool_call_to_block(&read, None) else {
+    let RenderBlock::ToolCall(ToolCallBlock::Read(read)) =
+        tool_call_to_block(&read, None, &SubagentLabelRegistry::default())
+    else {
         panic!("expected read block");
     };
     assert_eq!(read.path, "/memory-v2/global/topics/rust.md");
@@ -2372,7 +2417,9 @@ fn memory_v2_metadata_groups_ordinary_file_activity_without_losing_details() {
             "new_string": "new"
         }),
     );
-    let RenderBlock::ToolCall(ToolCallBlock::Edit(edit)) = tool_call_to_block(&edit, None) else {
+    let RenderBlock::ToolCall(ToolCallBlock::Edit(edit)) =
+        tool_call_to_block(&edit, None, &SubagentLabelRegistry::default())
+    else {
         panic!("expected edit block");
     };
     assert_eq!(edit.path, "/memory-v2/global/topics/rust.md");
@@ -2389,7 +2436,8 @@ fn memory_v2_metadata_groups_ordinary_file_activity_without_losing_details() {
             "path": "/memory-v2/global/topics"
         }),
     );
-    let RenderBlock::ToolCall(ToolCallBlock::Search(search)) = tool_call_to_block(&search, None)
+    let RenderBlock::ToolCall(ToolCallBlock::Search(search)) =
+        tool_call_to_block(&search, None, &SubagentLabelRegistry::default())
     else {
         panic!("expected search block");
     };
@@ -2404,7 +2452,8 @@ fn memory_v2_metadata_groups_ordinary_file_activity_without_losing_details() {
         "List memory",
         serde_json::json!({ "target_directory": "/memory-v2/global/topics" }),
     );
-    let RenderBlock::ToolCall(ToolCallBlock::ListDir(list)) = tool_call_to_block(&list, None)
+    let RenderBlock::ToolCall(ToolCallBlock::ListDir(list)) =
+        tool_call_to_block(&list, None, &SubagentLabelRegistry::default())
     else {
         panic!("expected list block");
     };
@@ -3342,9 +3391,11 @@ fn tracker_captures_available_commands_update() {
     let cmds = tracker
         .take_pending_acp_commands()
         .expect("should have pending");
-    assert_eq!(cmds.len(), 2);
-    assert_eq!(cmds[0].name, "flush");
-    assert_eq!(cmds[1].name, "compact");
+    let [flush, compact] = cmds.as_slice() else {
+        panic!("expected 2 commands: {cmds:?}");
+    };
+    assert_eq!(flush.name, "flush");
+    assert_eq!(compact.name, "compact");
 }
 #[test]
 fn tracker_single_drain_clears_pending() {
@@ -3367,9 +3418,11 @@ fn tracker_latest_update_replaces_pending() {
     let cmds = tracker
         .take_pending_acp_commands()
         .expect("should have pending");
-    assert_eq!(cmds.len(), 2);
-    assert_eq!(cmds[0].name, "new_a");
-    assert_eq!(cmds[1].name, "new_b");
+    let [a, b] = cmds.as_slice() else {
+        panic!("expected 2 commands: {cmds:?}");
+    };
+    assert_eq!(a.name, "new_a");
+    assert_eq!(b.name, "new_b");
 }
 #[test]
 fn parse_search_tool_results_grouped_format() {
@@ -3411,15 +3464,17 @@ fn parse_search_tool_results_grouped_format() {
     });
     let content = serde_json::to_string_pretty(&json).unwrap();
     let results = parse_search_tool_results(&content);
-    assert_eq!(results.len(), 3);
-    assert_eq!(results[0].name, "linear__save_issue");
-    assert_eq!(results[0].server, "linear");
-    assert_eq!(results[0].description, "Create an issue");
-    assert!((results[0].score - 0.8).abs() < f64::EPSILON);
-    assert_eq!(results[1].name, "linear__list_issues");
-    assert_eq!(results[1].server, "linear");
-    assert_eq!(results[2].name, "slack__send_message");
-    assert_eq!(results[2].server, "slack");
+    let [linear_save, linear_list, slack] = results.as_slice() else {
+        panic!("expected 3 results: {results:?}");
+    };
+    assert_eq!(linear_save.name, "linear__save_issue");
+    assert_eq!(linear_save.server, "linear");
+    assert_eq!(linear_save.description, "Create an issue");
+    assert!((linear_save.score - 0.8).abs() < f64::EPSILON);
+    assert_eq!(linear_list.name, "linear__list_issues");
+    assert_eq!(linear_list.server, "linear");
+    assert_eq!(slack.name, "slack__send_message");
+    assert_eq!(slack.server, "slack");
 }
 #[test]
 fn parse_search_tool_results_old_flat_format_returns_empty() {
@@ -4129,7 +4184,7 @@ fn completed_other_function_name_preserves_bash_output() {
     .raw_input(Some(serde_json::json!({ "command": "echo hi" })))
     .raw_output(serde_json::to_value(ToolOutput::Bash(bash)).ok())
     .locations(vec![]);
-    match tool_call_to_block(&tc, None) {
+    match tool_call_to_block(&tc, None, &SubagentLabelRegistry::default()) {
         RenderBlock::ToolCall(ToolCallBlock::Execute(ex)) => {
             assert_eq!(ex.command, "echo hi");
             assert_eq!(ex.output.as_deref(), Some("hello from bg\n"));
@@ -4456,6 +4511,24 @@ fn meta_with_prompt_id(prompt_id: &str) -> NotificationMeta {
     m.prompt_id = Some(prompt_id.to_string());
     m
 }
+#[test]
+fn hidden_user_message_keeps_the_pending_echo_skip() {
+    let mut sb = ScrollbackState::new();
+    let mut tracker = AcpUpdateTracker::new();
+    tracker.expect_user_echo();
+    let mut hide_meta = acp::Meta::new();
+    hide_meta.insert("hideFromScrollback".into(), serde_json::json!(true));
+    assert!(!tracker.handle_update(
+        user_message_with_chunk_meta(
+            "<timestamp>Wed</timestamp>\n<system_notification>done</system_notification>",
+            hide_meta,
+        ),
+        &meta(),
+        &mut sb,
+    ));
+    assert!(!tracker.handle_update(user_message("Reply with SECOND"), &meta(), &mut sb));
+    assert!(!tracker.expects_user_echo());
+}
 /// Scrollback hide is type-driven.
 /// Chunk meta `hideFromScrollback` or notification `promptId` routes to [`PromptOrigin::hide_user_echo_from_scrollback`].
 #[test]
@@ -4623,16 +4696,14 @@ fn replay_malformed_skill_token_ranges_degrade_to_plain() {
     }
 }
 /// A persisted interjection chunk as the shell writes it: the model-facing frame as text,
-/// the typed text in `displayText`, and the `interjection` chunk flag (wire literals pinned here).
+/// the typed text in `displayText`, and the `interjection` chunk flag.
 fn interjection_user_message(typed: &str) -> acp::SessionUpdate {
     let mut chunk_meta = serde_json::Map::new();
     chunk_meta.insert("modelId".into(), serde_json::json!("test-model"));
     chunk_meta.insert("interjection".into(), serde_json::Value::Bool(true));
     let mut text_meta = serde_json::Map::new();
     text_meta.insert("displayText".into(), serde_json::json!(typed));
-    let framed = format!(
-        "The user sent a message while you were working:\n<user_query>\n{typed}\n</user_query>\nMake sure to complete any unfinished tasks from previous turns."
-    );
+    let framed = xai_interjection_core::format_interjection(typed.to_string());
     acp::SessionUpdate::UserMessageChunk(
         acp::ContentChunk::new(acp::ContentBlock::Text(
             acp::TextContent::new(framed).meta(Some(text_meta)),
@@ -4696,11 +4767,94 @@ fn call_mcp_tool_coerced_to_use_tool_renders_block() {
             "tool_input" : { "query" : "alerts" } }
         )))
         .locations(vec![]);
-    let block = tool_call_to_block(&tc, None);
+    let block = tool_call_to_block(&tc, None, &SubagentLabelRegistry::default());
     let RenderBlock::ToolCall(ToolCallBlock::UseTool(ut)) = block else {
         panic!("expected UseTool block, got {block:?}");
     };
     assert_eq!(ut.tool_name, "grafana__search");
+}
+#[test]
+fn a_failed_tool_search_shows_its_output_text_as_the_error() {
+    let tc = acp::ToolCall::new(
+        acp::ToolCallId::new(Arc::from("mcp2")),
+        "Search tools slack",
+    )
+    .kind(acp::ToolKind::Other)
+    .status(acp::ToolCallStatus::Failed)
+    .content(vec![])
+    .raw_input(Some(
+        serde_json::json!({ "variant": "SearchTool", "query": "slack" }),
+    ))
+    .raw_output(Some(serde_json::json!({
+        "type": "SearchTool",
+        "result_count": 0,
+        "content": "no such server: slack"
+    })))
+    .locations(vec![]);
+    let block = tool_call_to_block(&tc, None, &SubagentLabelRegistry::default());
+    let RenderBlock::ToolCall(ToolCallBlock::IntegrationSearch(st)) = block else {
+        panic!("expected IntegrationSearch block, got {block:?}");
+    };
+    assert_eq!(st.error.as_deref(), Some("no such server: slack"));
+}
+#[test]
+fn directly_listed_mcp_tool_renders_like_a_use_tool_call() {
+    let mcp = xai_grok_tools::types::output::MCPOutput::errored(
+        "computer_check_permissions".into(),
+        "computer_use".into(),
+        "Failed to call computer_check_permissions: the helper did not answer within 15s".into(),
+    );
+    let input = xai_grok_tools::types::tool_io::ToolInput::MCPTool(
+        xai_grok_tools::types::tool_io::MCPToolInput {
+            tool_name: "computer_use__computer_check_permissions".into(),
+            tool_input: serde_json::json!({"x": 1}),
+        },
+    );
+    let tc = acp::ToolCall::new(
+        acp::ToolCallId::new(Arc::from("mcp2")),
+        "computer_use__computer_check_permissions",
+    )
+    .kind(acp::ToolKind::Other)
+    .status(acp::ToolCallStatus::Failed)
+    .content(vec![])
+    .raw_input(serde_json::to_value(input).ok())
+    .raw_output(serde_json::to_value(ToolOutput::MCP(mcp)).ok())
+    .locations(vec![]);
+    let block = tool_call_to_block(&tc, None, &SubagentLabelRegistry::default());
+    let RenderBlock::ToolCall(ToolCallBlock::UseTool(ut)) = block else {
+        panic!("expected UseTool block, got {block:?}");
+    };
+    assert_eq!("computer_use__computer_check_permissions", ut.tool_name);
+    assert_eq!(vec![("x".to_owned(), "1".to_owned())], ut.input_args);
+    assert_eq!(
+        Some("Failed to call computer_check_permissions: the helper did not answer within 15s"),
+        ut.error.as_deref()
+    );
+}
+#[test]
+fn generic_failed_tool_call_takes_its_error_from_raw_output() {
+    let output = ToolOutput::Text(xai_grok_tools::types::output::TextOutput::from(
+        "no task with id t1",
+    ));
+    let tc = acp::ToolCall::new(acp::ToolCallId::new(Arc::from("kill1")), "kill_task")
+        .kind(acp::ToolKind::Other)
+        .status(acp::ToolCallStatus::Failed)
+        .content(vec![])
+        .raw_input(Some(serde_json::json!({
+            "variant": "KillTask",
+            "task_id": "t1"
+        })))
+        .raw_output(serde_json::to_value(output).ok())
+        .locations(vec![]);
+    let block = tool_call_to_block(&tc, None, &SubagentLabelRegistry::default());
+    let RenderBlock::ToolCall(ToolCallBlock::Other(other)) = block else {
+        panic!("expected Other block, got {block:?}");
+    };
+    assert_eq!(Some("no task with id t1"), other.error.as_deref());
+    assert_eq!(
+        None, other.output,
+        "a failure carries its text as the error only"
+    );
 }
 #[test]
 fn send_feedback_update_renders_feedback_drafted() {
@@ -4758,7 +4912,7 @@ fn call_mcp_tool_no_raw_input_does_not_panic() {
     .status(acp::ToolCallStatus::Pending)
     .content(vec![])
     .locations(vec![]);
-    let _block = tool_call_to_block(&tc, None);
+    let _block = tool_call_to_block(&tc, None, &SubagentLabelRegistry::default());
 }
 #[test]
 fn cursor_todo_write_suppressed_by_title() {
@@ -4823,7 +4977,7 @@ fn video_tool_variants_use_typed_path_not_generic_scrape() {
         .raw_input(Some(serde_json::json!({ "variant" : variant })))
         .raw_output(serde_json::to_value(output).ok())
         .locations(vec![]);
-        let block = tool_call_to_block(&tc, None);
+        let block = tool_call_to_block(&tc, None, &SubagentLabelRegistry::default());
         let open_path = block
             .inline_open_button()
             .map(|(p, is_video)| {
@@ -4878,7 +5032,9 @@ fn tier_restricted_media_shows_upsell_text_not_error() {
     .raw_input(Some(serde_json::json!({ "variant": "ImageGen" })))
     .raw_output(serde_json::to_value(output).ok())
     .locations(vec![]);
-    let RenderBlock::ToolCall(ToolCallBlock::Other(block)) = tool_call_to_block(&tc, None) else {
+    let RenderBlock::ToolCall(ToolCallBlock::Other(block)) =
+        tool_call_to_block(&tc, None, &SubagentLabelRegistry::default())
+    else {
         panic!("expected an Other tool-call block");
     };
     assert!(
@@ -4894,6 +5050,81 @@ fn tier_restricted_media_shows_upsell_text_not_error() {
         "upsell text must be shown in the card body, got: {:?}",
         block.output
     );
+}
+/// The daemon client hand-builds the media card's JSON (it cannot depend on `MediaGenOutput`); this pins that the
+/// exact shape it sends — `type` + `path` only — renders as a media ref for both spellings, and that the fuller
+/// shape the built-in tools send does too.
+#[test]
+fn daemon_generate_image_output_shape_renders_as_a_media_ref() {
+    let outputs = [
+        (
+            "ImageGen",
+            serde_json::json!({ "type": "ImageGen", "path": "/work/proj/assets/cat.png" }),
+        ),
+        (
+            "ImageEdit",
+            serde_json::json!({ "type": "ImageEdit", "path": "/work/proj/assets/cat.png" }),
+        ),
+        (
+            "ImageGen",
+            serde_json::json!({
+                "type": "ImageGen",
+                "path": "/work/proj/assets/cat.png",
+                "filename": "cat.png",
+                "session_folder": "assets",
+            }),
+        ),
+    ];
+    for (variant, output) in outputs {
+        let tc = acp::ToolCall::new(
+            acp::ToolCallId::new(Arc::from("daemon-image")),
+            "Generate image: \"a cat\"",
+        )
+        .kind(acp::ToolKind::Other)
+        .status(acp::ToolCallStatus::Completed)
+        .raw_input(Some(serde_json::json!({
+            "variant": variant, "prompt": "a cat", "aspect_ratio": "16:9",
+        })))
+        .raw_output(Some(output.clone()))
+        .locations(vec![]);
+        assert_eq!(
+            media_gen_ref(&tc),
+            Some((std::path::PathBuf::from("/work/proj/assets/cat.png"), false)),
+            "{output}"
+        );
+        let RenderBlock::ToolCall(ToolCallBlock::Other(block)) =
+            tool_call_to_block(&tc, None, &SubagentLabelRegistry::default())
+        else {
+            panic!("expected an Other tool-call block for {output}");
+        };
+        assert!(block.is_success(), "{output}");
+    }
+}
+/// A refused generation (the server's access error) fails the card with the reason, and draws no image.
+#[test]
+fn daemon_generate_image_refusal_is_a_failed_card_with_the_reason() {
+    let reason = "Developer, Sand, or training access required";
+    let tc = acp::ToolCall::new(
+        acp::ToolCallId::new(Arc::from("daemon-image")),
+        "Generate image: \"a cat\"",
+    )
+    .kind(acp::ToolKind::Other)
+    .status(acp::ToolCallStatus::Failed)
+    .raw_input(Some(serde_json::json!({
+        "variant": "ImageGen", "prompt": "a cat", "aspect_ratio": "auto",
+    })))
+    .content(vec![acp::ToolCallContent::from(acp::ContentBlock::Text(
+        acp::TextContent::new(reason.to_string()),
+    ))])
+    .locations(vec![]);
+    assert_eq!(media_gen_ref(&tc), None);
+    let RenderBlock::ToolCall(ToolCallBlock::Other(block)) =
+        tool_call_to_block(&tc, None, &SubagentLabelRegistry::default())
+    else {
+        panic!("expected an Other tool-call block");
+    };
+    assert!(!block.is_success());
+    assert_eq!(block.error.as_deref(), Some(reason));
 }
 /// A hook batch younger than the reveal delay is invisible; once it outlives the delay it outranks the phase it blocks.
 #[test]

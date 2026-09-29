@@ -35,6 +35,7 @@ pub(in crate::app::dispatch) fn save_success_toast(label: &str, on: bool) -> Str
 /// The modal stores snapshots by value; without this, toggles would appear stuck.
 pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
     use crate::views::modal::ActiveModal;
+    use crate::views::settings_modal::SettingsModalMode;
     // Early exit when no settings modal is open (common case).
     if !app.agents.values().any(|a| {
         matches!(
@@ -54,6 +55,7 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
     let auto_mode_gate_from_app = app.auto_mode_gate;
     let ask_user_question_timeout_enabled_from_app = app.ask_user_question_timeout_enabled;
     let voice_stt_language_from_app = app.voice_config.language.clone();
+    let subagent_model_inheritance_from_app = app.subagent_model_inheritance;
     for agent in app.agents.values_mut() {
         // Walk both `Settings` and `ResetSettingsConfirm`
         // The confirm dialog embeds settings state that must stay fresh through async persist failures
@@ -91,7 +93,16 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
                 auto_mode_gate: auto_mode_gate_from_app,
                 ask_user_question_timeout_enabled: ask_user_question_timeout_enabled_from_app,
                 voice_stt_language: voice_stt_language_from_app.clone(),
+                subagent_model_inheritance: subagent_model_inheritance_from_app,
             };
+            if coding_data_sharing_lock_from_app.is_some()
+                && matches!(
+                    state.mode(),
+                    SettingsModalMode::PickingEnum { key, .. } if crate::settings::is_consent_chooser(key)
+                )
+            {
+                state.transition_to_browse();
+            }
         }
     }
 }
@@ -151,7 +162,7 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(
     focus_key: Option<&'static str>,
 ) -> Vec<Effect> {
     use crate::views::modal::ActiveModal;
-    use crate::views::settings_modal::SettingsModalState;
+    use crate::views::settings_modal::{RowVisibility, SettingsModalState};
 
     let mut effects = vec![];
     let id = match app.active_view {
@@ -186,6 +197,12 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(
     let auto_mode_gate_from_app = app.auto_mode_gate;
     let ask_user_question_timeout_enabled_from_app = app.ask_user_question_timeout_enabled;
     let voice_stt_language_from_app = app.voice_config.language.clone();
+    let subagent_model_inheritance_from_app = app.subagent_model_inheritance;
+    // Theme rows are `hidden_in_minimal`. Snapshot this AppView's mode, not `MINIMAL_MODE_ACTIVE`
+    // (other tests flip that process flag in parallel and would drop `theme` from the list).
+    let visibility = RowVisibility {
+        hide_appearance: app.screen_mode.is_minimal(),
+    };
 
     let Some(agent) = app.agents.get_mut(&id) else {
         return effects;
@@ -231,11 +248,13 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(
         auto_mode_gate: auto_mode_gate_from_app,
         ask_user_question_timeout_enabled: ask_user_question_timeout_enabled_from_app,
         voice_stt_language: voice_stt_language_from_app,
+        subagent_model_inheritance: subagent_model_inheritance_from_app,
     };
-    let mut state = Box::new(SettingsModalState::new(
+    let mut state = Box::new(SettingsModalState::new_with_row_visibility(
         registry,
         ui_snapshot,
         pager_snapshot,
+        visibility,
     ));
     if let Some(key) = focus_key
         && state.focus_key(key)
@@ -346,12 +365,28 @@ pub(in crate::app::dispatch) fn dispatch_confirm_reset_setting(
                 return vec![];
             };
             let default_value = crate::settings::default_value_for(meta);
+            let Some(action) = action_for_reset(key, &default_value) else {
+                tracing::error!(
+                    target: "settings",
+                    key,
+                    ?default_value,
+                    "reset has no action_for_reset arm — registry/dispatch skew",
+                );
+                return vec![];
+            };
 
             // Gate idempotent reset: a value already at its default only shows a toast
+            // Not for the coding-data setter, which owns that decision: its local "opt-out" may be the unconfirmed fail-safe, so it writes anyway
+            // Nor for a `[features]` override, where reset deletes the key: a saved value equal to the default is still an override
             let pager_snapshot = build_pager_snapshot(app);
             let current_value =
                 crate::settings::current_value_for(key, &app.current_ui, &pager_snapshot);
-            if current_value.as_ref() == Some(&default_value) {
+            if current_value.as_ref() == Some(&default_value)
+                && !matches!(
+                    action,
+                    Action::SetCodingDataSharing { .. } | Action::ClearSubagentModelInheritance
+                )
+            {
                 tracing::debug!(
                     target: "settings",
                     key,
@@ -364,15 +399,6 @@ pub(in crate::app::dispatch) fn dispatch_confirm_reset_setting(
                 return vec![];
             }
 
-            let Some(action) = action_for_reset(key, &default_value) else {
-                tracing::error!(
-                    target: "settings",
-                    key,
-                    ?default_value,
-                    "reset has no action_for_reset arm — registry/dispatch skew",
-                );
-                return vec![];
-            };
             tracing::info!(
                 target: "settings",
                 key,
@@ -611,6 +637,7 @@ pub(crate) fn build_pager_snapshot(app: &AppView) -> crate::settings::PagerLocal
         auto_mode_gate: app.auto_mode_gate,
         ask_user_question_timeout_enabled: app.ask_user_question_timeout_enabled,
         voice_stt_language: app.voice_config.language.clone(),
+        subagent_model_inheritance: app.subagent_model_inheritance,
     }
 }
 
@@ -627,6 +654,9 @@ pub(in crate::app::dispatch) fn action_for_reset(
         ("show_timestamps", SettingValue::Bool(b)) => Some(Action::SetTimestamps(*b)),
         ("show_timeline", SettingValue::Bool(b)) => Some(Action::SetTimeline(*b)),
         ("page_flip_on_send", SettingValue::Bool(b)) => Some(Action::SetPageFlipOnSend(*b)),
+        ("dashboard_preview", SettingValue::Bool(enabled)) => {
+            Some(Action::SetDashboardPreview(*enabled))
+        }
         ("confirm_before_rewind", SettingValue::Bool(b)) => {
             Some(Action::SetConfirmBeforeRewind(*b))
         }
@@ -669,6 +699,9 @@ pub(in crate::app::dispatch) fn action_for_reset(
         }
         ("toolset.ask_user_question.timeout_enabled", SettingValue::Bool(b)) => {
             Some(Action::SetAskUserQuestionTimeoutEnabled(*b))
+        }
+        ("subagent_model_inheritance", SettingValue::Bool(_)) => {
+            Some(Action::ClearSubagentModelInheritance)
         }
         ("keep_text_selection", SettingValue::Enum(s)) => {
             crate::appearance::TextSelection::from_canonical(s).map(Action::SetKeepTextSelection)
@@ -800,6 +833,9 @@ pub(in crate::app::dispatch) fn apply_setting_rollback(
         ("show_timestamps", SettingValue::Bool(b)) => set_timestamps_inner(app, *b),
         ("show_timeline", SettingValue::Bool(b)) => set_timeline_inner(app, *b),
         ("page_flip_on_send", SettingValue::Bool(b)) => set_page_flip_on_send_inner(app, *b),
+        ("dashboard_preview", SettingValue::Bool(enabled)) => {
+            app.current_ui.dashboard_preview = Some(*enabled);
+        }
         ("confirm_before_rewind", SettingValue::Bool(b)) => {
             set_confirm_before_rewind_inner(app, *b)
         }
@@ -897,6 +933,13 @@ pub(in crate::app::dispatch) fn apply_setting_rollback(
             set_yolo_mode_inner(app, kind.is_always_approve());
             // Restore the canonical (meaningful for `Default`)
             app.current_ui.permission_mode = Some(kind.as_canonical().to_string());
+            // The staged word has to roll back too, or SessionCreated replays the value that failed to save
+            if let ActiveView::Agent(id) = app.active_view
+                && let Some(agent) = app.agents.get_mut(&id)
+                && (agent.session.session_id.is_none() || agent.deferred_permission_mode.is_some())
+            {
+                agent.deferred_permission_mode = Some(kind.as_canonical());
+            }
             // Sync the per-session auto flag only for a permission_mode rollback
             // Other rollback arms must not clobber it from the global canonical
             sync_active_auto_flag(app);

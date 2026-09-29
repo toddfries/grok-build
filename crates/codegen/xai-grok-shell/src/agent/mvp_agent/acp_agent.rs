@@ -41,7 +41,11 @@ impl MvpAgent {
         let model = match self.resolve_model_id(&args.model_id) {
             Ok(model) => model,
             Err(_) => {
-                self.models_manager.wait_for_first_catalog().await;
+                self.models_manager
+                    .wait_for_first_catalog(
+                        crate::util::config::resolve_remote_fetch_enabled(),
+                    )
+                    .await;
                 self.resolve_model_id(&args.model_id)?
             }
         };
@@ -89,10 +93,16 @@ impl acp::Agent for MvpAgent {
     /// The response meta carries `model_state` so the client can display the available models and the default model. SINGLE-CALL INVARIANT: this method is the sole writer of `self.auth_method_id` during initialization.
     /// It is called exactly once per agent process by the ACP server before any session-creating requests. At that point `auth_method_id` is still `None` (initialized at `MvpAgent::new`).
     /// The auth-method block below relies on that invariant when it unconditionally writes the default id from `auth_method::build_auth_methods`.
+    #[tracing::instrument(name = "agent.acp_initialize", skip_all)]
     async fn initialize(
         &self,
         arguments: acp::InitializeRequest,
     ) -> Result<acp::InitializeResponse, acp::Error> {
+        if let Some(meta) = arguments.meta.as_ref() {
+            xai_grok_otel::link_current_span_to_meta(
+                &serde_json::Value::Object(meta.clone()),
+            );
+        }
         tracing::debug!(target: "sampling_log", "Received initialize request");
         xai_grok_telemetry::unified_log::info("agent initialized", None, None);
         startup::mark_agent_serving();
@@ -117,9 +127,6 @@ impl acp::Agent for MvpAgent {
                 return;
             }
             Self::reclaim_worktrees(grok_home, auto_gc_policy);
-        });
-        tokio::task::spawn_blocking(|| {
-            crate::session::persistence::cleanup_stale_sessions(None);
         });
         if remote_settled {
             self.start_search_index_once();
@@ -157,6 +164,7 @@ impl acp::Agent for MvpAgent {
                 let _t = xai_grok_telemetry::instrumentation::timer(
                     "startup.acp_initialize.user_info",
                 );
+                let _s = region!("startup.acp_initialize.user_info", Parent::Inherit);
                 if let Err(e) = self.auth_manager.update(auth).await {
                     tracing::warn!(
                         "Failed to refresh user info from proxy during new_session: {}",
@@ -248,6 +256,7 @@ impl acp::Agent for MvpAgent {
             let _t = xai_grok_telemetry::instrumentation::timer(
                 "startup.acp_initialize.auth_reload",
             );
+            let _s = region!("startup.acp_initialize.auth_reload", Parent::Inherit);
             self.auth_manager.force_reload_from_disk();
         }
         let post = self
@@ -290,7 +299,7 @@ impl acp::Agent for MvpAgent {
                 &crate::util::grok_home::grok_home(),
             )
         {
-            unsafe { std::env::set_var("XAI_API_KEY", &api_key) };
+            xai_grok_login::auth_method::set_runtime_xai_api_key(&api_key);
             tracing::info!("auth: loaded API key from auth.json (xai::api_key scope)");
             xai_grok_telemetry::unified_log::info(
                 "auth: loaded API key from auth.json (xai::api_key scope)",
@@ -365,6 +374,7 @@ impl acp::Agent for MvpAgent {
             let _t = xai_grok_telemetry::instrumentation::timer(
                 "startup.acp_initialize.silent_refresh",
             );
+            let _s = region!("startup.acp_initialize.silent_refresh", Parent::Inherit);
             has_cached_token = match self.auth_manager.silent_refresh().await {
                 SilentRefresh::Renewed(_) => true,
                 SilentRefresh::Failed(remedy) => remedy.is_self_healing(),
@@ -420,6 +430,7 @@ impl acp::Agent for MvpAgent {
             let _t = xai_grok_telemetry::instrumentation::timer(
                 "startup.acp_initialize.auth_methods",
             );
+            let _s = region!("startup.acp_initialize.auth_methods", Parent::Inherit);
             auth_method::build_auth_methods(auth_method::AuthMethodsBuildInputs {
                 has_external_api_key,
                 has_cached_token,
@@ -502,6 +513,7 @@ impl acp::Agent for MvpAgent {
             let _t = xai_grok_telemetry::instrumentation::timer(
                 "startup.acp_initialize.model_state",
             );
+            let _s = region!("startup.acp_initialize.model_state", Parent::Inherit);
             if crate::agent::chat_modes::process_chat_mode_enabled() {
                 self.chat_modes.model_state().await
             } else {
@@ -1147,6 +1159,7 @@ impl acp::Agent for MvpAgent {
             });
         let model = model_rx
             .await
+            .map(|current| current.id)
             .unwrap_or_else(|_| self.sampling_config.borrow().model.clone());
         let mut parsed_prompt_tx: Option<oneshot::Sender<ParsedPromptInfo>> = None;
         let verbatim = arguments
@@ -1503,17 +1516,19 @@ impl acp::Agent for MvpAgent {
                 prompt_id.as_str(),
                 &mapped,
             );
-            if let Some(tid) = turn_id {
-                payload["turnId"] = serde_json::json!(tid);
-            }
-            if let Some(ref t) = cancel_trigger {
-                payload["cancelTrigger"] = serde_json::json!(t);
-            }
-            if let Some(ref c) = cancellation_category {
-                payload["cancellationCategory"] = serde_json::json!(c);
-            }
-            if let Some(ref ctx) = cancellation_context {
-                payload["cancellationContext"] = ctx.clone();
+            if let Some(obj) = payload.as_object_mut() {
+                if let Some(tid) = turn_id {
+                    obj.insert("turnId".into(), serde_json::json!(tid));
+                }
+                if let Some(ref t) = cancel_trigger {
+                    obj.insert("cancelTrigger".into(), serde_json::json!(t));
+                }
+                if let Some(ref c) = cancellation_category {
+                    obj.insert("cancellationCategory".into(), serde_json::json!(c));
+                }
+                if let Some(ref ctx) = cancellation_context {
+                    obj.insert("cancellationContext".into(), ctx.clone());
+                }
             }
             if let Ok(params) = serde_json::value::to_raw_value(&payload) {
                 self.gateway
@@ -1883,6 +1898,9 @@ impl acp::Agent for MvpAgent {
             };
             let dispatch_lock = self.dispatch_lock(&args.session_id);
             let _dispatch_guard = dispatch_lock.lock().await;
+            let user_initiated = cancel_trigger
+                .as_ref()
+                .is_none_or(crate::session::CancelTrigger::is_user_gesture);
             let _ = handle
                 .cmd_tx
                 .send(
@@ -1890,7 +1908,7 @@ impl acp::Agent for MvpAgent {
                         cancel_subagents,
                         history,
                         trigger: cancel_trigger,
-                        user_initiated: true,
+                        user_initiated,
                         ..Default::default()
                     }),
                 );
@@ -1998,7 +2016,12 @@ impl acp::Agent for MvpAgent {
             }
             "x.ai/session/repair" => crate::extensions::repair::handle(self, &args).await,
             "x.ai/session/usage" => crate::extensions::usage::handle(self, &args).await,
-            "x.ai/memory/flush" | "x.ai/memory/rewrite" => {
+            crate::extensions::memory::MEMORY_FLUSH_METHOD
+            | crate::extensions::memory::MEMORY_DREAM_METHOD
+            | crate::extensions::memory::MEMORY_REWRITE_METHOD
+            | crate::extensions::memory::MEMORY_LIST_METHOD
+            | crate::extensions::memory::MEMORY_TOGGLE_METHOD
+            | crate::extensions::memory::MEMORY_FORGET_METHOD => {
                 crate::extensions::memory::handle(self, &args).await
             }
             "x.ai/skills/refresh-baseline" => {
@@ -2296,10 +2319,12 @@ impl acp::Agent for MvpAgent {
             }
             s if s.starts_with("x.ai/skills/") || s == "x.ai/workflows/list" => {
                 let compat = self.cfg.borrow().compat_resolved;
+                let cwd = crate::extensions::skills::request_cwd(&args);
+                let registry = self.plugin_registry_for_cwd(cwd.as_deref()).await;
                 crate::extensions::skills::handle(
                         self,
                         &args,
-                        self.plugin_registry_handle.snapshot().as_deref(),
+                        registry.as_deref(),
                         compat,
                     )
                     .await
