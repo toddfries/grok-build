@@ -72,7 +72,40 @@ pub use promote::{
     promote_with_supersession,
 };
 pub use search::{SearchFilter, SearchResult, hybrid_search, hybrid_search_filtered};
-pub use storage::{MemoryScope, MemoryStorage};
+pub use storage::{MemoryScope, MemoryStorage, SaveRememberNoteError};
+
+pub use v2::{
+    MAX_MANUAL_OBSERVATION_BYTES, V2Manifest, V2ManifestBudget, V2MemoryScope, V2StorageError,
+    ensure_scope_initialized, ensure_scope_initialized_with_journal_mode,
+    regenerate_scope_manifest, render_scope_manifest,
+};
+
+pub use v2_access::{V2AccessError, V2MemoryAccessPolicy, V2PathClass};
+
+pub use v2_capture::{
+    CaptureCursors, CaptureJob, CaptureLease, CaptureOutcomeDraft, CaptureRange, CaptureWorkState,
+    ClaimRequest, CommitResult, MAX_ALIASES, MAX_BODY_BYTES, MAX_KEYWORDS, MAX_OBSERVATIONS,
+    MAX_STATEMENT_BYTES, MAX_TERM_BYTES, MAX_TOPIC_BYTES, ObservationDraft, ObservationType,
+    V2CaptureError, V2CaptureStore,
+};
+
+pub use v2_carryover::{
+    V2CarryoverError, V2CarryoverOutcome, V2CarryoverReport, carry_over_legacy_memory,
+    default_legacy_memory_root, legacy_memory_file,
+};
+
+pub use v2_clock::{SharedV2Clock, SystemV2Clock, V2Clock, system_v2_clock};
+
+pub use v2_consolidation::{
+    ClaimedObservation, ConsolidationInput, ConsolidationLease, ConsolidationResult,
+    ConsolidationStatus, DreamClaimRequest, DreamEligibility, DreamEligibilityConfig,
+    DreamTriggerDisposition, TopicOperation, V2ConsolidationError, V2ConsolidationStore,
+};
+
+pub use v2_maintenance::{
+    DreamLeaseState, ForgetReason, ForgetRequest, ForgetResult, GcResult, MAX_FORGET_FILE_BYTES,
+    RetentionPolicy, V2MaintenanceError, V2MaintenanceStore, V2ScopeStatus,
+};
 
 pub(crate) const MEMORY_LOG_TARGET: &str = "xai_memory";
 

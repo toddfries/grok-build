@@ -123,6 +123,47 @@ impl MemoryIndex {
             JournalMode::for_db_path(db_path),
         )
     }
+    /// Open an index for lexical-only maintenance without changing the vector
+    /// dimension already recorded by the embedding backend.
+    pub(crate) fn open_or_create_preserving_dimensions(
+        db_path: &Path,
+        storage: MemoryStorage,
+        config: MemoryIndexConfig,
+        fallback_dimensions: usize,
+    ) -> Result<Self, rusqlite::Error> {
+        if let Some(parent) = db_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let journal_mode = JournalMode::for_db_path(db_path);
+        let db = journal_mode.open(db_path)?;
+        let has_meta = db.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        let stored_dimensions = if has_meta {
+            db.query_row(
+                schema::GET_META_SQL,
+                params!["embedding_dimensions"],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        } else {
+            None
+        };
+        let dimensions = match stored_dimensions {
+            Some(value) => value
+                .parse::<usize>()
+                .ok()
+                .filter(|dimensions| *dimensions > 0)
+                .ok_or(rusqlite::Error::InvalidQuery)?,
+            None => fallback_dimensions,
+        };
+        Self::initialize(db, storage, config, dimensions)
+    }
+
 
     /// Open with an explicit journal mode — the seam tests use to exercise
     /// the network-filesystem decision on a local disk.
@@ -274,7 +315,7 @@ impl MemoryIndex {
         let path_str = path.to_string_lossy().to_string();
 
         // Load existing chunks for this path
-        let existing = self.get_chunks_for_path(&path_str)?;
+        let existing = Self::get_chunks_for_path(&self.db, &path_str)?;
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
