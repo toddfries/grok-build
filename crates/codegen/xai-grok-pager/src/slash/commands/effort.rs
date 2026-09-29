@@ -62,7 +62,6 @@ impl SlashCommand for EffortCommand {
             return CommandResult::Error(format!("Usage: /effort <{levels}>{current}"));
         }
 
-        // Same gate-first policy as the CLI (`--effort`) and headless.
         match ctx.models.resolve_effort_for_model(&model_id, trimmed) {
             Ok(effort) => CommandResult::Action(Action::SwitchModel {
                 model_id,
@@ -355,12 +354,74 @@ mod tests {
         };
         let items = cmd.suggest_args(&ctx, "").unwrap();
         assert_eq!(items.len(), EFFORT_LEVELS.len());
-        assert_eq!(items[0].insert_text, "xhigh");
-        assert_eq!(items[1].insert_text, "high");
-        assert_eq!(items[1].display, "high (active)");
-        assert_eq!(items[2].insert_text, "medium");
-        assert_eq!(items[3].insert_text, "low");
-        assert!(items[0].match_text.starts_with("a "));
-        assert!(items[3].match_text.starts_with("d "));
+        let [a, b, c, d] = items.as_slice() else {
+            panic!("expected 4 items: {items:?}");
+        };
+        assert_eq!(a.insert_text, "xhigh");
+        assert_eq!(b.insert_text, "high");
+        assert_eq!(b.display, "high (active)");
+        assert_eq!(c.insert_text, "medium");
+        assert_eq!(d.insert_text, "low");
+        assert!(a.match_text.starts_with("a "));
+        assert!(d.match_text.starts_with("d "));
+    }
+
+    #[test]
+    fn typed_label_filters_in_the_picker_and_runs() {
+        let mut state = ModelState::default();
+        let id = acp::ModelId::new(Arc::from("grok-4.7"));
+        let info = acp::ModelInfo::new(id.clone(), "Grok 4.7".to_string()).meta(
+            serde_json::json!({
+                "supportsReasoningEffort": true,
+                "reasoningEfforts": [
+                    { "value": "xhigh", "label": "Extra High" },
+                    { "value": "high", "label": "High" },
+                ],
+            })
+            .as_object()
+            .cloned(),
+        );
+        state.available.insert(id.clone(), info);
+        state.current = Some(id.clone());
+
+        let mut ctrl = crate::slash::SlashController::with_builtins(std::path::PathBuf::from("."));
+        let slash = crate::slash::SlashState::default();
+        let top = |ctrl: &mut crate::slash::SlashController, text: &str| {
+            ctrl.refresh(&slash, text, text.len(), &state);
+            slash
+                .snapshot()
+                .matches
+                .first()
+                .map(|row| row.display.clone())
+        };
+        assert_eq!(
+            top(&mut ctrl, "/effort extra").as_deref(),
+            Some("Extra High")
+        );
+        assert_eq!(top(&mut ctrl, "/effort high").as_deref(), Some("High"));
+        assert_eq!(
+            top(&mut ctrl, "/model Grok 4.7 extra").as_deref(),
+            Some("Extra High")
+        );
+        assert_eq!(
+            top(&mut ctrl, "/model Grok 4.7 high").as_deref(),
+            Some("High")
+        );
+
+        let mut ctx = dummy_exec_ctx(&state);
+        match EffortCommand.run(&mut ctx, "Extra High") {
+            CommandResult::Action(Action::SwitchModel { model_id, effort }) => {
+                assert_eq!(model_id, id);
+                assert_eq!(effort, Some(ReasoningEffort::Xhigh));
+            }
+            other => panic!("expected SwitchModel, got {other:?}"),
+        }
+        match crate::slash::commands::model::ModelCommand.run(&mut ctx, "Grok 4.7 Extra High") {
+            CommandResult::Action(Action::SwitchModel { model_id, effort }) => {
+                assert_eq!(model_id.0.as_ref(), "grok-4.7");
+                assert_eq!(effort, Some(ReasoningEffort::Xhigh));
+            }
+            other => panic!("expected model switch, got {other:?}"),
+        }
     }
 }

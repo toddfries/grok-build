@@ -207,13 +207,31 @@ fn resolve_dismissable_campaigns() -> Vec<CampaignEntry> {
 
 /// Effective config with the remote/override-aware campaign overlay, from one `ConfigLayers::load`.
 pub fn load_effective_config() -> std::io::Result<toml::Value> {
+    load_effective_config_with_layers().map(|(_, effective)| effective)
+}
+
+/// What [`load_effective_config`] merged: the layers and the campaign patches it applied, highest priority first.
+pub struct EffectiveConfigLayers {
+    pub layers: ConfigLayers,
+    pub active_campaigns: Vec<CampaignEntry>,
+}
+
+/// [`load_effective_config`] plus its inputs, for a caller that also reads the layers one by one.
+pub fn load_effective_config_with_layers() -> std::io::Result<(EffectiveConfigLayers, toml::Value)>
+{
     let layers = ConfigLayers::load()?;
     let dismissed = load_dismissed_ids();
     let remote = cached_remote_campaigns();
     let mut effective = layers.effective_config_base();
     let active = resolve_active_campaigns_from_layers(&layers, &effective, &remote, &dismissed);
     layers.apply_campaign_overrides(&mut effective, &active);
-    Ok(effective)
+    Ok((
+        EffectiveConfigLayers {
+            layers,
+            active_campaigns: active,
+        },
+        effective,
+    ))
 }
 
 /// Effective config with **disk campaigns only**: no remote cache, no `GROK_CAMPAIGNS_OVERRIDE`.
@@ -449,8 +467,18 @@ mod tests {
             );
             let active = resolve_active_campaigns_from_layers(&layers, &base, &[], &HashSet::new());
             assert_eq!(active.len(), 1, "override must apply despite kill switch");
-            assert_eq!(active[0].id, "c");
-            assert_eq!(active[0].patch["models"]["default"].as_str(), Some("m"));
+            let Some(first) = active.first() else {
+                panic!("expected one campaign: {active:?}");
+            };
+            assert_eq!(first.id, "c");
+            assert_eq!(
+                first
+                    .patch
+                    .get("models")
+                    .and_then(|m| m.get("default"))
+                    .and_then(|v| v.as_str()),
+                Some("m")
+            );
         }
 
         // Same disabled base, override now unset: the kill switch suppresses all
@@ -716,10 +744,21 @@ mod tests {
         })
         .expect("entry with id + patch survives");
         assert_eq!(
-            entry.patch["models"]["default"].as_str(),
+            entry
+                .patch
+                .get("models")
+                .and_then(|m| m.get("default"))
+                .and_then(|v| v.as_str()),
             Some("remote-model")
         );
-        assert_eq!(entry.patch["features"]["web_fetch"].as_bool(), Some(true));
+        assert_eq!(
+            entry
+                .patch
+                .get("features")
+                .and_then(|f| f.get("web_fetch"))
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
 
         let no_id = CampaignOverride {
             id: None,
