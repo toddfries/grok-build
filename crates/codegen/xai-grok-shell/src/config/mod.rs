@@ -2,37 +2,55 @@ pub mod reloader;
 pub mod watcher;
 use crate::bundle;
 use serde::Deserialize;
+use std::sync::atomic::{AtomicU8, Ordering};
 pub use xai_grok_config_types::{
     DEFAULT_RECENCY_DECAY, MemoryConfig, MemoryDreamConfig, MemoryDreamSettings,
     MemoryEmbeddingConfig, MemoryEmbeddingSettings, MemoryFlushConfig, MemoryFlushSettings,
     MemoryGcConfig, MemoryGcSettings, MemoryIndexConfig, MemoryIndexSettings,
     MemoryInitialInjectionConfig, MemoryInitialInjectionSettings, MemoryMode, MemorySearchConfig,
     MemorySearchSettings, MemorySessionConfig, MemorySessionSettings, MemorySettings,
-    MemoryWatcherConfig, MemoryWatcherSettings, MmrConfig, MmrSettings, PruningConfig,
-    PruningSettings, TemporalDecayConfig, TemporalDecaySettings,
+    MemoryV2Config, MemoryV2Rollout, MemoryV2Settings, MemoryWatcherConfig, MemoryWatcherSettings,
+    MmrConfig, MmrSettings, PruningConfig, PruningSettings, TemporalDecayConfig,
+    TemporalDecaySettings,
 };
 /// Read the memory mode selected by the current effective config.
 ///
 /// Session actors use their already-resolved [`MemoryConfig`] instead. This
 /// helper is for standalone commands that do not own a session.
+static STANDALONE_MEMORY_MODE: AtomicU8 = AtomicU8::new(0);
+pub fn cache_standalone_memory_mode(mode: MemoryMode) {
+    let encoded = match mode {
+        MemoryMode::Legacy => 1,
+        MemoryMode::V2 => 2,
+    };
+    STANDALONE_MEMORY_MODE.store(encoded, Ordering::Release);
+}
 pub fn load_memory_mode() -> std::io::Result<MemoryMode> {
+    match STANDALONE_MEMORY_MODE.load(Ordering::Acquire) {
+        1 => Ok(MemoryMode::Legacy),
+        2 => Ok(MemoryMode::V2),
+        _ => load_memory_mode_with_remote(None),
+    }
+}
+pub fn load_memory_mode_with_remote(
+    remote: Option<&crate::util::config::RemoteSettings>,
+) -> std::io::Result<MemoryMode> {
     let config = load_effective_config()?;
-    let settings: MemorySettings = config
-        .get("memory")
-        .cloned()
-        .map(MemorySettings::deserialize)
-        .transpose()
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?
-        .unwrap_or_default();
-    Ok(settings.mode.unwrap_or_default())
+    Ok(resolve_standalone_memory_mode(&config, remote))
+}
+fn resolve_standalone_memory_mode(
+    config: &toml::Value,
+    remote: Option<&crate::util::config::RemoteSettings>,
+) -> MemoryMode {
+    MemoryConfig::resolve(false, false, config, remote).mode
 }
 /// Configuration for subagent (task tool) support.
 /// Parsed from the `[subagents]` section of `~/.grok/config.toml` or `.grok/config.toml`.
 /// Enabled by default; can be disabled via the `GROK_SUBAGENTS=0` env var or `[subagents] enabled = false` in config.toml.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct SubagentsConfig {
-    /// Whether subagent support is enabled.
+    /// Whether subagent support is enabled. Defaults to `true`, so a `[subagents]` table that only tunes limits, models, or toggles keeps subagents on.
     pub enabled: bool,
     /// Raw `[subagents] max_depth` (i64 so out-of-range parses; clamped to at least 1 at resolve).
     #[serde(default)]
@@ -65,6 +83,22 @@ pub struct SubagentsConfig {
     pub personas: std::collections::HashMap<String, SubagentPersona>,
 }
 use xai_grok_subagent_resolution::config::{SubagentPersona, SubagentRole};
+impl Default for SubagentsConfig {
+    fn default() -> Self {
+        SubagentsConfig {
+            enabled: true,
+            max_depth: None,
+            max_concurrent: None,
+            sampling_limit: None,
+            limit_behavior: None,
+            workflow_max_concurrent: None,
+            models: std::collections::HashMap::new(),
+            toggle: std::collections::HashMap::new(),
+            roles: std::collections::HashMap::new(),
+            personas: std::collections::HashMap::new(),
+        }
+    }
+}
 impl SubagentsConfig {
     fn discover_personas_in_dir(&mut self, dir: &std::path::Path) {
         if !dir.is_dir() {
@@ -334,10 +368,12 @@ impl SubagentsConfig {
         }
         LimitBehavior::Queue
     }
-    /// Resolve the final subagents config from all sources (in priority order): CLI flag `--subagents` (absolute highest, always enables) `GROK_SUBAGENTS` env var: `1`/`true` enables, `0`/`false` force-disables
-    /// Config file `[subagents]` section Default (enabled) `enabled` is deliberately not remotely gated. Only explicit local intent (CLI flag, `GROK_SUBAGENTS`, `[subagents] enabled`) changes the default.
+    /// Resolve the final subagents config from all sources (in priority order): CLI tri-state (`Some(false)` from `--no-subagents` force-disables, `Some(true)` force-enables, `None` defers)
+    /// `GROK_SUBAGENTS` env var: `1`/`true` enables, `0`/`false` force-disables; config file `[subagents] enabled`; Default (enabled).
+    /// `enabled` is deliberately not remotely gated. Only explicit local intent (CLI flag, `GROK_SUBAGENTS`, `[subagents] enabled`) changes the default.
+    /// A `[subagents]` table without an `enabled` key is not intent: it keeps the default so tuning `max_depth` or `[subagents.models]` cannot turn subagents off.
     /// Project files are excluded from this trust-independent base; Task boundaries overlay them using the parent cwd's authoritative trust verdict.
-    pub fn resolve(cli_flag: bool, config: &toml::Value) -> Self {
+    pub fn resolve(cli_flag: Option<bool>, config: &toml::Value) -> Self {
         let user_grok_root = xai_grok_config::user_grok_home();
         Self::resolve_base_with_sources(
             cli_flag,
@@ -347,7 +383,7 @@ impl SubagentsConfig {
         )
     }
     pub(crate) fn resolve_base_with_sources(
-        cli_flag: bool,
+        cli_flag: Option<bool>,
         config: &toml::Value,
         user_grok_root: Option<&std::path::Path>,
         bundled_root: &std::path::Path,
@@ -356,11 +392,15 @@ impl SubagentsConfig {
             .get("subagents")
             .and_then(|v| v.clone().try_into().ok())
             .unwrap_or_default();
+        let has_local_enabled = config
+            .get("subagents")
+            .and_then(|v| v.as_table())
+            .is_some_and(|t| t.contains_key("enabled"));
         let resolved = crate::agent::config::resolve_enabled(
-            if cli_flag { Some(true) } else { None },
+            cli_flag,
             "GROK_SUBAGENTS",
             result.enabled,
-            config.get("subagents").is_some(),
+            has_local_enabled,
             None,
             true,
         );
@@ -891,11 +931,13 @@ fn walk_toml(
 }
 /// The `[skills]` table from an effective config, shared by the reload dispatch and `grok inspect`.
 pub(crate) use crate::config::reloader::parse_skills_config;
-/// Effective config: the layers plus the campaign overlay (remote cache and `GROK_CAMPAIGNS_OVERRIDE`).
-pub use crate::util::config::load_effective_config;
 /// Effective config with disk campaigns only, for one-shot entrypoints that never fetch remote settings.
 /// This avoids resolving against a never-seeded cache.
 pub use crate::util::config::load_effective_config_disk_only;
+/// Effective config: the layers plus the campaign overlay (remote cache and `GROK_CAMPAIGNS_OVERRIDE`).
+pub use crate::util::config::{
+    EffectiveConfigLayers, load_effective_config, load_effective_config_with_layers,
+};
 /// Where a requirement or permission rule was loaded from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequirementSource {
@@ -1607,7 +1649,7 @@ fn update_config_toml_locked(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = grok_home.join("config.toml");
     let _flock = crate::util::config::acquire_init_lock(grok_home)?;
-    let content = crate::util::config::read_to_string_or_empty(&config_path)?;
+    let (dest, content) = crate::util::config::read_follow_bound(&config_path)?;
     let mut config: toml::Value = if content.is_empty() {
         toml::Value::Table(toml::map::Map::new())
     } else {
@@ -1619,7 +1661,11 @@ fn update_config_toml_locked(
     if !mutate(table)? {
         return Ok(());
     }
-    crate::util::config::atomic_write_string(&config_path, &toml::to_string_pretty(&config)?)?;
+    crate::util::config::atomic_write_follow_bound(
+        &config_path,
+        &dest,
+        &toml::to_string_pretty(&config)?,
+    )?;
     Ok(())
 }
 /// Append `value` to the `[plugins].<list>` string array (created if missing)

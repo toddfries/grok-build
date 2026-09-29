@@ -382,7 +382,7 @@ async fn first_catalog_wait_unblocks_on_fetch_and_skips_dead_dwell() {
     // Cold cache, remote fetch disabled: no fetch is coming, so no dwell.
     let start = tokio::time::Instant::now();
     assert!(
-        !mgr.wait_for_first_catalog_inner(/*remote_fetch_enabled*/ false)
+        !mgr.wait_for_first_catalog(/*remote_fetch_enabled*/ false)
             .await
     );
     assert_eq!(start.elapsed(), std::time::Duration::ZERO);
@@ -390,7 +390,7 @@ async fn first_catalog_wait_unblocks_on_fetch_and_skips_dead_dwell() {
     // Cold cache, no attempt spawned: nothing to wait for, so no dwell.
     let start = tokio::time::Instant::now();
     assert!(
-        !mgr.wait_for_first_catalog_inner(/*remote_fetch_enabled*/ true)
+        !mgr.wait_for_first_catalog(/*remote_fetch_enabled*/ true)
             .await
     );
     assert_eq!(start.elapsed(), std::time::Duration::ZERO);
@@ -398,7 +398,7 @@ async fn first_catalog_wait_unblocks_on_fetch_and_skips_dead_dwell() {
     // Cold cache, fetch in flight: the wait unblocks when the fetch lands.
     mgr.spawn_fetch_inner(None, /*remote_fetch_enabled*/ true);
     assert!(
-        mgr.wait_for_first_catalog_inner(/*remote_fetch_enabled*/ true)
+        mgr.wait_for_first_catalog(/*remote_fetch_enabled*/ true)
             .await,
         "the wait must observe the completed fetch",
     );
@@ -407,7 +407,7 @@ async fn first_catalog_wait_unblocks_on_fetch_and_skips_dead_dwell() {
     // Warm: an already-loaded catalog returns immediately.
     let start = tokio::time::Instant::now();
     assert!(
-        mgr.wait_for_first_catalog_inner(/*remote_fetch_enabled*/ true)
+        mgr.wait_for_first_catalog(/*remote_fetch_enabled*/ true)
             .await
     );
     assert_eq!(start.elapsed(), std::time::Duration::ZERO);
@@ -423,7 +423,7 @@ async fn first_catalog_wait_unblocks_on_failed_fetch() {
     let start = tokio::time::Instant::now();
     mgr.spawn_fetch_inner(None, /*remote_fetch_enabled*/ true);
     assert!(
-        !mgr.wait_for_first_catalog_inner(/*remote_fetch_enabled*/ true)
+        !mgr.wait_for_first_catalog(/*remote_fetch_enabled*/ true)
             .await
     );
     assert!(start.elapsed() < budget, "failure must beat the budget");
@@ -439,7 +439,7 @@ async fn first_catalog_wait_is_bounded() {
     let _attempt = FetchAttemptGuard::begin(&mgr.inner);
     let start = tokio::time::Instant::now();
     assert!(
-        !mgr.wait_for_first_catalog_inner(/*remote_fetch_enabled*/ true)
+        !mgr.wait_for_first_catalog(/*remote_fetch_enabled*/ true)
             .await
     );
     assert_eq!(start.elapsed(), budget, "only the budget ends this wait");
@@ -454,7 +454,7 @@ async fn first_catalog_wait_skips_doomed_signed_out_fetch() {
     let start = tokio::time::Instant::now();
     mgr.spawn_fetch_inner(None, /*remote_fetch_enabled*/ true);
     assert!(
-        !mgr.wait_for_first_catalog_inner(/*remote_fetch_enabled*/ true)
+        !mgr.wait_for_first_catalog(/*remote_fetch_enabled*/ true)
             .await
     );
     assert_eq!(start.elapsed(), std::time::Duration::ZERO);
@@ -472,7 +472,7 @@ async fn first_catalog_wait_observes_inline_fetch() {
     // Fetch first in the join, so its attempt registers on first poll.
     let ((), ready) = tokio::join!(
         mgr.fetch_and_apply_inner(/*remote_fetch_enabled*/ true),
-        mgr.wait_for_first_catalog_inner(/*remote_fetch_enabled*/ true),
+        mgr.wait_for_first_catalog(/*remote_fetch_enabled*/ true),
     );
     assert!(ready, "the wait must observe the inline fetch's outcome");
 }
@@ -505,7 +505,7 @@ async fn new_fetch_attempt_supersedes_failed_latch() {
 
     let start = tokio::time::Instant::now();
     assert!(
-        !mgr.wait_for_first_catalog_inner(/*remote_fetch_enabled*/ true)
+        !mgr.wait_for_first_catalog(/*remote_fetch_enabled*/ true)
             .await
     );
     assert_eq!(start.elapsed(), std::time::Duration::ZERO);
@@ -703,7 +703,10 @@ fn set_session_model_fleet_deny_uses_organization_message() {
         crate::config::RequirementSource::Unknown,
     );
     let catalog = resolve_model_catalog(&cfg, None);
-    assert!(!catalog["grok-3"].info.user_selectable);
+    let Some(grok3) = catalog.get("grok-3") else {
+        panic!("expected grok-3: {catalog:?}");
+    };
+    assert!(!grok3.info.user_selectable);
     let msg = allowlist_denied_message(&cfg);
     assert!(
         msg.contains("organization"),
@@ -855,8 +858,11 @@ fn default_reasoning_effort_only_stamps_supporting_model() {
     prefetched.insert("reasoning-model".to_string(), reasoning_entry);
 
     let catalog = resolve_model_catalog(&cfg, Some(prefetched));
+    let Some(reasoning) = catalog.get("reasoning-model") else {
+        panic!("expected reasoning-model: {catalog:?}");
+    };
     assert_eq!(
-        catalog["reasoning-model"].info.reasoning_effort,
+        reasoning.info.reasoning_effort,
         Some(ReasoningEffort::High),
         "reasoning-supporting default model should be stamped",
     );
@@ -869,8 +875,11 @@ fn default_reasoning_effort_only_stamps_supporting_model() {
     prefetched.insert("plain-model".to_string(), make_model_entry("plain-model"));
 
     let catalog = resolve_model_catalog(&cfg, Some(prefetched));
+    let Some(plain) = catalog.get("plain-model") else {
+        panic!("expected plain-model: {catalog:?}");
+    };
     assert_eq!(
-        catalog["plain-model"].info.reasoning_effort, None,
+        plain.info.reasoning_effort, None,
         "non-reasoning default model must NOT be stamped with persisted effort",
     );
 }
@@ -910,13 +919,19 @@ fn reasoning_effort_override_skips_models_that_do_not_offer_level() {
     prefetched.insert("legacy-none".to_string(), with_none);
 
     let catalog = resolve_model_catalog(&cfg, Some(prefetched));
+    let Some(grok45) = catalog.get("grok-4.5") else {
+        panic!("expected grok-4.5: {catalog:?}");
+    };
     assert_eq!(
-        catalog["grok-4.5"].info.reasoning_effort,
+        grok45.info.reasoning_effort,
         Some(ReasoningEffort::High),
         "--effort none must not stamp onto models that do not offer none"
     );
+    let Some(legacy) = catalog.get("legacy-none") else {
+        panic!("expected legacy-none: {catalog:?}");
+    };
     assert_eq!(
-        catalog["legacy-none"].info.reasoning_effort,
+        legacy.info.reasoning_effort,
         Some(ReasoningEffort::None),
         "models that list none should still accept the override"
     );
@@ -951,7 +966,10 @@ fn config_menu_only_model_derives_support_and_default() {
         .insert("plain".to_string(), config::ConfigModelOverride::default());
 
     let catalog = resolve_model_catalog(&cfg, None);
-    let info = &catalog["menu-only"].info;
+    let Some(menu_only) = catalog.get("menu-only") else {
+        panic!("expected menu-only: {catalog:?}");
+    };
+    let info = &menu_only.info;
     assert!(
         info.supports_reasoning_effort,
         "menu-only model must derive support"
@@ -961,8 +979,11 @@ fn config_menu_only_model_derives_support_and_default() {
         Some(ReasoningEffort::Xhigh),
         "derived default = marked-default option value"
     );
-    assert!(!catalog["plain"].info.supports_reasoning_effort);
-    assert_eq!(catalog["plain"].info.reasoning_effort, None);
+    let Some(plain) = catalog.get("plain") else {
+        panic!("expected plain: {catalog:?}");
+    };
+    assert!(!plain.info.supports_reasoning_effort);
+    assert_eq!(plain.info.reasoning_effort, None);
 
     let tmp = tempfile::TempDir::new().unwrap();
     let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
@@ -1005,13 +1026,19 @@ fn cli_reasoning_effort_override_only_stamps_supporting_models() {
     prefetched.insert("plain-model".to_string(), make_model_entry("plain-model"));
 
     let catalog = resolve_model_catalog(&cfg, Some(prefetched));
+    let Some(reasoning) = catalog.get("reasoning-model") else {
+        panic!("expected reasoning-model: {catalog:?}");
+    };
     assert_eq!(
-        catalog["reasoning-model"].info.reasoning_effort,
+        reasoning.info.reasoning_effort,
         Some(ReasoningEffort::High),
         "reasoning-supporting model should be stamped",
     );
+    let Some(plain) = catalog.get("plain-model") else {
+        panic!("expected plain-model: {catalog:?}");
+    };
     assert_eq!(
-        catalog["plain-model"].info.reasoning_effort, None,
+        plain.info.reasoning_effort, None,
         "non-reasoning model must NOT be stamped",
     );
 }
@@ -2212,41 +2239,11 @@ fn make_entry_config_with_id(
 ) -> config::ModelEntryConfig {
     config::ModelEntryConfig {
         id: id.map(|s| s.to_owned()),
-        model_family: None,
         model: model.to_owned(),
         base_url: "https://test.api/v1".to_owned(),
         name: name.map(|n| n.to_owned()),
-        description: None,
-        max_completion_tokens: None,
-        temperature: None,
-        top_p: None,
-        api_key: None,
-        env_key: None,
-        api_backend: Default::default(),
         context_window: std::num::NonZeroU64::new(200_000).unwrap(),
-        auto_compact_threshold_percent: None,
-        system_prompt_label: None,
-        extra_headers: IndexMap::new(),
-        api_base_url: None,
-        use_concise: false,
-        agent_type: config::default_agent_type(),
-        inference_idle_timeout_secs: None,
-        max_retries: None,
-        rate_limit_retry_threshold: None,
-        subagent_rate_limit_max_attempts: None,
-        hidden: false,
-        supported_in_api: true,
-        auth_scheme: None,
-        reasoning_effort: None,
-        supports_reasoning_effort: false,
-        reasoning_efforts: Vec::new(),
-        supports_backend_search: false,
-        compactions_remaining: None,
-        compaction_at_tokens: None,
-        show_model_fingerprint: false,
-        stream_tool_calls: None,
-        laziness_detector: config::LazinessDetectorPerModelConfig::default(),
-        variants: Vec::new(),
+        ..Default::default()
     }
 }
 
@@ -2267,11 +2264,17 @@ fn build_prefetched_map_distinct_ids_same_slug() {
     assert!(map.contains_key("auto"));
     assert!(map.contains_key("grok-build"));
     assert!(map.contains_key("experimental-fast"));
+    let Some(auto) = map.get("auto") else {
+        panic!("expected auto: {map:?}");
+    };
     assert_eq!(
-        map["auto"].info.model, "grok-build",
+        auto.info.model, "grok-build",
         "auto entry should still route to grok-build"
     );
-    assert_eq!(map["grok-build"].info.model, "grok-build");
+    let Some(build) = map.get("grok-build") else {
+        panic!("expected grok-build: {map:?}");
+    };
+    assert_eq!(build.info.model, "grok-build");
 }
 
 #[test]
@@ -2296,7 +2299,10 @@ fn build_prefetched_map_duplicate_id_overwrites() {
     let map = build_prefetched_map(entries, None);
 
     assert_eq!(map.len(), 1, "duplicate id: second overwrites first");
-    assert_eq!(map["grok-build"].info.name.as_deref(), Some("Second"));
+    let Some(build) = map.get("grok-build") else {
+        panic!("expected grok-build: {map:?}");
+    };
+    assert_eq!(build.info.name.as_deref(), Some("Second"));
 }
 
 #[test]

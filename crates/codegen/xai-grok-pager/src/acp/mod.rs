@@ -1,10 +1,13 @@
 //! ACP (Agent Communication Protocol) connection management.
 //!
 //! This module spawns the agent process, initializes the protocol, authenticates, and provides the channel for communication.
+/// Shared plan-file size cap for the pager keep.
+pub(crate) const MAX_PLAN_FILE_BYTES: usize = 256 * 1024;
 pub mod leader_bridge;
 pub mod meta;
 pub mod model_state;
 pub mod spawn;
+pub(crate) mod subagent_label_registry;
 mod subagent_message;
 pub mod tracker;
 mod version_mismatch;
@@ -124,7 +127,8 @@ pub struct AcpConnection {
 /// CLI flags that affect agent configuration, threaded from PagerArgs.
 #[derive(Debug, Clone, Default)]
 pub struct ConnectFlags {
-    pub subagents: bool,
+    /// `--no-subagents`. Only an explicit flag reaches the CLI tier of the resolver; otherwise env, config.toml, and the default decide, exactly as in `grok agent stdio`.
+    pub no_subagents: bool,
     /// CLI memory override set by a legacy compatibility flag.
     pub memory_enabled_override: Option<bool>,
     /// Original compatibility flag spelling for leader-mode warnings.
@@ -188,7 +192,7 @@ pub async fn connect(cancel: &CancellationToken, flags: ConnectFlags) -> Result<
                 raw_config: &raw_config,
                 remote_settings: flags.remote_settings.as_ref(),
                 is_headless: false,
-                cli_subagents: Some(flags.subagents),
+                cli_subagents: flags.no_subagents.then_some(false),
                 cli_web_search_model: None,
                 cli_session_summary_model: None,
                 memory_enabled_override: flags.memory_enabled_override,
@@ -219,7 +223,7 @@ pub async fn connect(cancel: &CancellationToken, flags: ConnectFlags) -> Result<
     initialize_connection(AgentEndpoint::from(spawned), &flags, auth_manager).await
 }
 /// Finishes connecting to an agent. Sends it `initialize`, works out whether the user must log in first, and returns the `AcpConnection`.
-/// The embedded agent, the leader agent, and the agent-host worker are all connected through this function, so these steps are written once.
+/// Every agent target is connected through this function, so these steps are written once.
 pub(in crate::acp) async fn initialize_connection(
     endpoint: AgentEndpoint,
     flags: &ConnectFlags,
@@ -377,8 +381,8 @@ fn unsupported_leader_flags(flags: &ConnectFlags) -> Vec<&'static str> {
     if flags.storage_mode.is_some() {
         out.push("--storage-mode");
     }
-    if flags.subagents {
-        out.push("--subagents");
+    if flags.no_subagents {
+        out.push("--no-subagents");
     }
     if !flags.permission_rules.is_empty() {
         out.push("--allow/--deny permission rules");
@@ -399,7 +403,7 @@ pub(super) fn apply_config_writes(flags: &ConnectFlags) {
             .entry("cli")
             .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
         if let Some(tbl) = cli.as_table_mut() {
-            tbl["installer"] = toml_edit::value(installer.as_str());
+            tbl.insert("installer", toml_edit::value(installer.as_str()));
             changed = true;
         }
     }
@@ -422,11 +426,16 @@ fn build_initialize_meta(flags: &ConnectFlags) -> serde_json::Value {
         "clientType": client_type,
         "clientVersion": PAGER_CLIENT_VERSION,
     });
-    if let Some(spo) = &flags.system_prompt_override {
-        meta["systemPromptOverride"] = serde_json::Value::String(spo.clone());
-    }
-    if let Some(rules) = &flags.rules {
-        meta["rules"] = serde_json::Value::String(rules.clone());
+    if let Some(obj) = meta.as_object_mut() {
+        if let Some(spo) = &flags.system_prompt_override {
+            obj.insert(
+                "systemPromptOverride".into(),
+                serde_json::Value::String(spo.clone()),
+            );
+        }
+        if let Some(rules) = &flags.rules {
+            obj.insert("rules".into(), serde_json::Value::String(rules.clone()));
+        }
     }
     meta
 }
@@ -441,8 +450,16 @@ fn client_capabilities_meta(flags: &ConnectFlags) -> serde_json::Value {
         "x.ai/bashOutputNoColor": true,
         "x.ai/gitHeadChanged": true,
     });
-    meta[xai_grok_shell::session::USER_MESSAGE_ECHO_CAPABILITY] = true.into();
-    meta[xai_grok_status_line::STATUS_LINE_CAPABILITY] = flags.status_line.into();
+    if let Some(obj) = meta.as_object_mut() {
+        obj.insert(
+            xai_grok_shell::session::USER_MESSAGE_ECHO_CAPABILITY.into(),
+            true.into(),
+        );
+        obj.insert(
+            xai_grok_status_line::STATUS_LINE_CAPABILITY.into(),
+            flags.status_line.into(),
+        );
+    }
     meta
 }
 /// Parse `defaultAuthMethodId` from `InitializeResponse.meta`.
@@ -466,6 +483,8 @@ pub(crate) struct InitializedAgent {
 }
 /// Send InitializeRequest and parse the response.
 async fn initialize(tx: &AcpAgentTx, flags: &ConnectFlags) -> Result<InitializedAgent> {
+    let mut meta = build_initialize_meta(flags).as_object().cloned();
+    crate::app::session_startup::stamp_phase_traceparent(&mut meta);
     let req = acp::InitializeRequest::new(acp::ProtocolVersion::V1)
         .client_capabilities(
             acp::ClientCapabilities::new()
@@ -475,7 +494,7 @@ async fn initialize(tx: &AcpAgentTx, flags: &ConnectFlags) -> Result<Initialized
                 .terminal(flags.terminal)
                 .meta(client_capabilities_meta(flags).as_object().cloned()),
         )
-        .meta(build_initialize_meta(flags).as_object().cloned());
+        .meta(meta);
     let resp: acp::InitializeResponse = {
         let _timer = xai_grok_telemetry::instrumentation::timer("acp_init.initialize_roundtrip");
         acp_send(req, tx).await?
@@ -758,12 +777,14 @@ mod tests {
             ]
         });
         let cmds = parse_available_commands(meta.as_object());
-        assert_eq!(cmds.len(), 2);
-        assert_eq!(cmds[0].name, "compact");
-        assert_eq!(cmds[0].description, "Compact conversation history");
-        assert!(cmds[0].input.is_some());
-        assert_eq!(cmds[1].name, "flush");
-        assert!(cmds[1].input.is_none());
+        let [compact, flush] = cmds.as_slice() else {
+            panic!("expected 2 commands: {cmds:?}");
+        };
+        assert_eq!(compact.name, "compact");
+        assert_eq!(compact.description, "Compact conversation history");
+        assert!(compact.input.is_some());
+        assert_eq!(flush.name, "flush");
+        assert!(flush.input.is_none());
     }
     #[test]
     fn parse_available_commands_missing_key_returns_empty() {
@@ -896,7 +917,10 @@ mod tests {
     fn startup_auth_method_id_is_copied_not_synthesized() {
         let methods = vec![make_auth_method("grok.com", "My Login", None)];
         let (_, _, method_id, _) = startup_auth_metadata(&methods);
-        assert_eq!(&method_id.unwrap(), methods[0].id());
+        let Some(first) = methods.first() else {
+            panic!("expected an auth method");
+        };
+        assert_eq!(&method_id.unwrap(), first.id());
     }
     #[test]
     fn startup_auth_external_provider_false_is_pending() {
@@ -917,7 +941,7 @@ mod tests {
             memory_override_flag: Some("--experimental-memory"),
             disable_web_search: true,
             storage_mode: Some("writeback".into()),
-            subagents: true,
+            no_subagents: true,
             ..Default::default()
         };
         let detected = unsupported_leader_flags(&flags);
@@ -925,7 +949,7 @@ mod tests {
         assert!(detected.contains(&"--experimental-memory"));
         assert!(detected.contains(&"--disable-web-search"));
         assert!(detected.contains(&"--storage-mode"));
-        assert!(detected.contains(&"--subagents"));
+        assert!(detected.contains(&"--no-subagents"));
     }
     #[test]
     fn unsupported_leader_flags_preserves_no_memory_spelling() {
@@ -953,7 +977,10 @@ mod tests {
             ..Default::default()
         };
         let meta = build_initialize_meta(&flags);
-        assert_eq!(meta["rules"], "Always reply in French.");
+        assert_eq!(
+            meta.get("rules").and_then(|v| v.as_str()),
+            Some("Always reply in French.")
+        );
     }
     #[test]
     fn build_initialize_meta_omits_rules_when_unset() {
@@ -971,7 +998,10 @@ mod tests {
             ..Default::default()
         };
         let meta = build_initialize_meta(&flags);
-        assert_eq!(meta["systemPromptOverride"], "YOU ARE A PIRATE.");
+        assert_eq!(
+            meta.get("systemPromptOverride").and_then(|v| v.as_str()),
+            Some("YOU ARE A PIRATE.")
+        );
     }
     #[test]
     fn build_initialize_meta_uses_custom_client_identifier_when_set() {
@@ -980,24 +1010,37 @@ mod tests {
             ..Default::default()
         };
         let meta = build_initialize_meta(&flags);
-        assert_eq!(meta["clientType"], "zed");
+        assert_eq!(meta.get("clientType").and_then(|v| v.as_str()), Some("zed"));
     }
     #[test]
     fn client_capabilities_meta_defaults_absent_or_blank_mode_to_off() {
         let absent = client_capabilities_meta(&ConnectFlags::default());
-        assert_eq!(absent["x.ai/hunkTracker"]["mode"], "off");
+        assert_eq!(
+            absent
+                .get("x.ai/hunkTracker")
+                .and_then(|v| v.get("mode"))
+                .and_then(|v| v.as_str()),
+            Some("off")
+        );
         let blank = client_capabilities_meta(&ConnectFlags {
             hunk_tracker_mode: Some("   ".into()),
             ..Default::default()
         });
-        assert_eq!(blank["x.ai/hunkTracker"]["mode"], "off");
+        assert_eq!(
+            blank
+                .get("x.ai/hunkTracker")
+                .and_then(|v| v.get("mode"))
+                .and_then(|v| v.as_str()),
+            Some("off")
+        );
     }
     #[test]
     fn client_capabilities_meta_always_requests_user_message_echo() {
         let meta = client_capabilities_meta(&ConnectFlags::default());
         assert_eq!(
-            meta[xai_grok_shell::session::USER_MESSAGE_ECHO_CAPABILITY],
-            true
+            meta.get(xai_grok_shell::session::USER_MESSAGE_ECHO_CAPABILITY)
+                .and_then(|v| v.as_bool()),
+            Some(true)
         );
     }
     /// The agent gates the whole payload on this key, so a misspelling on either side switches the feature off with nothing to show for it.
@@ -1009,7 +1052,11 @@ mod tests {
                 status_line: wants_a_row,
                 ..Default::default()
             });
-            assert_eq!(meta[key], wants_a_row, "status_line={wants_a_row}");
+            assert_eq!(
+                meta.get(key).and_then(|v| v.as_bool()),
+                Some(wants_a_row),
+                "status_line={wants_a_row}"
+            );
         }
     }
     #[test]
@@ -1019,7 +1066,13 @@ mod tests {
                 hunk_tracker_mode: Some(raw.into()),
                 ..Default::default()
             });
-            assert_eq!(meta["x.ai/hunkTracker"]["mode"], "off", "raw={raw}");
+            assert_eq!(
+                meta.get("x.ai/hunkTracker")
+                    .and_then(|v| v.get("mode"))
+                    .and_then(|v| v.as_str()),
+                Some("off"),
+                "raw={raw}"
+            );
         }
     }
 }
