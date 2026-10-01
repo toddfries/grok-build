@@ -12,6 +12,9 @@
 #[cfg(feature = "audio")]
 pub mod audio;
 pub mod auth;
+// The clip route only runs with capture compiled in; its tests need no device.
+#[cfg(any(test, feature = "audio"))]
+mod clip;
 pub mod config;
 pub mod error;
 pub mod event;
@@ -19,21 +22,27 @@ pub mod language;
 pub mod pipeline;
 pub mod probe;
 pub mod stt;
+pub mod transcriber;
+#[cfg(any(test, feature = "audio"))]
+mod wav;
 
 pub use auth::{SharedVoiceAuth, StaticVoiceAuth, VoiceAuthError, VoiceAuthProvider};
 pub use config::VoiceConfig;
 pub use error::VoiceError;
-pub use event::VoiceEvent;
+pub use event::{TaggedVoiceEvent, VoiceEvent, VoiceRoute, VoiceSessionId};
 pub use language::{
     STT_LANGUAGE_AUTO, STT_LANGUAGE_DEFAULT, STT_LANGUAGES, SttLanguage, canonicalize_stt_language,
     language_for_api, stt_language_by_code,
 };
-pub use pipeline::{VoiceCommand, run_voice_pipeline};
+pub use pipeline::{SttRoutes, VoiceCommand, run_voice_pipeline};
 #[cfg(feature = "audio")]
 pub use probe::run_mic_only_probe;
 pub use probe::{
     InputDeviceInfo, VoiceProbeOptions, VoiceProbeReport, format_probe_report, input_device_info,
     run_streaming_probe,
+};
+pub use transcriber::{
+    AudioClip, ClipTranscriber, FINAL_TIMEOUT, SharedClipTranscriber, TranscribeError,
 };
 
 /// Whether this build can capture microphone audio (the `audio` feature).
